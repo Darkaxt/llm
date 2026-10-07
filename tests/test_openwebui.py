@@ -1,6 +1,8 @@
 import io
 import zipfile
 import json
+
+import pytest
 from types import SimpleNamespace
 
 import llm
@@ -558,3 +560,82 @@ def test_zip_without_expected_sidecars_is_left_unchanged():
         )
         == []
     )
+
+
+
+def test_sidecar_member_selection_prefers_one_coherent_root():
+    selected = openwebui._select_sidecar_members(
+        [
+            "bundle/rule-index.json",
+            "bundle/splunk-rules.jsonl",
+            "bundle/macros.json",
+            "docs/rule-index.json",
+        ]
+    )
+
+    assert selected == {
+        "rule-index.json": "bundle/rule-index.json",
+        "splunk-rules.jsonl": "bundle/splunk-rules.jsonl",
+        "macros.json": "bundle/macros.json",
+    }
+
+
+def test_sidecar_member_selection_rejects_two_complete_roots():
+    with pytest.raises(llm.ModelError, match="multiple complete TIDE sidecar sets"):
+        openwebui._select_sidecar_members(
+            [
+                "bundle-a/rule-index.json",
+                "bundle-a/splunk-rules.jsonl",
+                "bundle-a/macros.json",
+                "bundle-b/rule-index.json",
+                "bundle-b/splunk-rules.jsonl",
+                "bundle-b/macros.json",
+            ]
+        )
+
+
+def test_sidecar_member_selection_rejects_ambiguous_duplicate_basename():
+    with pytest.raises(llm.ModelError, match="ambiguous TIDE sidecar filenames"):
+        openwebui._select_sidecar_members(
+            [
+                "a/rule-index.json",
+                "b/rule-index.json",
+                "splunk-rules.jsonl",
+                "macros.json",
+            ]
+        )
+
+
+def test_7z_sidecar_extraction():
+    import py7zr
+
+    payload = io.BytesIO()
+    with py7zr.SevenZipFile(payload, "w") as archive:
+        archive.writestr(
+            '{"67e794d5-73b2-45e5-b570-ceb5e0bba352":"rule.yaml"}',
+            "ec-tide-splunk-investigation-kb/rule-index.json",
+        )
+        archive.writestr(
+            '{"uuid":"67e794d5-73b2-45e5-b570-ceb5e0bba352"}\n',
+            "ec-tide-splunk-investigation-kb/splunk-rules.jsonl",
+        )
+        archive.writestr(
+            '{"macro":"value"}',
+            "ec-tide-splunk-investigation-kb/macros.json",
+        )
+
+    attachment = llm.Attachment(
+        type="application/x-7z-compressed",
+        content=payload.getvalue(),
+    )
+    sidecars = openwebui._archive_sidecar_attachments(
+        attachment,
+        filename="ec-tide-splunk-investigation-kb.7z",
+    )
+
+    assert [name for name, _ in sidecars] == [
+        "rule-index.json",
+        "splunk-rules.jsonl",
+        "macros.json",
+    ]
+    assert b"67e794d5-73b2-45e5-b570-ceb5e0bba352" in sidecars[0][1].content
