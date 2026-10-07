@@ -7,6 +7,7 @@ model discovery, streaming, reasoning and the Socket.IO tool execution path.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import queue
@@ -14,6 +15,7 @@ import shutil
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlparse
@@ -250,6 +252,72 @@ def _attachment_filename(attachment: llm.Attachment, index: int) -> str:
     return f"attachment-{index}{suffix}"
 
 
+_ZIP_SIDECAR_TYPES = {
+    "rule-index.json": "application/json",
+    "splunk-rules.jsonl": "application/x-ndjson",
+    "macros.json": "application/json",
+}
+_ZIP_SIDECAR_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _zip_sidecar_attachments(
+    attachment: llm.Attachment,
+    *,
+    filename: str | None = None,
+) -> list[tuple[str, llm.Attachment]]:
+    """Expose known machine-readable TIDE bundle sidecars from a ZIP in memory.
+
+    Open WebUI can store/process ZIP files, but retrieval may surface the archive
+    as an opaque binary blob. The investigation skill relies on these sidecars,
+    so prefer them over uploading the archive itself when they are present.
+    """
+    filename = filename or _attachment_filename(attachment, 0)
+    content_type = attachment.type or ""
+    if not (
+        filename.lower().endswith(".zip")
+        or content_type in {"application/zip", "application/x-zip-compressed"}
+    ):
+        return []
+
+    try:
+        content = attachment.content_bytes()
+    except Exception as exc:
+        raise llm.ModelError(f"Could not read ZIP attachment {filename}: {exc}") from exc
+    if not content:
+        return []
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            by_basename: dict[str, zipfile.ZipInfo] = {}
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                basename = Path(info.filename).name.lower()
+                if basename in _ZIP_SIDECAR_TYPES and basename not in by_basename:
+                    by_basename[basename] = info
+
+            sidecars: list[tuple[str, llm.Attachment]] = []
+            for expected_name, mime in _ZIP_SIDECAR_TYPES.items():
+                info = by_basename.get(expected_name)
+                if info is None:
+                    continue
+                if info.file_size > _ZIP_SIDECAR_MAX_BYTES:
+                    raise llm.ModelError(
+                        f"ZIP sidecar {expected_name} is too large "
+                        f"({info.file_size} bytes)"
+                    )
+                data = archive.read(info)
+                sidecars.append(
+                    (
+                        expected_name,
+                        llm.Attachment(type=mime, content=data),
+                    )
+                )
+            return sidecars
+    except zipfile.BadZipFile:
+        return []
+
+
 def _file_processing_timeout() -> float:
     raw = os.environ.get("LLM_OPENWEBUI_FILE_TIMEOUT", "600")
     try:
@@ -421,6 +489,7 @@ def _upload_attachment(
     total: int = 1,
     on_status: Callable[[str], None] | None = None,
     interactive_status: bool = False,
+    filename_override: str | None = None,
 ) -> dict[str, Any]:
     """Upload one LLM attachment using Open WebUI's native file API.
 
@@ -436,7 +505,7 @@ def _upload_attachment(
         except Exception as exc:
             raise llm.ModelError(f"Could not determine attachment type: {exc}") from exc
     content_type = content_type or "application/octet-stream"
-    filename = _attachment_filename(attachment, index)
+    filename = filename_override or _attachment_filename(attachment, index)
     try:
         content = attachment.content_bytes()
     except Exception as exc:
@@ -521,6 +590,7 @@ _TEXT_FULL_CONTEXT_EXTENSIONS = {
     ".markdown",
     ".txt",
     ".json",
+    ".jsonl",
     ".yaml",
     ".yml",
     ".xml",
@@ -544,6 +614,8 @@ def _is_textual_attachment(item: dict[str, Any]) -> bool:
         return True
     if content_type in {
         "application/json",
+        "application/x-ndjson",
+        "application/ndjson",
         "application/xml",
         "application/yaml",
         "application/x-yaml",
