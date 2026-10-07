@@ -127,10 +127,10 @@ async def run_chat_with_tools_with_files(
     # python-socketio 5.x.)
     http_session = aiohttp.ClientSession(trust_env=True)
     sio = socketio.AsyncClient(http_session=http_session)
-    # ``chat_id`` may be caller-supplied (when persisting via --save) so the
-    # completion lands on a real DB chat row; default to a throwaway uuid when
-    # the caller doesn't care about persistence.
-    chat_id = chat_id or str(uuid.uuid4())
+    # ``chat_id`` may be caller-supplied for a persisted chat. When it is
+    # omitted, defer choosing it until after Socket.IO connects: current Open
+    # WebUI treats a bare UUID as a persisted chat ID and returns 404 if that
+    # chat does not exist. Unsaved browser chats use "temporary:<socket-id>".
     message_id = str(uuid.uuid4())
 
     state: dict[str, Any] = {
@@ -303,6 +303,9 @@ async def run_chat_with_tools_with_files(
     session_id = sio.get_sid("/")
     if not session_id:
         raise APIError("socket.io connection has no default namespace session id")
+
+    if not chat_id:
+        chat_id = f"temporary:{session_id}"
 
     # Everything from here on is wrapped so the socket session and the proxy-aware
     # aiohttp session are ALWAYS torn down - no "Unclosed client session" warnings
