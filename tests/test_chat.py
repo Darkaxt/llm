@@ -456,3 +456,20 @@ def test_chat_prompt_session_shift_enter_sequences():
 
     assert ANSI_SEQUENCES["\x1b[27;2;13~"] == Keys.F24
     assert ANSI_SEQUENCES["\x1b[13;2u"] == Keys.F24
+
+
+
+def test_chat_turn_headers_only_for_interactive_tty(monkeypatch):
+    class FakeTTY:
+        def __init__(self, value):
+            self.value = value
+
+        def isatty(self):
+            return self.value
+
+    monkeypatch.setattr(llm.cli.sys, "stdin", FakeTTY(True))
+    monkeypatch.setattr(llm.cli.sys, "stdout", FakeTTY(True))
+    assert llm.cli._chat_turn_headers_enabled() is True
+
+    monkeypatch.setattr(llm.cli.sys, "stdout", FakeTTY(False))
+    assert llm.cli._chat_turn_headers_enabled() is False
