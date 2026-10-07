@@ -156,11 +156,15 @@ def _write_conversation_jsonl(
     rows.reverse()
     attachments_by_id = annotate_log_rows(db, rows, expand=True) if rows else {}
 
+    persisted_name = conversation.name
+    if not persisted_name and rows:
+        persisted_name = rows[0].get("conversation_name")
+
     session = {
         "type": "conversation",
         "conversation_id": conversation.id,
         "model": model_label,
-        "name": conversation.name,
+        "name": persisted_name,
     }
     lines = [json.dumps(session, ensure_ascii=False)]
     for row in rows:
