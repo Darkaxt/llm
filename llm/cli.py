@@ -137,6 +137,7 @@ def _build_chat_prompt_session():
     """Create the interactive multiline chat composer for real terminals."""
     from prompt_toolkit import PromptSession
     from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.input.vt100_parser import _IS_PREFIX_OF_LONGER_MATCH_CACHE
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
 
@@ -145,6 +146,7 @@ def _build_chat_prompt_session():
     # key so Shift+Enter can remain distinct when the terminal provides it.
     ANSI_SEQUENCES["\x1b[27;2;13~"] = Keys.F24  # xterm modifyOtherKeys
     ANSI_SEQUENCES["\x1b[13;2u"] = Keys.F24  # Kitty / CSI-u
+    _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
 
     bindings = KeyBindings()
 
