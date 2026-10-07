@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 
 import llm
-from llm.default_plugins import openwebui
+from llm.default_plugins import openwebui, openwebui_socket
 from llm.parts import AttachmentPart, Message, TextPart
 
 
@@ -396,3 +396,47 @@ def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert calls[0]["files"] == []
+
+
+
+def test_current_openwebui_structured_output_parsing():
+    output = [
+        {
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "Need Splunk."}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "call-1",
+            "name": "splunk-mcp_search",
+            "arguments": "{\"search\": \"index=_internal | head 1\"}",
+            "status": "completed",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": [{"type": "output_text", "text": "{\"result\": 1}"}],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "The search succeeded."}],
+        },
+    ]
+
+    assert (
+        openwebui_socket._structured_output_text(output)
+        == "The search succeeded."
+    )
+    assert openwebui_socket._structured_reasoning(output) == ["Need Splunk."]
+
+    events = openwebui_socket._structured_tool_events(output)
+    assert events == [
+        {
+            "name": "splunk-mcp_search",
+            "call_id": "call-1",
+            "arguments": "{\"search\": \"index=_internal | head 1\"}",
+            "result": "{\"result\": 1}",
+            "done": True,
+        }
+    ]
