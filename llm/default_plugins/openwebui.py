@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 import click
 import httpx2
 import llm
+from llm.chat_journal import append_record as append_chat_journal_record
 from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
 from llm.parts import AttachmentPart, ReasoningPart, StreamEvent, TextPart, ToolResultPart
 from openwebui_sdk import ChatResult, OpenWebUIClient
@@ -1665,9 +1666,31 @@ class OpenWebUIModel(llm.Model):
         client = _client(config)
         status_bar = _OpenWebUIStatusBar()
         status_activity: list[str] = []
+        provider_run_id = (
+            f"{conversation.id}:{time.time_ns()}"
+            if conversation is not None
+            else f"transient:{time.time_ns()}"
+        )
+
+        def journal_provider(record: dict[str, Any]) -> None:
+            if conversation is not None:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "provider": "openwebui",
+                        "provider_run_id": provider_run_id,
+                        **record,
+                    },
+                )
 
         def prepare_status(line: str) -> None:
             status_activity.append(line)
+            journal_provider(
+                {
+                    "type": "provider_status",
+                    "status": line,
+                }
+            )
             status_bar.update(line)
 
         try:
@@ -1724,10 +1747,22 @@ class OpenWebUIModel(llm.Model):
 
         def on_tool(line: str) -> None:
             tool_activity.append(line)
+            journal_provider(
+                {
+                    "type": "provider_tool",
+                    "tool": line,
+                }
+            )
             events.put(("tool", line))
 
         def on_status(line: str) -> None:
             status_activity.append(line)
+            journal_provider(
+                {
+                    "type": "provider_status",
+                    "status": line,
+                }
+            )
             events.put(("status", line))
 
         def worker() -> None:
@@ -1780,6 +1815,13 @@ class OpenWebUIModel(llm.Model):
                     )
                 events.put(("done", result))
             except Exception as exc:  # handed back to the main iterator
+                journal_provider(
+                    {
+                        "type": "provider_error",
+                        "error": str(exc),
+                        "error_class": type(exc).__name__,
+                    }
+                )
                 events.put(("error", exc))
 
         thread = threading.Thread(target=worker, daemon=True)
@@ -1823,6 +1865,7 @@ class OpenWebUIModel(llm.Model):
                     result = payload
                     response.response_json = {
                         "provider": "openwebui",
+                        "provider_run_id": provider_run_id,
                         "remote_model": self.remote_model_id,
                         "reasoning": result.reasoning,
                         "tool_calls": result.tool_calls,
