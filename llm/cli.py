@@ -423,6 +423,18 @@ def _run_chat(
                 )
             click.echo(f"\nModel error: {exc}", err=True)
             continue
+        except Exception as exc:
+            if conversation is not None and export_jsonl:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "type": "turn_error",
+                        "turn_id": turn_id,
+                        "error": str(exc),
+                        "error_class": type(exc).__name__,
+                    },
+                )
+            raise
         if after_response is not None:
             after_response(response)
         if conversation is not None and db is not None and export_jsonl:
