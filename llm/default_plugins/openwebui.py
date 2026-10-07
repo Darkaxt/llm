@@ -132,11 +132,61 @@ def _file_processing_timeout() -> float:
     return timeout
 
 
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def _activity_bar(tick: int, width: int = 18) -> str:
+    """Return an indeterminate moving marker, not a fake percentage."""
+    if width < 3:
+        width = 3
+    cycle = (width - 1) * 2
+    pos = tick % cycle
+    if pos >= width:
+        pos = cycle - pos
+    chars = [" "] * width
+    chars[pos] = "="
+    return "[" + "".join(chars) + "]"
+
+
+def _render_file_progress(
+    *,
+    filename: str,
+    status: str,
+    started: float,
+    tick: int,
+    ordinal: int,
+    total: int,
+    done: bool = False,
+) -> None:
+    elapsed = _format_elapsed(time.monotonic() - started)
+    bar = "[" + "=" * 18 + "]" if done else _activity_bar(tick)
+    line = (
+        f"[Open WebUI] {ordinal}/{total} {bar} "
+        f"{filename}: {status} · {elapsed}"
+    )
+    # In a terminal update one line in-place. When redirected, emit normal
+    # newline-delimited status so logs remain readable.
+    if hasattr(__import__("sys").stderr, "isatty") and __import__("sys").stderr.isatty():
+        click.echo("\r" + line.ljust(120), nl=done, err=True)
+    else:
+        click.echo(line, err=True)
+
+
 def _wait_for_file_processing(
     http: httpx2.Client,
     client: OpenWebUIClient,
     file_id: str,
     filename: str,
+    *,
+    ordinal: int = 1,
+    total: int = 1,
+    started: float | None = None,
 ) -> None:
     """Wait for Open WebUI's background extraction/RAG processing.
 
@@ -144,13 +194,15 @@ def _wait_for_file_processing(
     the upload request open. Polling the non-streaming status endpoint gives us
     the same semantics without tying a long-running SSE connection to the CLI.
     """
-    deadline = time.monotonic() + _file_processing_timeout()
+    started = started if started is not None else time.monotonic()
+    deadline = started + _file_processing_timeout()
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {client.token}",
     }
 
     last_status = None
+    tick = 0
     while True:
         if time.monotonic() >= deadline:
             raise llm.ModelError(
@@ -173,10 +225,19 @@ def _wait_for_file_processing(
             ) from exc
 
         status = payload.get("status") if isinstance(payload, dict) else None
-        if status != last_status:
-            click.echo(
-                f"[Open WebUI] {filename}: {status or 'waiting'}",
-                err=True,
+        display_status = status or "waiting"
+        if status != last_status or (
+            hasattr(__import__("sys").stderr, "isatty")
+            and __import__("sys").stderr.isatty()
+        ):
+            _render_file_progress(
+                filename=filename,
+                status=display_status,
+                started=started,
+                tick=tick,
+                ordinal=ordinal,
+                total=total,
+                done=status == "completed",
             )
             last_status = status
         if status == "completed":
@@ -206,6 +267,7 @@ def _wait_for_file_processing(
                 f"{status!r} for {filename}"
             )
 
+        tick += 1
         time.sleep(1)
 
 
@@ -213,6 +275,9 @@ def _upload_attachment(
     client: OpenWebUIClient,
     attachment: llm.Attachment,
     index: int,
+    *,
+    ordinal: int = 1,
+    total: int = 1,
 ) -> dict[str, Any]:
     """Upload one LLM attachment using Open WebUI's native file API.
 
@@ -244,7 +309,15 @@ def _upload_attachment(
         "process_in_background": "true",
     }
     upload_timeout = max(float(client.timeout), 120.0)
-    click.echo(f"[Open WebUI] {filename}: uploading", err=True)
+    started = time.monotonic()
+    _render_file_progress(
+        filename=filename,
+        status="uploading",
+        started=started,
+        tick=0,
+        ordinal=ordinal,
+        total=total,
+    )
     try:
         with httpx2.Client(trust_env=True, timeout=upload_timeout) as http:
             result = http.post(
@@ -270,6 +343,9 @@ def _upload_attachment(
                     client,
                     str(uploaded["id"]),
                     filename,
+                    ordinal=ordinal,
+                    total=total,
+                    started=started,
                 )
     except llm.ModelError:
         raise
@@ -304,6 +380,13 @@ def _prepare_openwebui_request(
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     messages: list[dict[str, str]] = []
     files_by_id: dict[str, dict[str, Any]] = {}
+    total_attachments = sum(
+        1
+        for message in prompt.messages
+        for part in message.parts
+        if isinstance(part, AttachmentPart) and part.attachment is not None
+    )
+    attachment_ordinal = 0
 
     for message in prompt.messages:
         has_attachment = False
@@ -311,13 +394,20 @@ def _prepare_openwebui_request(
             if not isinstance(part, AttachmentPart) or part.attachment is None:
                 continue
             has_attachment = True
+            attachment_ordinal += 1
             metadata = part.provider_metadata or {}
             cached = metadata.get("openwebui_file")
             cached_url = metadata.get("openwebui_url")
             if isinstance(cached, dict) and cached.get("id") and cached_url == client.base_url:
                 item = cached
             else:
-                item = _upload_attachment(client, part.attachment, index)
+                item = _upload_attachment(
+                    client,
+                    part.attachment,
+                    index,
+                    ordinal=attachment_ordinal,
+                    total=total_attachments,
+                )
                 part.provider_metadata = {
                     **metadata,
                     "openwebui_file": item,
