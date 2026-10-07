@@ -305,6 +305,9 @@ def _run_chat(
         except KeyboardInterrupt:
             click.echo("\nCancelled current response.", err=True)
             continue
+        except llm.ModelError as exc:
+            click.echo(f"\nModel error: {exc}", err=True)
+            continue
         if after_response is not None:
             after_response(response)
         if conversation is not None and db is not None and export_jsonl:
