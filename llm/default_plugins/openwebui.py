@@ -652,6 +652,7 @@ class OpenWebUIModel(llm.Model):
         events: queue.Queue[tuple[str, Any]] = queue.Queue()
         tool_activity: list[str] = []
         status_activity: list[str] = []
+        remote_execution: dict[str, Any] = {}
 
         def on_text(fragment: str) -> None:
             events.put(("text", fragment))
@@ -690,6 +691,12 @@ class OpenWebUIModel(llm.Model):
                             on_tool=on_tool,
                             on_status=on_status,
                         )
+                    )
+                    remote_execution.update(
+                        {
+                            "remote_chat_id": data.get("remote_chat_id"),
+                            "remote_task_ids": data.get("remote_task_ids", []),
+                        }
                     )
                     result = ChatResult(
                         answer=data.get("answer", ""),
@@ -752,6 +759,8 @@ class OpenWebUIModel(llm.Model):
                     "tool_calls": result.tool_calls,
                     "tool_activity": tool_activity,
                     "status_activity": status_activity,
+                    "raw_content": result.raw_content,
+                    **remote_execution,
                 }
                 break
 
