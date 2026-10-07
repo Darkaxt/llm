@@ -234,6 +234,18 @@ def _write_conversation_jsonl(
     return path
 
 
+def _chat_turn_headers_enabled() -> bool:
+    return bool(
+        getattr(sys.stdin, "isatty", lambda: False)()
+        and getattr(sys.stdout, "isatty", lambda: False)()
+    )
+
+
+def _print_chat_turn_header(label: str) -> None:
+    click.echo()
+    click.echo(click.style(f"── {label} ──", bold=True))
+
+
 def _run_chat(
     model_label,
     prompt_callback,
@@ -271,7 +283,11 @@ def _run_chat(
     argument_attachments = list(initial_attachments or [])
     prompt_session = _build_chat_prompt_session() if sys.stdin.isatty() and sys.stdout.isatty() else None
 
+    turn_headers = _chat_turn_headers_enabled()
+
     while True:
+        if turn_headers:
+            _print_chat_turn_header("You")
         prompt = _read_chat_prompt(prompt_session)
         fragments = []
         attachments = []
@@ -295,6 +311,9 @@ def _run_chat(
             break
         if transform_prompt is not None:
             prompt = transform_prompt(prompt)
+
+        if turn_headers:
+            _print_chat_turn_header("Assistant")
 
         try:
             response = prompt_callback(prompt, fragments, attachments)
