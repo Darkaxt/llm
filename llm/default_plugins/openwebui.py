@@ -13,7 +13,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Literal
 from urllib.parse import urlparse
 
 import click
@@ -367,11 +367,95 @@ def _upload_attachment(
         or uploaded.get("collection_name")
         or "",
     }
-    # LLM's -a semantics mean "send this attachment", not "search a few chunks".
-    # Full context best matches that expectation for document attachments.
-    if item["type"] == "file":
-        item["context"] = "full"
     return item
+
+
+_TEXT_FULL_CONTEXT_EXTENSIONS = {
+    ".md",
+    ".markdown",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".csv",
+    ".tsv",
+    ".py",
+    ".ps1",
+    ".sh",
+    ".spl",
+    ".conf",
+    ".toml",
+    ".ini",
+}
+_FULL_CONTEXT_PER_FILE_BYTES = 128 * 1024
+_FULL_CONTEXT_TOTAL_BYTES = 256 * 1024
+
+
+def _is_textual_attachment(item: dict[str, Any]) -> bool:
+    content_type = str(item.get("content_type") or "").lower()
+    if content_type.startswith("text/"):
+        return True
+    if content_type in {
+        "application/json",
+        "application/xml",
+        "application/yaml",
+        "application/x-yaml",
+        "application/toml",
+    }:
+        return True
+    return Path(str(item.get("name") or "")).suffix.lower() in _TEXT_FULL_CONTEXT_EXTENSIONS
+
+
+def _apply_attachment_context_policy(
+    files: list[dict[str, Any]],
+    mode: Literal["auto", "full", "rag"],
+) -> None:
+    """Choose full-context vs Open WebUI retrieval for uploaded files.
+
+    Full mode mirrors the browser manual Full Context toggle and can consume
+    the model window very quickly. RAG mode always uses chunked retrieval.
+    Auto mode uses full context only for small textual files, with both a
+    per-file and aggregate byte budget; archives/binary/large files use RAG.
+    """
+    total_full_bytes = 0
+    decisions: list[str] = []
+
+    for item in files:
+        if item.get("type") != "file":
+            continue
+
+        try:
+            size = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+
+        use_full = False
+        if mode == "full":
+            use_full = True
+        elif mode == "auto":
+            use_full = (
+                _is_textual_attachment(item)
+                and size > 0
+                and size <= _FULL_CONTEXT_PER_FILE_BYTES
+                and total_full_bytes + size <= _FULL_CONTEXT_TOTAL_BYTES
+            )
+
+        if use_full:
+            item["context"] = "full"
+            total_full_bytes += size
+            decision = "full"
+        else:
+            item.pop("context", None)
+            decision = "rag"
+
+        decisions.append(f"{item.get('name') or item.get('id')}={decision}")
+
+    if decisions:
+        click.echo(
+            "[Open WebUI] attachment context: " + ", ".join(decisions),
+            err=True,
+        )
 
 
 def _prepare_openwebui_request(
@@ -419,7 +503,12 @@ def _prepare_openwebui_request(
         if content or has_attachment:
             messages.append({"role": message.role, "content": content})
 
-    return messages, list(files_by_id.values())
+    files = list(files_by_id.values())
+    _apply_attachment_context_policy(
+        files,
+        prompt.options.openwebui_attachment_context,
+    )
+    return messages, files
 
 
 class OpenWebUIModel(llm.Model):
@@ -428,6 +517,7 @@ class OpenWebUIModel(llm.Model):
     class Options(llm.Options):
         temperature: float | None = None
         openwebui_tools: bool = True
+        openwebui_attachment_context: Literal["auto", "full", "rag"] = "auto"
 
     def __init__(self, remote_model_id: str, display_name: str | None = None):
         self.remote_model_id = remote_model_id
