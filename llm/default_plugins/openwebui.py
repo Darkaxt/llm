@@ -126,13 +126,13 @@ def _upload_attachment(
     RAG/file-extraction worker. Raster images are stored without document
     processing and are still supplied in the top-level files list.
     """
-    if not attachment.type:
+    content_type = attachment.type
+    if not content_type:
         try:
-            attachment.resolve_type()
+            content_type = attachment.resolve_type()
         except Exception as exc:
             raise llm.ModelError(f"Could not determine attachment type: {exc}") from exc
-
-    content_type = attachment.type or "application/octet-stream"
+    content_type = content_type or "application/octet-stream"
     filename = _attachment_filename(attachment, index)
     try:
         content = attachment.content_bytes()
