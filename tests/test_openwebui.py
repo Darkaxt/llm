@@ -108,9 +108,10 @@ def test_execute_streams_text_and_reasoning(monkeypatch):
     )
 
     class FakeClient:
-        def resolve_tools(self, model_id, no_tools=False):
+        def resolve_tools(self, model_id, extra_tool_ids=None, no_tools=False):
             assert model_id == "glm-5.3"
             assert no_tools is False
+            assert extra_tool_ids == []
             return ["splunk"]
 
         def run_chat(self, **kwargs):
@@ -271,3 +272,70 @@ def test_openwebui_chat_timeout_default_and_override(monkeypatch):
 
     monkeypatch.setenv("LLM_OPENWEBUI_CHAT_TIMEOUT", "900")
     assert openwebui._chat_timeout() == 900
+
+
+
+def test_enabled_tool_ids_are_merged_into_runtime(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {
+            "url": "https://example.test",
+            "token": "jwt",
+            "models": [],
+            "enabled_tool_ids": ["server:mcp:splunk"],
+        },
+    )
+
+    seen = {}
+
+    class FakeClient:
+        base_url = "https://example.test"
+        token = "jwt"
+        timeout = 600
+
+        def resolve_tools(self, model_id, extra_tool_ids=None, no_tools=False):
+            seen["extra"] = extra_tool_ids
+            return list(extra_tool_ids or [])
+
+    monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "run_chat_with_tools_with_files",
+        lambda **kwargs: {
+            "answer": "ok",
+            "reasoning": None,
+            "tool_calls": [],
+            "raw_content": "ok",
+        },
+    )
+
+    model = openwebui.OpenWebUIModel("glm-5.3")
+    prompt = llm.Prompt("test", model)
+    response = SimpleNamespace(response_json=None)
+
+    # No attachments means the SDK run_chat path would normally be used, so
+    # inject a harmless attachment file list via the preparation helper to
+    # exercise our attachment-aware socket path deterministically.
+    monkeypatch.setattr(
+        openwebui,
+        "_prepare_openwebui_request",
+        lambda prompt, client: (
+            [{"role": "user", "content": "test"}],
+            [{"id": "file-1", "type": "file"}],
+        ),
+    )
+    assert list(model.execute(prompt, True, response, None)) == []
+    assert seen["extra"] == ["server:mcp:splunk"]
+
+
+def test_resolve_tool_selector_matches_mcp_name():
+    tools = [
+        SimpleNamespace(id="server:mcp:splunk-main", name="Splunk MCP"),
+        SimpleNamespace(id="local-tool", name="Local Tool"),
+    ]
+    client = SimpleNamespace(list_tools=lambda: tools)
+
+    tool = openwebui._resolve_tool_selector(client, "Splunk MCP")
+    assert tool.id == "server:mcp:splunk-main"
+    assert openwebui._tool_kind(tool.id) == "mcp"
