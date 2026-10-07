@@ -1205,6 +1205,23 @@ def prompt(
     help="Continue the conversation with the given ID.",
 )
 @click.option(
+    "attachments",
+    "-a",
+    "--attachment",
+    type=AttachmentType(),
+    multiple=True,
+    help="Attachment path or URL or -",
+)
+@click.option(
+    "attachment_types",
+    "--at",
+    "--attachment-type",
+    type=(str, str),
+    multiple=True,
+    callback=attachment_types_callback,
+    help="Attachment with explicit mimetype, --at FILE MIME",
+)
+@click.option(
     "fragments",
     "-f",
     "--fragment",
@@ -1249,6 +1266,8 @@ def chat(
     model_id,
     _continue,
     conversation_id,
+    attachments,
+    attachment_types,
     fragments,
     system_fragments,
     template,
@@ -1299,6 +1318,9 @@ def chat(
             raise click.ClickException(str(ex))
         if model_id is None and template_obj.model:
             model_id = template_obj.model
+        attachments, attachment_types = _merge_template_attachments(
+            template_obj, attachments, attachment_types
+        )
         tools, python_tools = _merge_template_tools(template_obj, tools, python_tools)
 
     # Figure out which model we are using
@@ -1370,9 +1392,13 @@ def chat(
             if isinstance(fragment, Fragment)
         ]
         argument_attachments = [
-            attachment
-            for attachment in fragments_and_attachments
-            if isinstance(attachment, Attachment)
+            *attachments,
+            *attachment_types,
+            *[
+                attachment
+                for attachment in fragments_and_attachments
+                if isinstance(attachment, Attachment)
+            ],
         ]
         argument_system_fragments = resolve_fragments(db, system_fragments)
     except FragmentNotFound as ex:
