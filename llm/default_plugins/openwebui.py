@@ -94,19 +94,133 @@ def _message_content(message: Any) -> str:
             # context and should not be sent back as ordinary text.
             continue
         elif isinstance(part, AttachmentPart):
-            raise llm.ModelError(
-                "Open WebUI attachments are not implemented yet in this provider"
-            )
+            # Attachments are uploaded separately and referenced through the
+            # Open WebUI request's top-level "files" field.
+            continue
     return "\n".join(chunk for chunk in chunks if chunk)
 
 
-def _messages_for_openwebui(prompt: llm.Prompt) -> list[dict[str, str]]:
+def _attachment_filename(attachment: llm.Attachment, index: int) -> str:
+    if attachment.path:
+        return Path(attachment.path).name
+    if attachment.url:
+        name = Path(urlparse(attachment.url).path).name
+        if name:
+            return name
+    suffix = {
+        "text/markdown": ".md",
+        "application/json": ".json",
+        "application/pdf": ".pdf",
+    }.get(attachment.type or "", "")
+    return f"attachment-{index}{suffix}"
+
+
+def _upload_attachment(
+    client: OpenWebUIClient,
+    attachment: llm.Attachment,
+    index: int,
+) -> dict[str, Any]:
+    """Upload one LLM attachment using Open WebUI's native file API.
+
+    Documents are synchronously processed so the completion cannot race the
+    RAG/file-extraction worker. Raster images are stored without document
+    processing and are still supplied in the top-level files list.
+    """
+    if not attachment.type:
+        try:
+            attachment.resolve_type()
+        except Exception as exc:
+            raise llm.ModelError(f"Could not determine attachment type: {exc}") from exc
+
+    content_type = attachment.type or "application/octet-stream"
+    filename = _attachment_filename(attachment, index)
+    try:
+        content = attachment.content_bytes()
+    except Exception as exc:
+        raise llm.ModelError(f"Could not read attachment {filename}: {exc}") from exc
+    if not content:
+        raise llm.ModelError(f"Attachment {filename} is empty")
+
+    is_image = content_type.startswith("image/")
+    params = {
+        "process": "false" if is_image else "true",
+        "process_in_background": "false",
+    }
+    try:
+        with httpx2.Client(trust_env=True, timeout=client.timeout) as http:
+            result = http.post(
+                f"{client.base_url}/api/v1/files/",
+                params=params,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {client.token}",
+                },
+                files={"file": (filename, content, content_type)},
+            )
+            result.raise_for_status()
+            uploaded = result.json()
+    except Exception as exc:
+        raise llm.ModelError(f"Open WebUI failed to upload {filename}: {exc}") from exc
+
+    if not isinstance(uploaded, dict) or not uploaded.get("id"):
+        raise llm.ModelError(
+            f"Open WebUI returned an invalid upload response for {filename}"
+        )
+
+    meta = uploaded.get("meta") if isinstance(uploaded.get("meta"), dict) else {}
+    effective_type = meta.get("content_type") or content_type
+    item: dict[str, Any] = {
+        "type": "image" if str(effective_type).startswith("image/") else "file",
+        "file": uploaded,
+        "id": str(uploaded["id"]),
+        "url": str(uploaded["id"]),
+        "name": uploaded.get("filename") or filename,
+        "status": "uploaded",
+        "content_type": effective_type,
+        "size": meta.get("size", len(content)),
+        "collection_name": meta.get("collection_name")
+        or uploaded.get("collection_name")
+        or "",
+    }
+    # LLM's -a semantics mean "send this attachment", not "search a few chunks".
+    # Full context best matches that expectation for document attachments.
+    if item["type"] == "file":
+        item["context"] = "full"
+    return item
+
+
+def _prepare_openwebui_request(
+    prompt: llm.Prompt,
+    client: OpenWebUIClient,
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     messages: list[dict[str, str]] = []
+    files_by_id: dict[str, dict[str, Any]] = {}
+
     for message in prompt.messages:
+        has_attachment = False
+        for index, part in enumerate(message.parts):
+            if not isinstance(part, AttachmentPart) or part.attachment is None:
+                continue
+            has_attachment = True
+            metadata = part.provider_metadata or {}
+            cached = metadata.get("openwebui_file")
+            cached_url = metadata.get("openwebui_url")
+            if isinstance(cached, dict) and cached.get("id") and cached_url == client.base_url:
+                item = cached
+            else:
+                item = _upload_attachment(client, part.attachment, index)
+                part.provider_metadata = {
+                    **metadata,
+                    "openwebui_file": item,
+                    "openwebui_url": client.base_url,
+                }
+            files_by_id[str(item["id"])] = item
+
         content = _message_content(message)
-        if content:
+        if content or has_attachment:
             messages.append({"role": message.role, "content": content})
-    return messages
+
+    return messages, list(files_by_id.values())
 
 
 class OpenWebUIModel(llm.Model):
@@ -166,16 +280,43 @@ class OpenWebUIModel(llm.Model):
 
         def worker() -> None:
             try:
-                result = client.run_chat(
-                    model=self.remote_model_id,
-                    messages=messages,
-                    tool_ids=tool_ids,
-                    temperature=prompt.options.temperature,
-                    on_text=on_text,
-                    on_reasoning=on_reasoning,
-                    on_tool=on_tool,
-                    on_status=on_status,
-                )
+                if tool_ids and attached_files:
+                    # openwebui-sdk 0.1.1 does not yet expose its top-level
+                    # "files" field on the Socket.IO tool path. Use the vendored
+                    # compatibility runner so attachments and model-attached
+                    # tools work together instead of silently dropping either.
+                    data = __import__("asyncio").run(
+                        run_chat_with_tools_with_files(
+                            base_url=client.base_url,
+                            token=client.token or "",
+                            model=self.remote_model_id,
+                            messages=messages,
+                            tool_ids=tool_ids,
+                            files=attached_files,
+                            on_text=on_text,
+                            on_reasoning=on_reasoning,
+                            on_tool=on_tool,
+                            on_status=on_status,
+                        )
+                    )
+                    result = ChatResult(
+                        answer=data.get("answer", ""),
+                        reasoning=data.get("reasoning"),
+                        tool_calls=data.get("tool_calls", []),
+                        raw_content=data.get("raw_content", ""),
+                    )
+                else:
+                    result = client.run_chat(
+                        model=self.remote_model_id,
+                        messages=messages,
+                        tool_ids=tool_ids,
+                        temperature=prompt.options.temperature,
+                        extra={"files": attached_files} if attached_files else None,
+                        on_text=on_text,
+                        on_reasoning=on_reasoning,
+                        on_tool=on_tool,
+                        on_status=on_status,
+                    )
                 events.put(("done", result))
             except Exception as exc:  # handed back to the main iterator
                 events.put(("error", exc))
