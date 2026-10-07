@@ -222,6 +222,8 @@ async def run_chat_with_tools_with_files(
         "phase_started_at": time.monotonic(),
     }
     done = asyncio.Event()
+    remote_task_ids: list[str] = []
+    remote_chat_id: str | None = None
 
     def _emit_answer_snapshot(answer: str) -> None:
         if answer.startswith(state["answer"]):
@@ -535,14 +537,14 @@ async def run_chat_with_tools_with_files(
         if not isinstance(task_ids, list):
             task_id = ack.get("task_id")
             task_ids = [task_id] if task_id else []
+        remote_task_ids = [str(task_id) for task_id in task_ids if task_id]
         ack_chat_id = ack.get("chat_id")
+        remote_chat_id = str(ack_chat_id) if ack_chat_id else chat_id
         details = []
-        if task_ids:
-            details.append(
-                "task " + ",".join(str(task_id) for task_id in task_ids)
-            )
-        if ack_chat_id:
-            details.append(f"chat {ack_chat_id}")
+        if remote_task_ids:
+            details.append("task " + ",".join(remote_task_ids))
+        if remote_chat_id:
+            details.append(f"chat {remote_chat_id}")
         out_status(
             "request accepted" + (f" ({'; '.join(details)})" if details else "")
         )
@@ -594,4 +596,6 @@ async def run_chat_with_tools_with_files(
         # Full serialized content with <details> reasoning/tool_calls blocks —
         # needed by --save so the web UI can render them.
         "raw_content": state["raw_content"],
+        "remote_chat_id": remote_chat_id or chat_id,
+        "remote_task_ids": remote_task_ids,
     }
