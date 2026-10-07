@@ -150,6 +150,7 @@ def _wait_for_file_processing(
         "Authorization": f"Bearer {client.token}",
     }
 
+    last_status = None
     while True:
         if time.monotonic() >= deadline:
             raise llm.ModelError(
@@ -172,6 +173,12 @@ def _wait_for_file_processing(
             ) from exc
 
         status = payload.get("status") if isinstance(payload, dict) else None
+        if status != last_status:
+            click.echo(
+                f"[Open WebUI] {filename}: {status or 'waiting'}",
+                err=True,
+            )
+            last_status = status
         if status == "completed":
             return
         if status == "failed":
@@ -237,6 +244,7 @@ def _upload_attachment(
         "process_in_background": "true",
     }
     upload_timeout = max(float(client.timeout), 120.0)
+    click.echo(f"[Open WebUI] {filename}: uploading", err=True)
     try:
         with httpx2.Client(trust_env=True, timeout=upload_timeout) as http:
             result = http.post(
