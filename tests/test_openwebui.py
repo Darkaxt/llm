@@ -160,3 +160,53 @@ def test_openwebui_model_accepts_general_attachment_types(tmp_path):
     model._validate_attachments(
         [llm.Attachment(type="application/zip", path=str(path))]
     )
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _FakeHttp:
+    def __init__(self, statuses, file_payload=None):
+        self.statuses = iter(statuses)
+        self.file_payload = file_payload or {"data": {}}
+
+    def get(self, url, **kwargs):
+        if url.endswith("/process/status"):
+            return _FakeResponse({"status": next(self.statuses)})
+        return _FakeResponse(self.file_payload)
+
+
+def test_wait_for_file_processing_completes(monkeypatch):
+    monkeypatch.setattr(openwebui.time, "sleep", lambda _seconds: None)
+    http = _FakeHttp(["pending", "processing", "completed"])
+    client = SimpleNamespace(
+        base_url="https://example.test",
+        token="jwt",
+    )
+    openwebui._wait_for_file_processing(http, client, "file-1", "bundle.zip")
+
+
+def test_wait_for_file_processing_surfaces_server_error(monkeypatch):
+    monkeypatch.setattr(openwebui.time, "sleep", lambda _seconds: None)
+    http = _FakeHttp(
+        ["failed"],
+        file_payload={"data": {"error": "unsupported archive"}},
+    )
+    client = SimpleNamespace(
+        base_url="https://example.test",
+        token="jwt",
+    )
+    try:
+        openwebui._wait_for_file_processing(http, client, "file-1", "bundle.zip")
+    except llm.ModelError as exc:
+        assert "unsupported archive" in str(exc)
+    else:
+        raise AssertionError("expected file processing failure")
