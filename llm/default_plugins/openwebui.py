@@ -688,12 +688,38 @@ def _prepare_openwebui_request(
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     messages: list[dict[str, str]] = []
     files_by_id: dict[str, dict[str, Any]] = {}
-    total_attachments = sum(
-        1
-        for message in prompt.messages
-        for part in message.parts
-        if isinstance(part, AttachmentPart) and part.attachment is not None
-    )
+
+    # Build the upload plan first so progress counts reflect archive expansion.
+    # Cached sidecars are reused without re-reading/re-uploading the ZIP.
+    sidecar_plans: dict[int, list[tuple[str, llm.Attachment]]] = {}
+    total_attachments = 0
+    for message in prompt.messages:
+        for part in message.parts:
+            if not isinstance(part, AttachmentPart) or part.attachment is None:
+                continue
+            metadata = part.provider_metadata or {}
+            cached_sidecars = metadata.get("openwebui_sidecars")
+            cached_url = metadata.get("openwebui_url")
+            if (
+                isinstance(cached_sidecars, list)
+                and cached_sidecars
+                and cached_url == client.base_url
+                and all(isinstance(item, dict) and item.get("id") for item in cached_sidecars)
+            ):
+                total_attachments += len(cached_sidecars)
+                continue
+
+            filename = _attachment_filename(part.attachment, 0)
+            sidecars = _zip_sidecar_attachments(
+                part.attachment,
+                filename=filename,
+            )
+            if sidecars:
+                sidecar_plans[id(part)] = sidecars
+                total_attachments += len(sidecars)
+            else:
+                total_attachments += 1
+
     attachment_ordinal = 0
 
     for message in prompt.messages:
@@ -702,11 +728,74 @@ def _prepare_openwebui_request(
             if not isinstance(part, AttachmentPart) or part.attachment is None:
                 continue
             has_attachment = True
-            attachment_ordinal += 1
             metadata = part.provider_metadata or {}
-            cached = metadata.get("openwebui_file")
             cached_url = metadata.get("openwebui_url")
-            if isinstance(cached, dict) and cached.get("id") and cached_url == client.base_url:
+            archive_filename = _attachment_filename(part.attachment, index)
+
+            cached_sidecars = metadata.get("openwebui_sidecars")
+            if (
+                isinstance(cached_sidecars, list)
+                and cached_sidecars
+                and cached_url == client.base_url
+                and all(isinstance(item, dict) and item.get("id") for item in cached_sidecars)
+            ):
+                if on_status is not None:
+                    names = ", ".join(
+                        str(item.get("name") or item.get("id"))
+                        for item in cached_sidecars
+                    )
+                    on_status(
+                        f"archive {archive_filename} · reusing sidecars · {names}"
+                    )
+                for item in cached_sidecars:
+                    files_by_id[str(item["id"])] = item
+                continue
+
+            sidecars = sidecar_plans.get(id(part), [])
+            if sidecars:
+                if on_status is not None:
+                    on_status(
+                        f"archive {archive_filename} · exposing "
+                        + ", ".join(name for name, _ in sidecars)
+                    )
+
+                uploaded_sidecars: list[dict[str, Any]] = []
+                for sidecar_name, sidecar_attachment in sidecars:
+                    attachment_ordinal += 1
+                    item = _upload_attachment(
+                        client,
+                        sidecar_attachment,
+                        index,
+                        ordinal=attachment_ordinal,
+                        total=total_attachments,
+                        on_status=on_status,
+                        interactive_status=interactive_status,
+                        filename_override=sidecar_name,
+                    )
+                    uploaded_sidecars.append(item)
+                    files_by_id[str(item["id"])] = item
+
+                part.provider_metadata = {
+                    **metadata,
+                    "openwebui_sidecars": uploaded_sidecars,
+                    "openwebui_sidecar_names": [
+                        name for name, _ in sidecars
+                    ],
+                    "openwebui_url": client.base_url,
+                    "openwebui_archive_replaced": True,
+                }
+                # Do not upload the ZIP itself. The skill's machine-readable
+                # sidecars are the useful interface, and avoiding the archive
+                # removes the slow/opaque ZIP processing path.
+                continue
+
+            attachment_ordinal += 1
+            cached = metadata.get("openwebui_file")
+            if (
+                isinstance(cached, dict)
+                and cached.get("id")
+                and cached_url == client.base_url
+            ):
                 item = cached
             else:
                 item = _upload_attachment(
