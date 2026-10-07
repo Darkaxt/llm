@@ -827,6 +827,7 @@ def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
         "deleted": 0,
         "unmodified": 0,
         "uploaded": 2,
+        "reused": 0,
     }
 
 
@@ -893,3 +894,110 @@ def test_local_knowledge_manifest_expands_7z_as_virtual_tree(tmp_path):
 
     assert ("bundle", "rule-index.json") in virtual_paths
     assert ("", "bundle.7z") not in virtual_paths
+
+
+
+def test_resume_knowledge_file_reuses_oldest_matching_upload(monkeypatch):
+    calls = []
+
+    candidates_by_hash = {
+        "abc": [
+            {
+                "id": "old-file",
+                "filename": "rule-index.json",
+                "created_at": 10,
+                "data": {"status": "completed"},
+                "meta": {
+                    "name": "rule-index.json",
+                    "file_hash": "abc",
+                    "data": {
+                        "knowledge_id": "kb-1",
+                        "directory_id": "dir-1",
+                    },
+                },
+            },
+            {
+                "id": "new-failed-retry",
+                "filename": "rule-index.json",
+                "created_at": 20,
+                "data": {
+                    "status": "failed",
+                    "error": "Duplicate content detected.",
+                },
+                "meta": {
+                    "name": "rule-index.json",
+                    "file_hash": "abc",
+                    "data": {
+                        "knowledge_id": "kb-1",
+                        "directory_id": "dir-1",
+                    },
+                },
+            },
+        ]
+    }
+
+    def fake_json(client, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        if path.endswith("/file/add"):
+            assert kwargs["json_body"]["file_id"] == "old-file"
+            return {"id": "kb-1"}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(openwebui, "_owui_http_json", fake_json)
+
+    entry = {
+        "filename": "rule-index.json",
+        "path": "bundle",
+        "checksum": "abc",
+    }
+    client = SimpleNamespace(timeout=600)
+
+    assert openwebui._resume_knowledge_file(
+        client,
+        knowledge_id="kb-1",
+        entry=entry,
+        directory_id="dir-1",
+        candidates_by_hash=candidates_by_hash,
+    )
+    assert len(calls) == 1
+
+
+def test_matching_resume_candidates_requires_filename_and_prefers_directory():
+    candidates_by_hash = {
+        "abc": [
+            {
+                "id": "wrong-name",
+                "filename": "macros.json",
+                "meta": {
+                    "name": "macros.json",
+                    "data": {"directory_id": "dir-1"},
+                },
+            },
+            {
+                "id": "fallback-root",
+                "filename": "rule-index.json",
+                "meta": {
+                    "name": "rule-index.json",
+                    "data": {},
+                },
+            },
+            {
+                "id": "exact",
+                "filename": "rule-index.json",
+                "meta": {
+                    "name": "rule-index.json",
+                    "data": {"directory_id": "dir-1"},
+                },
+            },
+        ]
+    }
+
+    matches = openwebui._matching_resume_candidates(
+        {
+            "filename": "rule-index.json",
+            "checksum": "abc",
+        },
+        "dir-1",
+        candidates_by_hash,
+    )
+    assert [item["id"] for item in matches] == ["exact", "fallback-root"]
