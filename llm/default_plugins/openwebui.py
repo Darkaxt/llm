@@ -27,6 +27,22 @@ from openwebui_sdk.errors import APIError, AuthError
 CONFIG_FILENAME = "openwebui.json"
 
 
+def _escape_pressed() -> bool:
+    """Return True when Escape was pressed during generation on Windows.
+
+    GetAsyncKeyState lets us detect Escape without consuming type-ahead from
+    stdin. Ctrl+C remains handled by Python's normal KeyboardInterrupt path.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x0001)
+    except Exception:
+        return False
+
+
 def _config_path() -> Path:
     return llm.user_dir() / CONFIG_FILENAME
 
@@ -699,7 +715,12 @@ class OpenWebUIModel(llm.Model):
         thread.start()
 
         while True:
-            kind, payload = events.get()
+            if _escape_pressed():
+                raise KeyboardInterrupt
+            try:
+                kind, payload = events.get(timeout=0.1)
+            except queue.Empty:
+                continue
             if kind == "text":
                 yield str(payload)
             elif kind == "reasoning":
