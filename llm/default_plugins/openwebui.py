@@ -373,7 +373,14 @@ def _enabled_knowledge_items(
                 f"Enabled Open WebUI knowledge base {knowledge_id} "
                 f"is unavailable: {exc}"
             ) from exc
-        items.append({"type": "collection", **knowledge})
+        items.append(
+            {
+                "type": "collection",
+                "id": str(knowledge["id"]),
+                "name": knowledge.get("name"),
+                "description": knowledge.get("description"),
+            }
+        )
     return items
 
 
