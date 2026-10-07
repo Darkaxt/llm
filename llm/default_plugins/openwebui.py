@@ -392,6 +392,130 @@ def _enabled_tool_ids(config: dict[str, Any]) -> list[str]:
     return [str(value) for value in raw if value]
 
 
+_KB_ARCHIVE_MAX_MEMBER_BYTES = 64 * 1024 * 1024
+_KB_ARCHIVE_MAX_TOTAL_BYTES = 512 * 1024 * 1024
+
+
+def _safe_archive_member_path(name: str) -> PurePosixPath | None:
+    normalized = str(name).replace("\\", "/").lstrip("/")
+    path = PurePosixPath(normalized)
+    if not path.name:
+        return None
+    if any(part in {"", ".", ".."} for part in path.parts):
+        if ".." in path.parts:
+            raise click.ClickException(
+                f"Archive member uses an unsafe relative path: {name!r}"
+            )
+    if any(part.startswith(".") for part in path.parts):
+        return None
+    return path
+
+
+def _zip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]:
+    members: list[tuple[PurePosixPath, bytes]] = []
+    total = 0
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                member_path = _safe_archive_member_path(info.filename)
+                if member_path is None:
+                    continue
+                if info.file_size > _KB_ARCHIVE_MAX_MEMBER_BYTES:
+                    raise click.ClickException(
+                        f"Archive member {info.filename!r} is too large "
+                        f"({info.file_size} bytes)"
+                    )
+                total += int(info.file_size)
+                if total > _KB_ARCHIVE_MAX_TOTAL_BYTES:
+                    raise click.ClickException(
+                        f"Expanded archive {path} exceeds "
+                        f"{_KB_ARCHIVE_MAX_TOTAL_BYTES} bytes"
+                    )
+                members.append((member_path, archive.read(info)))
+    except zipfile.BadZipFile as exc:
+        raise click.ClickException(f"Invalid ZIP archive {path}: {exc}") from exc
+    return members
+
+
+def _sevenzip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]:
+    try:
+        import py7zr
+    except ImportError as exc:
+        raise click.ClickException(
+            "7z knowledge sync requires py7zr; reinstall with "
+            "python -m pip install -e ."
+        ) from exc
+
+    try:
+        with py7zr.SevenZipFile(path, mode="r") as archive:
+            if archive.needs_password():
+                raise click.ClickException(
+                    f"7z archive {path} is password-protected"
+                )
+            infos = [info for info in archive.list() if not info.is_directory]
+            selected: list[tuple[str, PurePosixPath]] = []
+            total = 0
+            for info in infos:
+                member_path = _safe_archive_member_path(info.filename)
+                if member_path is None:
+                    continue
+                size = int(info.uncompressed or 0)
+                if size > _KB_ARCHIVE_MAX_MEMBER_BYTES:
+                    raise click.ClickException(
+                        f"Archive member {info.filename!r} is too large "
+                        f"({size} bytes)"
+                    )
+                total += size
+                if total > _KB_ARCHIVE_MAX_TOTAL_BYTES:
+                    raise click.ClickException(
+                        f"Expanded archive {path} exceeds "
+                        f"{_KB_ARCHIVE_MAX_TOTAL_BYTES} bytes"
+                    )
+                selected.append((info.filename, member_path))
+
+            if not selected:
+                return []
+
+            factory = py7zr.BytesIOFactory(_KB_ARCHIVE_MAX_MEMBER_BYTES + 1)
+            archive.extract(
+                targets=[raw_name for raw_name, _ in selected],
+                factory=factory,
+            )
+
+            members: list[tuple[PurePosixPath, bytes]] = []
+            for raw_name, member_path in selected:
+                product = factory.get(raw_name)
+                product.seek(0)
+                data = product.read()
+                if len(data) > _KB_ARCHIVE_MAX_MEMBER_BYTES:
+                    raise click.ClickException(
+                        f"Archive member {raw_name!r} exceeded the extraction limit"
+                    )
+                members.append((member_path, data))
+            return members
+    except click.ClickException:
+        raise
+    except py7zr.Bad7zFile as exc:
+        raise click.ClickException(f"Invalid 7z archive {path}: {exc}") from exc
+    except Exception as exc:
+        raise click.ClickException(
+            f"Failed to read 7z archive {path}: {exc}"
+        ) from exc
+
+
+def _knowledge_archive_members(
+    path: Path,
+) -> list[tuple[PurePosixPath, bytes]] | None:
+    suffix = path.suffix.lower()
+    if suffix == ".zip":
+        return _zip_knowledge_members(path)
+    if suffix == ".7z":
+        return _sevenzip_knowledge_members(path)
+    return None
+
+
 def _local_knowledge_manifest(root: Path) -> list[dict[str, Any]]:
     root = root.expanduser().resolve()
     if not root.exists():
@@ -400,8 +524,56 @@ def _local_knowledge_manifest(root: Path) -> list[dict[str, Any]]:
         raise click.ClickException(f"Knowledge source is not a folder: {root}")
 
     manifest: list[dict[str, Any]] = []
+    seen_virtual_paths: dict[tuple[str, str], str] = {}
+
+    def add_entry(
+        *,
+        virtual_path: PurePosixPath,
+        content: bytes | None,
+        local_path: Path,
+        source_label: str,
+    ) -> None:
+        parent = virtual_path.parent.as_posix()
+        if parent == ".":
+            parent = ""
+        key = (parent, virtual_path.name)
+        previous = seen_virtual_paths.get(key)
+        if previous is not None:
+            display = f"{parent}/{virtual_path.name}" if parent else virtual_path.name
+            raise click.ClickException(
+                f"Knowledge source contains duplicate virtual path {display!r}: "
+                f"{previous} and {source_label}"
+            )
+        seen_virtual_paths[key] = source_label
+
+        if content is None:
+            digest = hashlib.sha256()
+            size = 0
+            with local_path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+            checksum = digest.hexdigest()
+        else:
+            size = len(content)
+            checksum = hashlib.sha256(content).hexdigest()
+
+        entry: dict[str, Any] = {
+            "filename": virtual_path.name,
+            "path": parent,
+            "checksum": checksum,
+            "size": size,
+            "_local_path": str(local_path),
+        }
+        if content is not None:
+            entry["_content"] = content
+            entry["_archive_source"] = source_label
+        manifest.append(entry)
+
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        # Match Open WebUI's directory picker behavior: ignore hidden content.
         dirnames[:] = sorted(
             name
             for name in dirnames
@@ -414,29 +586,40 @@ def _local_knowledge_manifest(root: Path) -> list[dict[str, Any]]:
             full_path = Path(dirpath) / filename
             if full_path.is_symlink() or not full_path.is_file():
                 continue
+
             relative = full_path.relative_to(root)
-            parent = relative.parent.as_posix()
-            if parent == ".":
-                parent = ""
-            digest = hashlib.sha256()
-            size = 0
-            with full_path.open("rb") as handle:
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    size += len(chunk)
-            manifest.append(
-                {
-                    "filename": filename,
-                    "path": parent,
-                    "checksum": digest.hexdigest(),
-                    "size": size,
-                    "_local_path": str(full_path),
-                }
-            )
+            archive_members = _knowledge_archive_members(full_path)
+            if archive_members is None:
+                add_entry(
+                    virtual_path=PurePosixPath(relative.as_posix()),
+                    content=None,
+                    local_path=full_path,
+                    source_label=str(relative),
+                )
+                continue
+
+            archive_parent = PurePosixPath(relative.parent.as_posix())
+            for member_path, data in archive_members:
+                virtual_path = (
+                    archive_parent / member_path
+                    if archive_parent.as_posix() not in {"", "."}
+                    else member_path
+                )
+                add_entry(
+                    virtual_path=virtual_path,
+                    content=data,
+                    local_path=full_path,
+                    source_label=f"{relative}!/{member_path.as_posix()}",
+                )
+
+    manifest.sort(
+        key=lambda item: (
+            str(item["path"]).casefold(),
+            str(item["filename"]).casefold(),
+        )
+    )
     return manifest
+
 
 
 def _content_type_for_path(path: Path) -> str:
@@ -501,12 +684,15 @@ def _upload_knowledge_sync_file(
     interactive_status: bool = False,
 ) -> dict[str, Any]:
     path = Path(str(entry["_local_path"]))
-    try:
-        content = path.read_bytes()
-    except Exception as exc:
-        raise llm.ModelError(
-            f"Could not read knowledge source file {path}: {exc}"
-        ) from exc
+    if "_content" in entry:
+        content = bytes(entry["_content"])
+    else:
+        try:
+            content = path.read_bytes()
+        except Exception as exc:
+            raise llm.ModelError(
+                f"Could not read knowledge source file {path}: {exc}"
+            ) from exc
 
     metadata = {
         "knowledge_id": knowledge_id,
@@ -548,7 +734,7 @@ def _upload_knowledge_sync_file(
                     "file": (
                         entry["filename"],
                         content,
-                        _content_type_for_path(path),
+                        _content_type_for_path(Path(str(entry["filename"]))),
                     )
                 },
             )
