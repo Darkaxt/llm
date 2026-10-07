@@ -262,3 +262,12 @@ def test_attachment_context_full_is_explicit_override():
     ]
     openwebui._apply_attachment_context_policy(files, "full")
     assert files[0]["context"] == "full"
+
+
+
+def test_openwebui_chat_timeout_default_and_override(monkeypatch):
+    monkeypatch.delenv("LLM_OPENWEBUI_CHAT_TIMEOUT", raising=False)
+    assert openwebui._chat_timeout() == 600
+
+    monkeypatch.setenv("LLM_OPENWEBUI_CHAT_TIMEOUT", "900")
+    assert openwebui._chat_timeout() == 900
