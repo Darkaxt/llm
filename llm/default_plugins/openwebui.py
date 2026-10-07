@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
+import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlparse
 
 import click
@@ -25,6 +27,55 @@ from openwebui_sdk import ChatResult, OpenWebUIClient
 from openwebui_sdk.errors import APIError, AuthError
 
 CONFIG_FILENAME = "openwebui.json"
+
+
+class _OpenWebUIStatusBar:
+    """One transient terminal line for Open WebUI transport/meta activity."""
+
+    def __init__(self) -> None:
+        self.enabled = bool(
+            getattr(sys.stderr, "isatty", lambda: False)()
+            and getattr(sys.stdout, "isatty", lambda: False)()
+        )
+        self.visible = False
+        self.current = ""
+
+    def _width(self) -> int:
+        return max(20, shutil.get_terminal_size((120, 24)).columns)
+
+    def _render_text(self, text: str, *, kind: str = "status") -> str:
+        normalized = " ".join(str(text).split())
+        if kind == "tool":
+            normalized = f"tool · {normalized}"
+        prefix = "Open WebUI │ "
+        width = self._width()
+        available = max(8, width - len(prefix) - 1)
+        if len(normalized) > available:
+            normalized = normalized[: max(1, available - 1)] + "…"
+        return prefix + normalized
+
+    def update(self, text: str, *, kind: str = "status") -> None:
+        self.current = str(text)
+        if not self.enabled:
+            prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
+            click.echo(f"{prefix} {text}", err=True)
+            return
+
+        width = self._width()
+        line = self._render_text(text, kind=kind)
+        # Use only carriage returns/spaces rather than ANSI cursor control so
+        # this remains reliable in Windows Terminal/PowerShell.
+        sys.stderr.write("\r" + (" " * (width - 1)) + "\r" + line)
+        sys.stderr.flush()
+        self.visible = True
+
+    def clear(self) -> None:
+        if not self.enabled or not self.visible:
+            return
+        width = self._width()
+        sys.stderr.write("\r" + (" " * (width - 1)) + "\r")
+        sys.stderr.flush()
+        self.visible = False
 
 
 def _escape_pressed() -> bool:
@@ -243,16 +294,21 @@ def _render_file_progress(
     ordinal: int,
     total: int,
     done: bool = False,
+    on_status: Callable[[str], None] | None = None,
 ) -> None:
     elapsed = _format_elapsed(time.monotonic() - started)
+    if on_status is not None:
+        on_status(
+            f"attachments {ordinal}/{total} · {filename} · {status} · {elapsed}"
+        )
+        return
+
     bar = "[" + "=" * 18 + "]" if done else _activity_bar(tick)
     line = (
         f"[Open WebUI] {ordinal}/{total} {bar} "
         f"{filename}: {status} · {elapsed}"
     )
-    # In a terminal update one line in-place. When redirected, emit normal
-    # newline-delimited status so logs remain readable.
-    if hasattr(__import__("sys").stderr, "isatty") and __import__("sys").stderr.isatty():
+    if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
         click.echo("\r" + line.ljust(120), nl=done, err=True)
     else:
         click.echo(line, err=True)
@@ -267,6 +323,8 @@ def _wait_for_file_processing(
     ordinal: int = 1,
     total: int = 1,
     started: float | None = None,
+    on_status: Callable[[str], None] | None = None,
+    interactive_status: bool = False,
 ) -> None:
     """Wait for Open WebUI's background extraction/RAG processing.
 
@@ -306,10 +364,12 @@ def _wait_for_file_processing(
 
         status = payload.get("status") if isinstance(payload, dict) else None
         display_status = status or "waiting"
-        if status != last_status or (
-            hasattr(__import__("sys").stderr, "isatty")
-            and __import__("sys").stderr.isatty()
-        ):
+        terminal_updates = interactive_status or (
+            on_status is None
+            and hasattr(sys.stderr, "isatty")
+            and sys.stderr.isatty()
+        )
+        if status != last_status or terminal_updates:
             _render_file_progress(
                 filename=filename,
                 status=display_status,
@@ -318,6 +378,7 @@ def _wait_for_file_processing(
                 ordinal=ordinal,
                 total=total,
                 done=status == "completed",
+                on_status=on_status,
             )
             last_status = status
         if status == "completed":
@@ -358,6 +419,8 @@ def _upload_attachment(
     *,
     ordinal: int = 1,
     total: int = 1,
+    on_status: Callable[[str], None] | None = None,
+    interactive_status: bool = False,
 ) -> dict[str, Any]:
     """Upload one LLM attachment using Open WebUI's native file API.
 
@@ -397,6 +460,7 @@ def _upload_attachment(
         tick=0,
         ordinal=ordinal,
         total=total,
+        on_status=on_status,
     )
     try:
         with httpx2.Client(trust_env=True, timeout=upload_timeout) as http:
@@ -426,6 +490,8 @@ def _upload_attachment(
                     ordinal=ordinal,
                     total=total,
                     started=started,
+                    on_status=on_status,
+                    interactive_status=interactive_status,
                 )
     except llm.ModelError:
         raise
@@ -490,6 +556,8 @@ def _is_textual_attachment(item: dict[str, Any]) -> bool:
 def _apply_attachment_context_policy(
     files: list[dict[str, Any]],
     mode: Literal["auto", "full", "rag"],
+    *,
+    on_status: Callable[[str], None] | None = None,
 ) -> None:
     """Choose full-context vs Open WebUI retrieval for uploaded files.
 
@@ -532,15 +600,19 @@ def _apply_attachment_context_policy(
         decisions.append(f"{item.get('name') or item.get('id')}={decision}")
 
     if decisions:
-        click.echo(
-            "[Open WebUI] attachment context: " + ", ".join(decisions),
-            err=True,
-        )
+        message = "attachment context · " + " · ".join(decisions)
+        if on_status is not None:
+            on_status(message)
+        else:
+            click.echo("[Open WebUI] " + message, err=True)
 
 
 def _prepare_openwebui_request(
     prompt: llm.Prompt,
     client: OpenWebUIClient,
+    *,
+    on_status: Callable[[str], None] | None = None,
+    interactive_status: bool = False,
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
     messages: list[dict[str, str]] = []
     files_by_id: dict[str, dict[str, Any]] = {}
@@ -571,6 +643,8 @@ def _prepare_openwebui_request(
                     index,
                     ordinal=attachment_ordinal,
                     total=total_attachments,
+                    on_status=on_status,
+                    interactive_status=interactive_status,
                 )
                 part.provider_metadata = {
                     **metadata,
@@ -587,6 +661,7 @@ def _prepare_openwebui_request(
     _apply_attachment_context_policy(
         files,
         prompt.options.openwebui_attachment_context,
+        on_status=on_status,
     )
     return messages, files
 
