@@ -669,11 +669,13 @@ class OpenWebUIModel(llm.Model):
 
         def worker() -> None:
             try:
-                if tool_ids and attached_files:
-                    # openwebui-sdk 0.1.1 does not yet expose its top-level
-                    # "files" field on the Socket.IO tool path. Use the vendored
-                    # compatibility runner so attachments and model-attached
-                    # tools work together instead of silently dropping either.
+                if tool_ids:
+                    # Always use our compatibility runner for tool-enabled chats.
+                    # The installed SDK still generates a bare UUID chat_id for
+                    # unsaved chats, which current Open WebUI treats as a missing
+                    # persisted chat and rejects with 404. Our runner mirrors the
+                    # browser's temporary:<socket-id> convention and also supports
+                    # attachments on the same request.
                     data = __import__("asyncio").run(
                         run_chat_with_tools_with_files(
                             base_url=client.base_url,
