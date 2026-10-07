@@ -60,7 +60,7 @@ def test_prepare_openwebui_request_uploads_and_reuses_attachment(tmp_path, monke
     monkeypatch.setattr(
         openwebui,
         "_upload_attachment",
-        lambda client, attachment, index: calls.append(index) or uploaded,
+        lambda client, attachment, index, **kwargs: calls.append(index) or uploaded,
     )
     client = SimpleNamespace(base_url="https://example.test")
 
@@ -210,3 +210,55 @@ def test_wait_for_file_processing_surfaces_server_error(monkeypatch):
         assert "unsupported archive" in str(exc)
     else:
         raise AssertionError("expected file processing failure")
+
+
+
+def test_attachment_context_auto_uses_full_for_small_text_and_rag_for_zip():
+    files = [
+        {
+            "type": "file",
+            "id": "md",
+            "name": "SKILL.md",
+            "content_type": "text/markdown",
+            "size": 32_000,
+        },
+        {
+            "type": "file",
+            "id": "zip",
+            "name": "kb.zip",
+            "content_type": "application/zip",
+            "size": 40_000,
+        },
+    ]
+    openwebui._apply_attachment_context_policy(files, "auto")
+    assert files[0]["context"] == "full"
+    assert "context" not in files[1]
+
+
+def test_attachment_context_rag_forces_chunked_retrieval():
+    files = [
+        {
+            "type": "file",
+            "id": "md",
+            "name": "SPEC.md",
+            "content_type": "text/markdown",
+            "size": 12_000,
+            "context": "full",
+        }
+    ]
+    openwebui._apply_attachment_context_policy(files, "rag")
+    assert "context" not in files[0]
+
+
+def test_attachment_context_full_is_explicit_override():
+    files = [
+        {
+            "type": "file",
+            "id": "zip",
+            "name": "kb.zip",
+            "content_type": "application/zip",
+            "size": 40_000,
+        }
+    ]
+    openwebui._apply_attachment_context_policy(files, "full")
+    assert files[0]["context"] == "full"
