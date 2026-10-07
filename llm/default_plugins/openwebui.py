@@ -713,7 +713,23 @@ class OpenWebUIModel(llm.Model):
             )
 
         client = _client(config)
-        messages, attached_files = _prepare_openwebui_request(prompt, client)
+        status_bar = _OpenWebUIStatusBar()
+        status_activity: list[str] = []
+
+        def prepare_status(line: str) -> None:
+            status_activity.append(line)
+            status_bar.update(line)
+
+        try:
+            messages, attached_files = _prepare_openwebui_request(
+                prompt,
+                client,
+                on_status=prepare_status,
+                interactive_status=status_bar.enabled,
+            )
+        except Exception:
+            status_bar.clear()
+            raise
 
         try:
             tool_ids = client.resolve_tools(
@@ -726,7 +742,6 @@ class OpenWebUIModel(llm.Model):
 
         events: queue.Queue[tuple[str, Any]] = queue.Queue()
         tool_activity: list[str] = []
-        status_activity: list[str] = []
         remote_execution: dict[str, Any] = {}
 
         def on_text(fragment: str) -> None:
@@ -799,45 +814,54 @@ class OpenWebUIModel(llm.Model):
         thread.start()
 
         output_line_open = False
-        while True:
-            if _escape_pressed():
-                raise KeyboardInterrupt
-            try:
-                kind, payload = events.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if kind == "text":
-                chunk = str(payload)
-                output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
-                yield chunk
-            elif kind == "reasoning":
-                if not prompt.hide_reasoning:
+        try:
+            while True:
+                if _escape_pressed():
+                    raise KeyboardInterrupt
+                try:
+                    kind, payload = events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if kind == "text":
+                    status_bar.clear()
                     chunk = str(payload)
                     output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
-                    yield StreamEvent(type="reasoning", chunk=chunk)
-            elif kind in ("tool", "status"):
-                if output_line_open:
-                    click.echo("", err=True)
-                prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
-                click.echo(f"{prefix} {payload}", err=True)
-                output_line_open = False
-            elif kind == "error":
-                if isinstance(payload, (APIError, AuthError)):
-                    raise llm.ModelError(str(payload)) from payload
-                raise payload
-            elif kind == "done":
-                result = payload
-                response.response_json = {
-                    "provider": "openwebui",
-                    "remote_model": self.remote_model_id,
-                    "reasoning": result.reasoning,
-                    "tool_calls": result.tool_calls,
-                    "tool_activity": tool_activity,
-                    "status_activity": status_activity,
-                    "raw_content": result.raw_content,
-                    **remote_execution,
-                }
-                break
+                    yield chunk
+                elif kind == "reasoning":
+                    if not prompt.hide_reasoning:
+                        status_bar.clear()
+                        chunk = str(payload)
+                        output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
+                        yield StreamEvent(type="reasoning", chunk=chunk)
+                elif kind in ("tool", "status"):
+                    if output_line_open:
+                        click.echo("", err=True)
+                        output_line_open = False
+                    status_bar.update(
+                        str(payload),
+                        kind="tool" if kind == "tool" else "status",
+                    )
+                elif kind == "error":
+                    status_bar.clear()
+                    if isinstance(payload, (APIError, AuthError)):
+                        raise llm.ModelError(str(payload)) from payload
+                    raise payload
+                elif kind == "done":
+                    status_bar.clear()
+                    result = payload
+                    response.response_json = {
+                        "provider": "openwebui",
+                        "remote_model": self.remote_model_id,
+                        "reasoning": result.reasoning,
+                        "tool_calls": result.tool_calls,
+                        "tool_activity": tool_activity,
+                        "status_activity": status_activity,
+                        "raw_content": result.raw_content,
+                        **remote_execution,
+                    }
+                    break
+        finally:
+            status_bar.clear()
 
 
 @llm.hookimpl
