@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import urlparse
@@ -118,6 +119,89 @@ def _attachment_filename(attachment: llm.Attachment, index: int) -> str:
     return f"attachment-{index}{suffix}"
 
 
+def _file_processing_timeout() -> float:
+    raw = os.environ.get("LLM_OPENWEBUI_FILE_TIMEOUT", "600")
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise llm.ModelError(
+            "LLM_OPENWEBUI_FILE_TIMEOUT must be a number of seconds"
+        ) from exc
+    if timeout <= 0:
+        raise llm.ModelError("LLM_OPENWEBUI_FILE_TIMEOUT must be greater than zero")
+    return timeout
+
+
+def _wait_for_file_processing(
+    http: httpx2.Client,
+    client: OpenWebUIClient,
+    file_id: str,
+    filename: str,
+) -> None:
+    """Wait for Open WebUI's background extraction/RAG processing.
+
+    The browser uses /process/status after the upload POST instead of keeping
+    the upload request open. Polling the non-streaming status endpoint gives us
+    the same semantics without tying a long-running SSE connection to the CLI.
+    """
+    deadline = time.monotonic() + _file_processing_timeout()
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {client.token}",
+    }
+
+    while True:
+        if time.monotonic() >= deadline:
+            raise llm.ModelError(
+                f"Open WebUI timed out processing {filename} "
+                f"after {_file_processing_timeout():g}s"
+            )
+
+        try:
+            status_response = http.get(
+                f"{client.base_url}/api/v1/files/{file_id}/process/status",
+                params={"stream": "false"},
+                headers=headers,
+            )
+            status_response.raise_for_status()
+            payload = status_response.json()
+        except Exception as exc:
+            raise llm.ModelError(
+                f"Open WebUI failed while checking processing status for "
+                f"{filename}: {exc}"
+            ) from exc
+
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if status == "completed":
+            return
+        if status == "failed":
+            detail = None
+            try:
+                file_response = http.get(
+                    f"{client.base_url}/api/v1/files/{file_id}",
+                    headers=headers,
+                )
+                file_response.raise_for_status()
+                file_payload = file_response.json()
+                if isinstance(file_payload, dict):
+                    data = file_payload.get("data")
+                    if isinstance(data, dict):
+                        detail = data.get("error")
+            except Exception:
+                pass
+            suffix = f": {detail}" if detail else ""
+            raise llm.ModelError(
+                f"Open WebUI failed to process {filename}{suffix}"
+            )
+        if status not in ("pending", "processing", None):
+            raise llm.ModelError(
+                f"Open WebUI returned unexpected processing status "
+                f"{status!r} for {filename}"
+            )
+
+        time.sleep(1)
+
+
 def _upload_attachment(
     client: OpenWebUIClient,
     attachment: llm.Attachment,
@@ -125,9 +209,10 @@ def _upload_attachment(
 ) -> dict[str, Any]:
     """Upload one LLM attachment using Open WebUI's native file API.
 
-    Documents are synchronously processed so the completion cannot race the
-    RAG/file-extraction worker. Raster images are stored without document
-    processing and are still supplied in the top-level files list.
+    Documents follow the browser flow: the upload POST returns quickly while
+    extraction/RAG processing continues in the background, then we wait on the
+    file process-status endpoint before starting model inference. Raster images
+    are stored without document processing.
     """
     content_type = attachment.type
     if not content_type:
@@ -147,10 +232,13 @@ def _upload_attachment(
     is_image = content_type.startswith("image/")
     params = {
         "process": "false" if is_image else "true",
-        "process_in_background": "false",
+        # Match the Open WebUI browser: return the uploaded file record first,
+        # then observe processing separately through /process/status.
+        "process_in_background": "true",
     }
+    upload_timeout = max(float(client.timeout), 120.0)
     try:
-        with httpx2.Client(trust_env=True, timeout=client.timeout) as http:
+        with httpx2.Client(trust_env=True, timeout=upload_timeout) as http:
             result = http.post(
                 f"{client.base_url}/api/v1/files/",
                 params=params,
@@ -162,13 +250,23 @@ def _upload_attachment(
             )
             result.raise_for_status()
             uploaded = result.json()
+
+            if not isinstance(uploaded, dict) or not uploaded.get("id"):
+                raise llm.ModelError(
+                    f"Open WebUI returned an invalid upload response for {filename}"
+                )
+
+            if not is_image:
+                _wait_for_file_processing(
+                    http,
+                    client,
+                    str(uploaded["id"]),
+                    filename,
+                )
+    except llm.ModelError:
+        raise
     except Exception as exc:
         raise llm.ModelError(f"Open WebUI failed to upload {filename}: {exc}") from exc
-
-    if not isinstance(uploaded, dict) or not uploaded.get("id"):
-        raise llm.ModelError(
-            f"Open WebUI returned an invalid upload response for {filename}"
-        )
 
     meta = uploaded.get("meta") if isinstance(uploaded.get("meta"), dict) else {}
     effective_type = meta.get("content_type") or content_type
