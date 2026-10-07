@@ -235,6 +235,23 @@ class OpenWebUIModel(llm.Model):
         self.display_name = display_name or remote_model_id
         self.model_id = f"openwebui/{remote_model_id}"
 
+    # Open WebUI's /api/v1/files endpoint accepts general file uploads and
+    # applies the deployment's own allowed-extension / size policy. LLM's base
+    # Model class otherwise rejects every attachment unless it is enumerated in
+    # attachment_types, which is too restrictive for a dynamic Open WebUI
+    # backend (Markdown, JSON, ZIP bundles, PDFs, source files, etc.).
+    def _validate_attachments(
+        self, attachments: list[llm.Attachment] | None = None
+    ) -> None:
+        for attachment in attachments or []:
+            # Resolve early so path/stdin attachments still fail with a useful
+            # error if LLM cannot determine a MIME type. The Open WebUI server
+            # remains authoritative for whether that type/extension is allowed.
+            try:
+                attachment.resolve_type()
+            except Exception as exc:
+                raise ValueError(f"Could not determine attachment type: {exc}") from exc
+
     def __str__(self) -> str:
         return f"Open WebUI: {self.display_name}"
 
