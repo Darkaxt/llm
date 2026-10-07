@@ -592,6 +592,11 @@ def _sync_knowledge_folder(
     if on_status is not None:
         on_status(f"knowledge sync · hashing {root}")
     manifest = _local_knowledge_manifest(root)
+    if not manifest:
+        raise click.ClickException(
+            f"Knowledge source folder contains no visible files: {root}. "
+            "Refusing to sync an empty folder."
+        )
     wire_manifest = [
         {
             key: entry[key]
