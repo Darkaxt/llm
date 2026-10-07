@@ -48,6 +48,7 @@ def test_chat_basic(mock_model, logs_db):
         "\nType 'exit' or 'quit' to exit"
         "\nType '!multi' to enter multiple lines, then '!end' to finish"
         "\nType '!edit' to open your default editor and modify the prompt"
+        "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         "\n> Hi"
         "\none world"
@@ -97,6 +98,7 @@ def test_chat_basic(mock_model, logs_db):
         "\nType 'exit' or 'quit' to exit"
         "\nType '!multi' to enter multiple lines, then '!end' to finish"
         "\nType '!edit' to open your default editor and modify the prompt"
+        "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         "\n> Continue"
         "\ncontinued"
@@ -133,6 +135,7 @@ def test_chat_system(mock_model, logs_db):
         "\nType 'exit' or 'quit' to exit"
         "\nType '!multi' to enter multiple lines, then '!end' to finish"
         "\nType '!edit' to open your default editor and modify the prompt"
+        "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         "\n> Hi"
         "\nI am mean"
@@ -307,6 +310,7 @@ def test_chat_tools(logs_db):
         "Type 'exit' or 'quit' to exit\n"
         "Type '!multi' to enter multiple lines, then '!end' to finish\n"
         "Type '!edit' to open your default editor and modify the prompt\n"
+        "Press Ctrl+C during generation to cancel the current response\n"
         "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments\n"
         '> {"prompt": "Convert hello to uppercase", "tool_calls": [{"name": "upper", '
         '"arguments": {"text": "hello"}}]}\n'
@@ -356,3 +360,34 @@ def test_chat_fragments(tmpdir):
     ).output
     assert '"prompt": "one' in output
     assert '"prompt": "two"' in output
+
+
+
+def test_run_chat_ctrl_c_cancels_current_response(monkeypatch, capsys):
+    prompts = iter(["hello", "quit"])
+    monkeypatch.setattr(
+        llm.cli.click,
+        "prompt",
+        lambda *args, **kwargs: next(prompts),
+    )
+
+    class FakeResponse:
+        def stream_events(self):
+            return iter(())
+
+    monkeypatch.setattr(
+        llm.cli,
+        "display_stream_events",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    after = []
+    llm.cli._run_chat(
+        "mock",
+        lambda prompt, fragments, attachments: FakeResponse(),
+        after_response=lambda response: after.append(response),
+    )
+
+    captured = capsys.readouterr()
+    assert "Cancelled current response." in captured.err
+    assert after == []
