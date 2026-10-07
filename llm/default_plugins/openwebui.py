@@ -271,6 +271,29 @@ def _list_knowledge_bases(client: OpenWebUIClient) -> list[dict[str, Any]]:
     return items
 
 
+def _create_knowledge_base(
+    client: OpenWebUIClient,
+    name: str,
+    description: str,
+) -> dict[str, Any]:
+    payload = _owui_http_json(
+        client,
+        "POST",
+        "/api/v1/knowledge/create",
+        json_body={
+            "name": name,
+            "description": description,
+            "access_grants": [],
+        },
+        timeout=max(float(client.timeout), 300.0),
+    )
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise llm.ModelError(
+            f"Open WebUI returned an invalid knowledge base after creating {name!r}"
+        )
+    return payload
+
+
 def _get_knowledge_by_id(
     client: OpenWebUIClient,
     knowledge_id: str,
