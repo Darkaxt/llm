@@ -445,3 +445,14 @@ def test_read_chat_prompt_noninteractive_uses_click(monkeypatch):
         lambda *args, **kwargs: "hello",
     )
     assert llm.cli._read_chat_prompt(None) == "hello"
+
+
+
+def test_chat_prompt_session_shift_enter_sequences():
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.keys import Keys
+
+    llm.cli._build_chat_prompt_session()
+
+    assert ANSI_SEQUENCES["\x1b[27;2;13~"] == Keys.F24
+    assert ANSI_SEQUENCES["\x1b[13;2u"] == Keys.F24
