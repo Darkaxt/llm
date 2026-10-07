@@ -444,6 +444,25 @@ async def run_chat_with_tools_with_files(
 
     out_status("tool session connected")
 
+    # Mirror the browser's post-connect authentication handshake. The server's
+    # connect(auth=...) path should already populate SESSION_POOL and join the
+    # user:<id> room, but user-join is what the current frontend explicitly
+    # performs after every connection. Requiring its ACK proves that this
+    # socket can actually receive the user's `events` broadcasts.
+    try:
+        joined_user = await sio.call(
+            "user-join",
+            {"auth": {"token": token}},
+            timeout=min(float(timeout), 30.0),
+        )
+    except Exception as exc:
+        raise APIError(f"Open WebUI user-join handshake failed: {exc}") from exc
+    if not isinstance(joined_user, dict) or not joined_user.get("id"):
+        raise APIError(
+            f"Open WebUI user-join returned an invalid response: {joined_user!r}"
+        )
+    out_status(f"socket authenticated as {joined_user.get('name') or joined_user['id']}")
+
     if not chat_id:
         chat_id = f"temporary:{session_id}"
 
@@ -496,9 +515,20 @@ async def run_chat_with_tools_with_files(
                 f"unexpected chat ack: {ack!r}; server did not start a background task"
             )
 
-        task_id = ack.get("task_id")
+        task_ids = ack.get("task_ids")
+        if not isinstance(task_ids, list):
+            task_id = ack.get("task_id")
+            task_ids = [task_id] if task_id else []
+        ack_chat_id = ack.get("chat_id")
+        details = []
+        if task_ids:
+            details.append(
+                "task " + ",".join(str(task_id) for task_id in task_ids)
+            )
+        if ack_chat_id:
+            details.append(f"chat {ack_chat_id}")
         out_status(
-            f"request accepted{f' (task {task_id})' if task_id else ''}"
+            "request accepted" + (f" ({'; '.join(details)})" if details else "")
         )
 
         # ---- wait for completion, with visible idle heartbeat ----
@@ -517,6 +547,9 @@ async def run_chat_with_tools_with_files(
                 )
             except _AsyncTimeoutError:
                 idle = time.monotonic() - state["last_event_at"]
+                # Keep the socket/session alive exactly as the browser does.
+                with contextlib.suppress(Exception):
+                    await sio.emit("heartbeat", {})
                 out_status(
                     f"waiting for Open WebUI ({int(elapsed + heartbeat_seconds)}s elapsed, "
                     f"{int(idle)}s since last event)"
