@@ -133,6 +133,52 @@ async def display_async_stream_events(events, *, show_reasoning=True):
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
 
 
+def _build_chat_prompt_session():
+    """Create the interactive multiline chat composer for real terminals."""
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+
+    # prompt_toolkit currently normalizes xterm Shift+Enter to plain Enter.
+    # Re-map the common extended terminal encodings to an otherwise-unused
+    # key so Shift+Enter can remain distinct when the terminal provides it.
+    ANSI_SEQUENCES["\x1b[27;2;13~"] = Keys.F24  # xterm modifyOtherKeys
+    ANSI_SEQUENCES["\x1b[13;2u"] = Keys.F24  # Kitty / CSI-u
+
+    bindings = KeyBindings()
+
+    @bindings.add("enter", eager=True)
+    def _send(event):
+        event.app.exit(result=event.current_buffer.text)
+
+    @bindings.add("c-j", eager=True)
+    def _newline_ctrl_j(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("f24", eager=True)
+    def _newline_shift_enter(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("escape", "enter", eager=True)
+    def _newline_meta_enter(event):
+        event.current_buffer.insert_text("\n")
+
+    return PromptSession(
+        multiline=True,
+        key_bindings=bindings,
+        prompt_continuation=lambda width, line_number, is_soft_wrap: "  ",
+        enable_history_search=True,
+    )
+
+
+def _read_chat_prompt(session=None) -> str:
+    # Tests and piped/non-interactive callers keep the existing Click path.
+    if session is None:
+        return click.prompt("", prompt_suffix="> ")
+    return session.prompt("> ")
+
+
 def _chat_export_dir() -> pathlib.Path:
     configured = os.environ.get("LLM_CHAT_EXPORT_DIR")
     path = pathlib.Path(configured).expanduser() if configured else user_dir() / "conversations"
@@ -211,7 +257,7 @@ def _run_chat(
             )
             click.echo(f"Autosave JSONL: {export_path}")
     click.echo("Type 'exit' or 'quit' to exit")
-    click.echo("Type '!multi' to enter multiple lines, then '!end' to finish")
+    click.echo("Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)")
     click.echo("Type '!edit' to open your default editor and modify the prompt")
     click.echo("Press Ctrl+C during generation to cancel the current response")
     if db is not None:
@@ -221,14 +267,10 @@ def _run_chat(
 
     argument_fragments = list(initial_fragments or [])
     argument_attachments = list(initial_attachments or [])
-    in_multi = False
-    accumulated = []
-    accumulated_fragments = []
-    accumulated_attachments = []
-    end_token = "!end"
+    prompt_session = _build_chat_prompt_session() if sys.stdin.isatty() and sys.stdout.isatty() else None
 
     while True:
-        prompt = click.prompt("", prompt_suffix="> " if not in_multi else "")
+        prompt = _read_chat_prompt(prompt_session)
         fragments = []
         attachments = []
         if argument_fragments:
@@ -238,12 +280,6 @@ def _run_chat(
         if argument_attachments:
             attachments = argument_attachments
             argument_attachments = []
-        if prompt.strip().startswith("!multi"):
-            in_multi = True
-            bits = prompt.strip().split()
-            if len(bits) > 1:
-                end_token = "!end {}".format(" ".join(bits[1:]))
-            continue
         if prompt.strip() == "!edit":
             edited_prompt = click.edit()
             if edited_prompt is None:
@@ -252,22 +288,6 @@ def _run_chat(
             prompt = edited_prompt.strip()
         if db is not None and prompt.strip().startswith("!fragment "):
             prompt, fragments, attachments = process_fragments_in_chat(db, prompt)
-
-        if in_multi:
-            if prompt.strip() == end_token:
-                prompt = "\n".join(accumulated)
-                fragments = accumulated_fragments
-                attachments = accumulated_attachments
-                in_multi = False
-                accumulated = []
-                accumulated_fragments = []
-                accumulated_attachments = []
-            else:
-                if prompt:
-                    accumulated.append(prompt)
-                accumulated_fragments += fragments
-                accumulated_attachments += attachments
-                continue
 
         if prompt.strip() in ("exit", "quit"):
             break
