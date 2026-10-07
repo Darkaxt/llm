@@ -1642,6 +1642,28 @@ class OpenWebUIModel(llm.Model):
                 on_status=prepare_status,
                 interactive_status=status_bar.enabled,
             )
+            knowledge_items = _enabled_knowledge_items(config, client)
+            if knowledge_items:
+                existing = {
+                    (str(item.get("type") or ""), str(item.get("id") or ""))
+                    for item in attached_files
+                    if isinstance(item, dict)
+                }
+                for item in knowledge_items:
+                    key = (
+                        str(item.get("type") or ""),
+                        str(item.get("id") or ""),
+                    )
+                    if key not in existing:
+                        attached_files.append(item)
+                        existing.add(key)
+                prepare_status(
+                    "knowledge · "
+                    + " · ".join(
+                        str(item.get("name") or item.get("id"))
+                        for item in knowledge_items
+                    )
+                )
         except Exception:
             status_bar.clear()
             raise
