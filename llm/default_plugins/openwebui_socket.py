@@ -554,21 +554,30 @@ async def run_chat_with_tools_with_files(
         )
 
         # ---- wait for completion, with visible idle heartbeat ----
+        #
+        # `timeout` is an inactivity timeout, not a total wall-clock limit.
+        # Long investigations can legitimately run for many minutes while
+        # emitting retrieval/tool/model events. Resetting the deadline on every
+        # real event prevents active investigations being killed at 600s.
         started_at = time.monotonic()
         heartbeat_seconds = 15.0
         while not done.is_set():
-            elapsed = time.monotonic() - started_at
-            remaining = timeout - elapsed
-            if remaining <= 0:
-                state["error"] = f"timed out after {timeout}s"
+            now = time.monotonic()
+            idle = now - state["last_event_at"]
+            remaining_idle = timeout - idle
+            if remaining_idle <= 0:
+                state["error"] = (
+                    f"timed out after {timeout}s without an Open WebUI event"
+                )
                 break
             try:
                 await asyncio.wait_for(
                     done.wait(),
-                    timeout=min(heartbeat_seconds, remaining),
+                    timeout=min(heartbeat_seconds, remaining_idle),
                 )
             except _AsyncTimeoutError:
                 now = time.monotonic()
+                elapsed = now - started_at
                 idle = now - state["last_event_at"]
                 phase_elapsed = now - state["phase_started_at"]
                 # Keep the socket/session alive exactly as the browser does.
@@ -576,7 +585,7 @@ async def run_chat_with_tools_with_files(
                     await sio.emit("heartbeat", {})
                 out_status(
                     f"waiting for {state['phase']} "
-                    f"({int(phase_elapsed)}s phase, {int(elapsed + heartbeat_seconds)}s total, "
+                    f"({int(phase_elapsed)}s phase, {int(elapsed)}s total, "
                     f"{int(idle)}s since last event)"
                 )
     finally:
