@@ -1914,6 +1914,292 @@ def register_commands(cli):
             )
 
 
+    @openwebui_group.group(name="knowledge")
+    def knowledge_group():
+        """Manage reusable Open WebUI knowledge bases."""
+
+    @knowledge_group.command(name="list")
+    def knowledge_list():
+        """List knowledge bases visible to this user."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            available = _list_knowledge_bases(client)
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        enabled = set(_enabled_knowledge_ids(config))
+        sources = _knowledge_sources(config)
+        seen: set[str] = set()
+        if not available and not enabled:
+            click.echo("No Open WebUI knowledge bases are visible to this user.")
+            return
+
+        for item in available:
+            knowledge_id = str(item.get("id") or "")
+            if not knowledge_id:
+                continue
+            seen.add(knowledge_id)
+            marker = "*" if knowledge_id in enabled else " "
+            name = str(item.get("name") or knowledge_id)
+            source = sources.get(knowledge_id, "")
+            writable = item.get("write_access")
+            access = "write" if writable is not False else "read"
+            click.echo(
+                f"{marker}\t{name}\t{knowledge_id}\t{access}"
+                + (f"\t{source}" if source else "")
+            )
+
+        for knowledge_id in sorted(enabled - seen):
+            source = sources.get(knowledge_id, "")
+            click.echo(
+                f"*\t<unavailable>\t{knowledge_id}\tstale"
+                + (f"\t{source}" if source else "")
+            )
+
+    @knowledge_group.command(name="create")
+    @click.argument("name")
+    @click.option(
+        "--description",
+        default="Managed by llm Open WebUI CLI.",
+        show_default=True,
+        help="Knowledge base description.",
+    )
+    @click.option(
+        "--enable",
+        is_flag=True,
+        help="Enable this knowledge base for future CLI chats.",
+    )
+    def knowledge_create(name: str, description: str, enable: bool):
+        """Create a persistent Open WebUI knowledge base."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            knowledge = _create_knowledge_base(client, name, description)
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        knowledge_id = str(knowledge["id"])
+        if enable:
+            enabled = _enabled_knowledge_ids(config)
+            if knowledge_id not in enabled:
+                enabled.append(knowledge_id)
+                config["enabled_knowledge_ids"] = enabled
+                _save_config(config)
+        click.echo(
+            f"Created knowledge base {knowledge.get('name') or name} "
+            f"({knowledge_id})"
+            + (" and enabled it for CLI chats." if enable else ".")
+        )
+
+    @knowledge_group.command(name="enable")
+    @click.argument("selector")
+    def knowledge_enable(selector: str):
+        """Enable a persistent knowledge base for every Open WebUI CLI chat."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            knowledge = _resolve_knowledge_selector(client, selector)
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        knowledge_id = str(knowledge["id"])
+        enabled = _enabled_knowledge_ids(config)
+        if knowledge_id not in enabled:
+            enabled.append(knowledge_id)
+            config["enabled_knowledge_ids"] = enabled
+            _save_config(config)
+        click.echo(
+            f"Enabled knowledge base "
+            f"{knowledge.get('name') or knowledge_id} ({knowledge_id})"
+        )
+
+    @knowledge_group.command(name="disable")
+    @click.argument("selector")
+    def knowledge_disable(selector: str):
+        """Stop attaching a persisted knowledge base to CLI chats."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+
+        enabled = _enabled_knowledge_ids(config)
+        knowledge_id: str
+        name: str
+        if selector in enabled:
+            knowledge_id = selector
+            name = selector
+        else:
+            client = _client(config)
+            try:
+                knowledge = _resolve_knowledge_selector(client, selector)
+            except llm.ModelError as exc:
+                raise click.ClickException(str(exc)) from exc
+            knowledge_id = str(knowledge["id"])
+            name = str(knowledge.get("name") or knowledge_id)
+
+        config["enabled_knowledge_ids"] = [
+            value for value in enabled if value != knowledge_id
+        ]
+        _save_config(config)
+        click.echo(f"Disabled knowledge base {name} ({knowledge_id})")
+
+    @knowledge_group.command(name="clear")
+    def knowledge_clear():
+        """Disable all CLI-persisted Open WebUI knowledge bases."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        config["enabled_knowledge_ids"] = []
+        _save_config(config)
+        click.echo("Disabled all CLI-persisted Open WebUI knowledge bases.")
+
+    @knowledge_group.command(name="sync")
+    @click.argument("selector")
+    @click.argument(
+        "source",
+        required=False,
+        type=click.Path(file_okay=False, path_type=Path),
+    )
+    def knowledge_sync(selector: str, source: Path | None):
+        """Incrementally sync a local folder into an Open WebUI knowledge base."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            knowledge = _resolve_knowledge_selector(client, selector)
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        knowledge_id = str(knowledge["id"])
+        sources = _knowledge_sources(config)
+        if source is None:
+            stored = sources.get(knowledge_id)
+            if not stored:
+                raise click.ClickException(
+                    "No local source folder is registered for this knowledge "
+                    "base; provide PATH on this sync."
+                )
+            source = Path(stored)
+
+        source = source.expanduser().resolve()
+        status_bar = _OpenWebUIStatusBar()
+        try:
+            result = _sync_knowledge_folder(
+                client,
+                knowledge,
+                source,
+                on_status=status_bar.update,
+                interactive_status=status_bar.enabled,
+            )
+        except (llm.ModelError, click.ClickException) as exc:
+            status_bar.clear()
+            raise click.ClickException(str(exc)) from exc
+        finally:
+            status_bar.clear()
+
+        sources[knowledge_id] = str(source)
+        config["knowledge_sources"] = sources
+        _save_config(config)
+        click.echo(
+            f"Synced {knowledge.get('name') or knowledge_id}: "
+            f"{result['added']} added, {result['modified']} modified, "
+            f"{result['deleted']} deleted, {result['unmodified']} unchanged."
+        )
+
+    @knowledge_group.command(name="register")
+    @click.argument("name")
+    @click.argument(
+        "source",
+        type=click.Path(file_okay=False, path_type=Path),
+    )
+    @click.option(
+        "--description",
+        default="Reusable knowledge synchronized by llm Open WebUI CLI.",
+        show_default=True,
+        help="Description used if the knowledge base must be created.",
+    )
+    def knowledge_register(name: str, source: Path, description: str):
+        """Create/reuse, sync and enable a knowledge base in one command."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+
+        try:
+            available = _list_knowledge_bases(client)
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        folded = name.casefold()
+        matches = [
+            item
+            for item in available
+            if str(item.get("name") or "").casefold() == folded
+        ]
+        if len(matches) > 1:
+            detail = ", ".join(
+                f"{item.get('name')} ({item.get('id')})" for item in matches
+            )
+            raise click.ClickException(
+                f"Multiple knowledge bases have the exact name {name!r}: {detail}"
+            )
+
+        created = False
+        if matches:
+            knowledge = matches[0]
+        else:
+            try:
+                knowledge = _create_knowledge_base(client, name, description)
+            except llm.ModelError as exc:
+                raise click.ClickException(str(exc)) from exc
+            created = True
+
+        if knowledge.get("write_access") is False:
+            raise click.ClickException(
+                f"Knowledge base {knowledge.get('name') or knowledge.get('id')} "
+                "is read-only for this user."
+            )
+
+        source = source.expanduser().resolve()
+        status_bar = _OpenWebUIStatusBar()
+        try:
+            result = _sync_knowledge_folder(
+                client,
+                knowledge,
+                source,
+                on_status=status_bar.update,
+                interactive_status=status_bar.enabled,
+            )
+        except (llm.ModelError, click.ClickException) as exc:
+            status_bar.clear()
+            raise click.ClickException(str(exc)) from exc
+        finally:
+            status_bar.clear()
+
+        knowledge_id = str(knowledge["id"])
+        enabled = _enabled_knowledge_ids(config)
+        if knowledge_id not in enabled:
+            enabled.append(knowledge_id)
+        sources = _knowledge_sources(config)
+        sources[knowledge_id] = str(source)
+        config["enabled_knowledge_ids"] = enabled
+        config["knowledge_sources"] = sources
+        _save_config(config)
+
+        click.echo(
+            f"{'Created' if created else 'Reused'} and registered "
+            f"{knowledge.get('name') or knowledge_id} ({knowledge_id}); "
+            f"{result['added']} added, {result['modified']} modified, "
+            f"{result['deleted']} deleted, {result['unmodified']} unchanged."
+        )
+
     @openwebui_group.command(name="tools")
     def tools():
         """List Open WebUI tools and MCP servers visible to this user."""
