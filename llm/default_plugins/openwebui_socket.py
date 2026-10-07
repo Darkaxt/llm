@@ -101,7 +101,11 @@ def _structured_output_text(output: Any) -> str:
         return ""
     chunks: list[str] = []
     for item in output:
-        if isinstance(item, dict) and item.get("type") == "message":
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "message"
+            and item.get("role", "assistant") == "assistant"
+        ):
             text = _structured_parts_text(item.get("content"))
             if text.strip():
                 chunks.append(text)
