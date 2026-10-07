@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import time
 import uuid
 from asyncio import TimeoutError as _AsyncTimeoutError
 from collections.abc import Callable
@@ -79,6 +81,81 @@ def _need_socketio() -> Any:
             "a required dependency; reinstall with: pip install -e openwebui-cli"
         ) from exc
     return socketio
+
+
+def _structured_parts_text(parts: Any) -> str:
+    if not isinstance(parts, list):
+        return ""
+    chunks: list[str] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if text is not None:
+            chunks.append(str(text))
+    return "".join(chunks)
+
+
+def _structured_output_text(output: Any) -> str:
+    if not isinstance(output, list):
+        return ""
+    chunks: list[str] = []
+    for item in output:
+        if isinstance(item, dict) and item.get("type") == "message":
+            text = _structured_parts_text(item.get("content"))
+            if text.strip():
+                chunks.append(text)
+    return "\n".join(chunks)
+
+
+def _structured_reasoning(output: Any) -> list[str]:
+    if not isinstance(output, list):
+        return []
+    blocks: list[str] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "reasoning":
+            continue
+        parts = item.get("summary") if isinstance(item.get("summary"), list) else item.get("content")
+        text = _structured_parts_text(parts)
+        if text:
+            blocks.append(text)
+    return blocks
+
+
+def _structured_tool_events(output: Any) -> list[dict[str, Any]]:
+    if not isinstance(output, list):
+        return []
+    results_by_call: dict[str, Any] = {}
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        call_id = str(item.get("call_id") or "")
+        raw = item.get("output")
+        if isinstance(raw, list):
+            result = _structured_parts_text(raw)
+        elif raw is None:
+            result = None
+        else:
+            result = raw
+        results_by_call[call_id] = result
+
+    events: list[dict[str, Any]] = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        call_id = str(item.get("call_id") or item.get("id") or "")
+        status = str(item.get("status") or "")
+        done = call_id in results_by_call or status in {"failed", "incomplete"}
+        events.append(
+            {
+                "name": str(item.get("name") or "tool"),
+                "call_id": call_id,
+                "arguments": item.get("arguments"),
+                "result": results_by_call.get(call_id),
+                "done": done,
+            }
+        )
+    return events
 
 
 async def run_chat_with_tools_with_files(
@@ -135,18 +212,69 @@ async def run_chat_with_tools_with_files(
 
     state: dict[str, Any] = {
         "answer": "",        # last rendered answer prose (stripped)
-        "raw_content": "",   # last full serialized content (with <details> blocks)
-        "reasoning_blocks": [],  # list of reasoning strings (one per <details type=reasoning>)
-        "tool_done": {},     # tool name -> done? (to detect executing->done)
-        "tool_results": [],  # [{name, result}] for --json capture
+        "raw_content": "",   # serialized legacy content or current structured output
+        "reasoning_blocks": [],  # list of reasoning strings
+        "tool_done": {},     # tool key -> done? (to detect executing->done)
+        "tool_results": [],  # [{name, result}] for structured result capture
         "error": None,
+        "last_event_at": time.monotonic(),
     }
     done = asyncio.Event()
 
+    def _emit_answer_snapshot(answer: str) -> None:
+        if answer.startswith(state["answer"]):
+            delta = answer[len(state["answer"]):]
+            if delta:
+                out_text(delta)
+            state["answer"] = answer
+        elif len(answer) > len(state["answer"]):
+            state["answer"] = answer
+
+    def _sync_structured_output(output: Any) -> None:
+        answer = _structured_output_text(output)
+        if answer:
+            _emit_answer_snapshot(answer)
+
+        current_blocks = _structured_reasoning(output)
+        prev_blocks = state["reasoning_blocks"]
+        for i, block in enumerate(current_blocks):
+            if i >= len(prev_blocks):
+                if i > 0:
+                    out_reasoning("\n\n")
+                out_reasoning(block)
+            elif block.startswith(prev_blocks[i]):
+                delta = block[len(prev_blocks[i]):]
+                if delta:
+                    out_reasoning(delta)
+        state["reasoning_blocks"] = current_blocks
+
+        current_events = _structured_tool_events(output)
+        new_results: list[dict[str, Any]] = []
+        for ev in current_events:
+            key = ev.get("call_id") or ev["name"]
+            done_now = bool(ev.get("done"))
+            done_before = state["tool_done"].get(key)
+            if done_before is None or done_before != done_now:
+                suffix = " done" if done_now else " ..."
+                out_tool(f"↳ {ev['name']}{suffix}")
+            state["tool_done"][key] = done_now
+            if done_now:
+                new_results.append(
+                    {
+                        "name": ev["name"],
+                        "result": ev.get("result"),
+                    }
+                )
+        if new_results:
+            state["tool_results"] = new_results
+
     def _handle_event(payload: dict[str, Any]) -> None:
-        # Server emits {chat_id, message_id, data}; only ours.
+        # Current Open WebUI emits on Socket.IO "events"; older releases used
+        # "chat-events". Both carry {chat_id, message_id, data}.
         if payload.get("chat_id") != chat_id:
             return
+        state["last_event_at"] = time.monotonic()
+
         event = payload.get("data") or {}
         etype = event.get("type")
         data = event.get("data") or {}
@@ -157,116 +285,125 @@ async def run_chat_with_tools_with_files(
                 out_status(str(action))
             return
 
-        if etype == "task-cancelled":
-            state["error"] = "task cancelled by server"
+        if etype in ("task-cancelled", "chat:tasks:cancel"):
+            # chat:tasks:cancel follows a normal completion in current Open WebUI,
+            # so only treat the explicit task-cancelled event as an error.
+            if etype == "task-cancelled":
+                state["error"] = "task cancelled by server"
+                done.set()
+            return
+
+        if etype == "chat:message:error":
+            err = data.get("error")
+            if isinstance(err, dict):
+                state["error"] = err.get("content") or err.get("detail") or str(err)
+            else:
+                state["error"] = str(err or "Open WebUI chat error")
             done.set()
+            return
+
+        if etype in ("chat:message:delta", "message"):
+            fragment = data.get("content") or ""
+            if fragment:
+                out_text(str(fragment))
+                state["answer"] += str(fragment)
+            return
+
+        if etype in ("chat:message", "replace"):
+            content = str(data.get("content") or "")
+            if content:
+                _emit_answer_snapshot(content)
+            return
+
+        if etype == "response:completion":
+            # These are provider-native Responses API stream events. Current
+            # Open WebUI also emits periodic/final chat:completion snapshots,
+            # which are authoritative and easier to consume here.
             return
 
         if etype != "chat:completion":
             return
 
-        # Error embedded in a completion event.
         if isinstance(data, dict) and data.get("error"):
             err = data["error"]
-            state["error"] = err.get("detail") if isinstance(err, dict) else str(err)
+            if isinstance(err, dict):
+                state["error"] = (
+                    err.get("detail")
+                    or err.get("content")
+                    or err.get("message")
+                    or str(err)
+                )
+            else:
+                state["error"] = str(err)
             done.set()
             return
 
-        content = data.get("content") or ""
+        output = data.get("output")
+        if isinstance(output, list):
+            _sync_structured_output(output)
+            state["raw_content"] = json.dumps(output, ensure_ascii=False)
+        else:
+            content = data.get("content") or ""
 
-        # Surface ALL reasoning blocks (there can be multiple in a multi-step
-        # tool-calling turn — the model reasons before each tool call). Each
-        # block is streamed via prefix-diff as it grows; NEW blocks (index beyond
-        # what we've seen) are printed in full.
-        current_blocks = extract_all_reasoning(content)
-        prev_blocks = state["reasoning_blocks"]
-        for i, block in enumerate(current_blocks):
-            if i >= len(prev_blocks):
-                # New reasoning block — add a separator if there was a previous
-                # block, then stream the full text.
-                if i > 0:
-                    out_reasoning("\n\n")
-                if block:
+            # Legacy serialized-content path.
+            current_blocks = extract_all_reasoning(content)
+            prev_blocks = state["reasoning_blocks"]
+            for i, block in enumerate(current_blocks):
+                if i >= len(prev_blocks):
+                    if i > 0:
+                        out_reasoning("\n\n")
                     out_reasoning(block)
-                prev_blocks.append(block)
-            elif block.startswith(prev_blocks[i]):
-                # Existing block grew — stream the delta.
-                delta = block[len(prev_blocks[i]):]
-                if delta:
-                    out_reasoning(delta)
-                prev_blocks[i] = block
-            elif len(block) > len(prev_blocks[i]):
-                # Non-prefix but longer (block flipped mid-stream): accept
-                # without re-printing.
-                prev_blocks[i] = block
-        state["reasoning_blocks"] = prev_blocks
+                elif block.startswith(prev_blocks[i]):
+                    delta = block[len(prev_blocks[i]):]
+                    if delta:
+                        out_reasoning(delta)
+            state["reasoning_blocks"] = current_blocks
 
-        # Surface tool activity: first appearance emits a line; the
-        # executing->done transition emits the result. Also accumulate the
-        # structured result for --json capture (state["tool_results"]).
-        tool_done = state["tool_done"]
-        tool_results = state["tool_results"]
-        results_by_name = {r.get("name"): r for r in tool_results if isinstance(r, dict)}
-        for ev in extract_tool_events(content):
-            name = ev.get("name") or "?"
-            prev = tool_done.get(name)
-            if prev is None:
-                # first time we see this tool
-                out_tool(format_tool_line(ev))
-                tool_done[name] = bool(ev.get("done"))
-            elif ev.get("done") and not prev:
-                out_tool(format_tool_line(ev))
-                tool_done[name] = True
-            # Keep the latest structured result for this tool (name + result).
-            if name in results_by_name:
-                results_by_name[name]["result"] = ev.get("result")
-                results_by_name[name]["done"] = bool(ev.get("done"))
-            else:
-                entry = {"name": name, "result": ev.get("result"), "done": bool(ev.get("done"))}
-                results_by_name[name] = entry
-                tool_results.append(entry)
+            current_tool_events = extract_tool_events(content)
+            results_by_name = {r["name"]: r for r in state["tool_results"]}
+            for ev in current_tool_events:
+                name = ev.get("name") or "tool"
+                done_now = bool(ev.get("done"))
+                done_before = state["tool_done"].get(name)
+                if done_before is None or done_before != done_now:
+                    out_tool(format_tool_line(ev))
+                state["tool_done"][name] = done_now
 
-        # Stream the answer prose via prefix-diff. The server emits the running
-        # answer as content grows; the final ``done`` event re-sends the complete
-        # content. We only print NEW text.
-        #
-        # When a tool block flips (Executing -> done) the serialized prose can
-        # shift so the new answer is NOT a prefix-extension of the previous - in
-        # that case we DON'T print anything (the user already has the streamed
-        # fragments) and, crucially, we DON'T update state["answer"]: keeping
-        # the last prefix-consistent value keeps later deltas comparable. The
-        # final ``done`` event's content becomes the return value via the delta
-        # path below (it extends fine, with an empty delta).
-        answer = extract_answer_text(content)
-        if answer.startswith(state["answer"]):
-            delta = answer[len(state["answer"]):]
-            if delta:
-                out_text(delta)
-            state["answer"] = answer
-        elif len(answer) > len(state["answer"]):
-            # Non-prefix but longer final answer: accept it as the authoritative
-            # return value without double-printing streamed text.
-            state["answer"] = answer
+                if done_now:
+                    if name in results_by_name:
+                        results_by_name[name]["result"] = ev.get("result")
+                        results_by_name[name]["done"] = True
+                    else:
+                        entry = {
+                            "name": name,
+                            "result": ev.get("result"),
+                            "done": True,
+                        }
+                        results_by_name[name] = entry
+                        state["tool_results"].append(entry)
+
+            answer = extract_answer_text(content)
+            if answer:
+                _emit_answer_snapshot(answer)
+            state["raw_content"] = content
 
         if data.get("done"):
-            # Capture the full serialized content on the terminal event so
-            # callers (--save) can persist it with <details> blocks intact —
-            # the web UI renders reasoning/tool_calls FROM those blocks.
-            state["raw_content"] = content
             done.set()
 
-    @sio.on("chat-events")
-    async def _on_chat_events(payload, cb=None):  # type: ignore[no-untyped-def]
-        # socketio may call this from its own event loop thread; the per-event
-        # work is sync, so just run it. cb is an optional ack callback.
+    async def _on_events(payload, cb=None):  # type: ignore[no-untyped-def]
         try:
             _handle_event(payload)
-        except Exception as exc:  # noqa: BLE001 - deliberate: keep the socket loop alive on any tool-event error
+        except Exception as exc:  # noqa: BLE001
             state["error"] = f"error handling chat event: {exc}"
             done.set()
         if cb:
             with contextlib.suppress(Exception):
                 await cb(True)
+
+    # Current Open WebUI uses "events"; retain the old name for 0.6.x
+    # deployments supported by openwebui-sdk.
+    sio.on("events", handler=_on_events)
+    sio.on("chat-events", handler=_on_events)
 
     # ---- connect ----
     # Open WebUI mounts its socket.io ASGI app at "/ws" with
@@ -285,6 +422,7 @@ async def run_chat_with_tools_with_files(
         "transports": ["websocket", "polling"],
         "socketio_path": "/ws/socket.io",
     }
+    out_status("connecting to Open WebUI tool session")
     try:
         await sio.connect(base_url, **connect_kwargs)
     except Exception as exc:
@@ -303,6 +441,8 @@ async def run_chat_with_tools_with_files(
     session_id = sio.get_sid("/")
     if not session_id:
         raise APIError("socket.io connection has no default namespace session id")
+
+    out_status("tool session connected")
 
     if not chat_id:
         chat_id = f"temporary:{session_id}"
@@ -352,16 +492,35 @@ async def run_chat_with_tools_with_files(
         )
 
         if not (isinstance(ack, dict) and ack.get("status")):
-            # Some builds still stream over HTTP for this path; surface a clear msg.
             raise APIError(
                 f"unexpected chat ack: {ack!r}; server did not start a background task"
             )
 
-        # ---- wait for completion ----
-        try:
-            await asyncio.wait_for(done.wait(), timeout=timeout)
-        except _AsyncTimeoutError:
-            state["error"] = f"timed out after {timeout}s"
+        task_id = ack.get("task_id")
+        out_status(
+            f"request accepted{f' (task {task_id})' if task_id else ''}"
+        )
+
+        # ---- wait for completion, with visible idle heartbeat ----
+        started_at = time.monotonic()
+        heartbeat_seconds = 15.0
+        while not done.is_set():
+            elapsed = time.monotonic() - started_at
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                state["error"] = f"timed out after {timeout}s"
+                break
+            try:
+                await asyncio.wait_for(
+                    done.wait(),
+                    timeout=min(heartbeat_seconds, remaining),
+                )
+            except _AsyncTimeoutError:
+                idle = time.monotonic() - state["last_event_at"]
+                out_status(
+                    f"waiting for Open WebUI ({int(elapsed + heartbeat_seconds)}s elapsed, "
+                    f"{int(idle)}s since last event)"
+                )
     finally:
         with contextlib.suppress(Exception):
             await sio.disconnect()
