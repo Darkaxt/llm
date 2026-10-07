@@ -299,15 +299,18 @@ def test_enabled_tool_ids_are_merged_into_runtime(monkeypatch):
             return list(extra_tool_ids or [])
 
     monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
-    monkeypatch.setattr(
-        openwebui,
-        "run_chat_with_tools_with_files",
-        lambda **kwargs: {
+    async def fake_tool_runner(**kwargs):
+        return {
             "answer": "ok",
             "reasoning": None,
             "tool_calls": [],
             "raw_content": "ok",
-        },
+        }
+
+    monkeypatch.setattr(
+        openwebui,
+        "run_chat_with_tools_with_files",
+        fake_tool_runner,
     )
 
     model = openwebui.OpenWebUIModel("glm-5.3")
@@ -374,7 +377,7 @@ def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
 
     calls = []
 
-    def fake_runner(**kwargs):
+    async def fake_runner(**kwargs):
         calls.append(kwargs)
         return {
             "answer": "ok",
