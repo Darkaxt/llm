@@ -133,6 +133,55 @@ async def display_async_stream_events(events, *, show_reasoning=True):
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
 
 
+def _chat_export_dir() -> pathlib.Path:
+    configured = os.environ.get("LLM_CHAT_EXPORT_DIR")
+    path = pathlib.Path(configured).expanduser() if configured else user_dir() / "conversations"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _chat_export_path(conversation_id: str) -> pathlib.Path:
+    return _chat_export_dir() / f"{conversation_id}.jsonl"
+
+
+def _write_conversation_jsonl(
+    db,
+    conversation: _BaseConversation,
+    *,
+    model_label: str,
+) -> pathlib.Path:
+    """Atomically mirror a conversation to portable newline-delimited JSON."""
+    path = _chat_export_path(conversation.id)
+    rows = merged_log_rows(LogStore(db), thread_id=conversation.id)
+    rows.reverse()
+    attachments_by_id = annotate_log_rows(db, rows, expand=True) if rows else {}
+
+    session = {
+        "type": "conversation",
+        "conversation_id": conversation.id,
+        "model": model_label,
+        "name": conversation.name,
+    }
+    lines = [json.dumps(session, ensure_ascii=False)]
+    for row in rows:
+        row["attachments"] = [
+            {k: v for k, v in attachment.items() if k != "response_id"}
+            for attachment in attachments_by_id.get(row["id"], [])
+        ]
+        lines.append(
+            json.dumps(
+                {"type": "turn", **row},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
 def _run_chat(
     model_label,
     prompt_callback,
@@ -143,9 +192,20 @@ def _run_chat(
     transform_prompt=None,
     after_response=None,
     show_reasoning=True,
+    conversation=None,
+    export_jsonl=True,
 ):
     """Run the terminal chat loop shared by managed and transient models."""
     click.echo(f"Chatting with {model_label}")
+    if conversation is not None:
+        click.echo(f"Conversation ID: {conversation.id}")
+        if db is not None and export_jsonl:
+            export_path = _write_conversation_jsonl(
+                db,
+                conversation,
+                model_label=model_label,
+            )
+            click.echo(f"Autosave JSONL: {export_path}")
     click.echo("Type 'exit' or 'quit' to exit")
     click.echo("Type '!multi' to enter multiple lines, then '!end' to finish")
     click.echo("Type '!edit' to open your default editor and modify the prompt")
@@ -221,6 +281,12 @@ def _run_chat(
             continue
         if after_response is not None:
             after_response(response)
+        if conversation is not None and db is not None and export_jsonl:
+            _write_conversation_jsonl(
+                db,
+                conversation,
+                model_label=model_label,
+            )
         print()
 
 
@@ -1440,6 +1506,7 @@ def chat(
         transform_prompt=transform_chat_prompt,
         after_response=lambda response: response.log_to_db(db),
         show_reasoning=not hide_reasoning,
+        conversation=conversation,
     )
 
 
