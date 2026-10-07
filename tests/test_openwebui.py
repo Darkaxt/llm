@@ -327,7 +327,7 @@ def test_enabled_tool_ids_are_merged_into_runtime(monkeypatch):
     monkeypatch.setattr(
         openwebui,
         "_prepare_openwebui_request",
-        lambda prompt, client: (
+        lambda prompt, client, **kwargs: (
             [{"role": "user", "content": "test"}],
             [{"id": "file-1", "type": "file"}],
         ),
@@ -376,7 +376,7 @@ def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
     monkeypatch.setattr(
         openwebui,
         "_prepare_openwebui_request",
-        lambda prompt, client: ([{"role": "user", "content": "test"}], []),
+        lambda prompt, client, **kwargs: ([{"role": "user", "content": "test"}], []),
     )
 
     calls = []
@@ -639,3 +639,191 @@ def test_7z_sidecar_extraction():
         "macros.json",
     ]
     assert b"67e794d5-73b2-45e5-b570-ceb5e0bba352" in sidecars[0][1].content
+
+
+
+def test_local_knowledge_manifest_preserves_relative_paths(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "rule.yaml").write_text("a", encoding="utf-8")
+    (tmp_path / "b" / "rule.yaml").write_text("b", encoding="utf-8")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "skip.txt").write_text("skip", encoding="utf-8")
+
+    manifest = openwebui._local_knowledge_manifest(tmp_path)
+
+    assert [(item["path"], item["filename"]) for item in manifest] == [
+        ("a", "rule.yaml"),
+        ("b", "rule.yaml"),
+    ]
+    assert manifest[0]["checksum"] != manifest[1]["checksum"]
+
+
+def test_enabled_knowledge_items_use_minimal_collection_shape(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_get_knowledge_by_id",
+        lambda client, knowledge_id: {
+            "id": knowledge_id,
+            "name": "TIDE Splunk Investigation",
+            "description": "Reusable TIDE knowledge",
+            "files": [{"id": "huge-file-list-entry"}],
+            "access_grants": [{"permission": "read"}],
+        },
+    )
+    config = {"enabled_knowledge_ids": ["kb-1"]}
+    client = SimpleNamespace()
+
+    items = openwebui._enabled_knowledge_items(config, client)
+
+    assert items == [
+        {
+            "type": "collection",
+            "id": "kb-1",
+            "name": "TIDE Splunk Investigation",
+            "description": "Reusable TIDE knowledge",
+        }
+    ]
+
+
+def test_enabled_knowledge_is_added_to_chat_request(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {
+            "url": "https://example.test",
+            "token": "jwt",
+            "models": [],
+            "enabled_knowledge_ids": ["kb-1"],
+        },
+    )
+
+    calls = []
+
+    class FakeClient:
+        base_url = "https://example.test"
+        token = "jwt"
+        timeout = 600
+
+        def resolve_tools(self, model_id, extra_tool_ids=None, no_tools=False):
+            return []
+
+        def run_chat(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                answer="ok",
+                reasoning=None,
+                tool_calls=[],
+                raw_content="ok",
+            )
+
+    monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_prepare_openwebui_request",
+        lambda prompt, client, **kwargs: (
+            [{"role": "user", "content": "test"}],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_enabled_knowledge_items",
+        lambda config, client: [
+            {
+                "type": "collection",
+                "id": "kb-1",
+                "name": "TIDE Splunk Investigation",
+                "description": "Reusable TIDE knowledge",
+            }
+        ],
+    )
+
+    model = openwebui.OpenWebUIModel("glm-5.3")
+    prompt = llm.Prompt("test", model)
+    response = SimpleNamespace(response_json=None)
+
+    assert list(model.execute(prompt, True, response, None)) == []
+    assert len(calls) == 1
+    assert calls[0]["extra"]["files"] == [
+        {
+            "type": "collection",
+            "id": "kb-1",
+            "name": "TIDE Splunk Investigation",
+            "description": "Reusable TIDE knowledge",
+        }
+    ]
+
+
+def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "rules").mkdir()
+    (tmp_path / "rules" / "one.yaml").write_text("one", encoding="utf-8")
+    (tmp_path / "macros.json").write_text("{}", encoding="utf-8")
+
+    requests = []
+    uploads = []
+
+    def fake_json(client, method, path, **kwargs):
+        requests.append((method, path, kwargs))
+        if path.endswith("/sync/diff"):
+            return {
+                "added": [
+                    {"filename": "one.yaml", "path": "rules"},
+                    {"filename": "macros.json", "path": ""},
+                ],
+                "modified": [],
+                "deleted": [],
+                "mkdir": ["rules"],
+                "rmdir": [],
+                "unmodified_count": 0,
+                "directory_map": {},
+            }
+        if path.endswith("/dirs/create"):
+            return {"id": "dir-rules"}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(openwebui, "_owui_http_json", fake_json)
+    monkeypatch.setattr(
+        openwebui,
+        "_upload_knowledge_sync_file",
+        lambda client, **kwargs: uploads.append(kwargs) or {"id": "file"},
+    )
+
+    client = SimpleNamespace(
+        base_url="https://example.test",
+        token="jwt",
+        timeout=600,
+    )
+    knowledge = {"id": "kb-1", "name": "TIDE"}
+
+    result = openwebui._sync_knowledge_folder(
+        client,
+        knowledge,
+        tmp_path,
+    )
+
+    diff_body = requests[0][2]["json_body"]
+    assert {
+        (item["path"], item["filename"])
+        for item in diff_body["manifest"]
+    } == {
+        ("rules", "one.yaml"),
+        ("", "macros.json"),
+    }
+    assert len(uploads) == 2
+    assert {
+        (item["entry"]["path"], item["entry"]["filename"])
+        for item in uploads
+    } == {
+        ("rules", "one.yaml"),
+        ("", "macros.json"),
+    }
+    assert result == {
+        "added": 2,
+        "modified": 0,
+        "deleted": 0,
+        "unmodified": 0,
+        "uploaded": 2,
+    }
