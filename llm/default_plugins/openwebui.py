@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Literal
 from urllib.parse import urlparse
 
@@ -252,12 +252,84 @@ def _attachment_filename(attachment: llm.Attachment, index: int) -> str:
     return f"attachment-{index}{suffix}"
 
 
-_ZIP_SIDECAR_TYPES = {
+_ARCHIVE_SIDECAR_TYPES = {
     "rule-index.json": "application/json",
     "splunk-rules.jsonl": "application/x-ndjson",
     "macros.json": "application/json",
 }
-_ZIP_SIDECAR_MAX_BYTES = 64 * 1024 * 1024
+_ARCHIVE_SIDECAR_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _normalized_archive_path(name: str) -> PurePosixPath:
+    # Archive formats use POSIX separators by convention, but normalize
+    # backslashes too so archives produced on Windows behave consistently.
+    return PurePosixPath(str(name).replace("\\", "/").lstrip("/"))
+
+
+def _select_sidecar_members(member_names: list[str]) -> dict[str, str]:
+    """Resolve expected sidecars without silently collapsing path collisions.
+
+    Prefer exactly one directory that contains a complete sidecar set. If there
+    is no complete set, globally unique sidecars are allowed. Any remaining
+    duplicate basename is ambiguous and therefore rejected.
+    """
+    by_parent: dict[str, dict[str, list[str]]] = {}
+    by_basename: dict[str, list[str]] = {}
+
+    for raw_name in member_names:
+        path = _normalized_archive_path(raw_name)
+        basename = path.name.lower()
+        if basename not in _ARCHIVE_SIDECAR_TYPES:
+            continue
+        parent = path.parent.as_posix()
+        by_parent.setdefault(parent, {}).setdefault(basename, []).append(raw_name)
+        by_basename.setdefault(basename, []).append(raw_name)
+
+    complete_roots: list[str] = []
+    for parent, members in by_parent.items():
+        if all(
+            len(members.get(expected_name, [])) == 1
+            for expected_name in _ARCHIVE_SIDECAR_TYPES
+        ):
+            complete_roots.append(parent)
+
+    if len(complete_roots) > 1:
+        roots = ", ".join(repr(root or ".") for root in sorted(complete_roots))
+        raise llm.ModelError(
+            "Archive contains multiple complete TIDE sidecar sets under "
+            f"different paths: {roots}"
+        )
+
+    if len(complete_roots) == 1:
+        root = complete_roots[0]
+        members = by_parent[root]
+        return {
+            expected_name: members[expected_name][0]
+            for expected_name in _ARCHIVE_SIDECAR_TYPES
+        }
+
+    ambiguous = {
+        expected_name: candidates
+        for expected_name, candidates in by_basename.items()
+        if len(candidates) > 1
+    }
+    if ambiguous:
+        detail = "; ".join(
+            f"{name}: {', '.join(paths)}"
+            for name, paths in sorted(ambiguous.items())
+        )
+        raise llm.ModelError(
+            "Archive contains ambiguous TIDE sidecar filenames under "
+            f"different paths: {detail}"
+        )
+
+    # Partial but unambiguous sets are still useful and preserve the previous
+    # behavior for older/minimal bundles.
+    return {
+        expected_name: candidates[0]
+        for expected_name in _ARCHIVE_SIDECAR_TYPES
+        if (candidates := by_basename.get(expected_name))
+    }
 
 
 def _zip_sidecar_attachments(
@@ -265,12 +337,6 @@ def _zip_sidecar_attachments(
     *,
     filename: str | None = None,
 ) -> list[tuple[str, llm.Attachment]]:
-    """Expose known machine-readable TIDE bundle sidecars from a ZIP in memory.
-
-    Open WebUI can store/process ZIP files, but retrieval may surface the archive
-    as an opaque binary blob. The investigation skill relies on these sidecars,
-    so prefer them over uploading the archive itself when they are present.
-    """
     filename = filename or _attachment_filename(attachment, 0)
     content_type = attachment.type or ""
     if not (
@@ -282,40 +348,217 @@ def _zip_sidecar_attachments(
     try:
         content = attachment.content_bytes()
     except Exception as exc:
-        raise llm.ModelError(f"Could not read ZIP attachment {filename}: {exc}") from exc
+        raise llm.ModelError(
+            f"Could not read ZIP attachment {filename}: {exc}"
+        ) from exc
     if not content:
         return []
 
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            by_basename: dict[str, zipfile.ZipInfo] = {}
-            for info in archive.infolist():
-                if info.is_dir():
-                    continue
-                basename = Path(info.filename).name.lower()
-                if basename in _ZIP_SIDECAR_TYPES and basename not in by_basename:
-                    by_basename[basename] = info
+            infos = [info for info in archive.infolist() if not info.is_dir()]
+            selected = _select_sidecar_members([info.filename for info in infos])
+            if not selected:
+                return []
+
+            infos_by_name: dict[str, list[zipfile.ZipInfo]] = {}
+            for info in infos:
+                infos_by_name.setdefault(info.filename, []).append(info)
 
             sidecars: list[tuple[str, llm.Attachment]] = []
-            for expected_name, mime in _ZIP_SIDECAR_TYPES.items():
-                info = by_basename.get(expected_name)
-                if info is None:
+            for expected_name, mime in _ARCHIVE_SIDECAR_TYPES.items():
+                member_name = selected.get(expected_name)
+                if member_name is None:
                     continue
-                if info.file_size > _ZIP_SIDECAR_MAX_BYTES:
+                matching_infos = infos_by_name.get(member_name, [])
+                if len(matching_infos) != 1:
                     raise llm.ModelError(
-                        f"ZIP sidecar {expected_name} is too large "
+                        f"Archive member {member_name!r} is duplicated and ambiguous"
+                    )
+                info = matching_infos[0]
+                if info.file_size > _ARCHIVE_SIDECAR_MAX_BYTES:
+                    raise llm.ModelError(
+                        f"Archive sidecar {member_name} is too large "
                         f"({info.file_size} bytes)"
                     )
-                data = archive.read(info)
                 sidecars.append(
                     (
                         expected_name,
-                        llm.Attachment(type=mime, content=data),
+                        llm.Attachment(
+                            type=mime,
+                            content=archive.read(info),
+                        ),
                     )
                 )
             return sidecars
     except zipfile.BadZipFile:
         return []
+
+
+def _sevenzip_sidecar_attachments(
+    attachment: llm.Attachment,
+    *,
+    filename: str | None = None,
+) -> list[tuple[str, llm.Attachment]]:
+    filename = filename or _attachment_filename(attachment, 0)
+    content_type = attachment.type or ""
+    if not (
+        filename.lower().endswith(".7z")
+        or content_type in {
+            "application/x-7z-compressed",
+            "application/7z",
+        }
+    ):
+        return []
+
+    try:
+        import py7zr
+    except ImportError as exc:
+        raise llm.ModelError(
+            "7z attachment support requires py7zr; reinstall the project "
+            "with: python -m pip install -e ."
+        ) from exc
+
+    try:
+        content = attachment.content_bytes()
+    except Exception as exc:
+        raise llm.ModelError(
+            f"Could not read 7z attachment {filename}: {exc}"
+        ) from exc
+    if not content:
+        return []
+
+    class _MemoryIO(py7zr.Py7zIO):
+        def __init__(self) -> None:
+            self.buffer = io.BytesIO()
+
+        def write(self, data):
+            return self.buffer.write(data)
+
+        def read(self, size=None):
+            return self.buffer.read(-1 if size is None else size)
+
+        def seek(self, offset, whence=0):
+            return self.buffer.seek(offset, whence)
+
+        def flush(self) -> None:
+            return None
+
+        def size(self) -> int:
+            return self.buffer.getbuffer().nbytes
+
+        def getvalue(self) -> bytes:
+            return self.buffer.getvalue()
+
+    class _MemoryFactory(py7zr.WriterFactory):
+        def __init__(self) -> None:
+            self.products: dict[str, _MemoryIO] = {}
+
+        def create(self, filename):
+            product = _MemoryIO()
+            self.products[str(filename).replace("\\", "/")] = product
+            return product
+
+    try:
+        archive_buffer = io.BytesIO(content)
+        with py7zr.SevenZipFile(archive_buffer, mode="r") as archive:
+            if archive.needs_password():
+                raise llm.ModelError(
+                    f"7z attachment {filename} is password-protected"
+                )
+
+            infos = [info for info in archive.list() if not info.is_directory]
+            selected = _select_sidecar_members([info.filename for info in infos])
+            if not selected:
+                return []
+
+            info_by_name = {info.filename: info for info in infos}
+            for member_name in selected.values():
+                info = info_by_name.get(member_name)
+                if info is None:
+                    raise llm.ModelError(
+                        f"7z member {member_name!r} disappeared while reading archive"
+                    )
+                if int(info.uncompressed or 0) > _ARCHIVE_SIDECAR_MAX_BYTES:
+                    raise llm.ModelError(
+                        f"Archive sidecar {member_name} is too large "
+                        f"({info.uncompressed} bytes)"
+                    )
+
+            targets = list(selected.values())
+            # py7zr may require explicit parent directory entries when extracting
+            # nested files. Include only parent entries that actually exist.
+            member_name_set = {info.filename for info in archive.list()}
+            for member_name in list(targets):
+                path = _normalized_archive_path(member_name)
+                for parent in path.parents:
+                    parent_name = parent.as_posix()
+                    if parent_name in ("", "."):
+                        continue
+                    if parent_name in member_name_set and parent_name not in targets:
+                        targets.append(parent_name)
+
+            factory = _MemoryFactory()
+            archive.extract(targets=targets, factory=factory)
+
+        sidecars: list[tuple[str, llm.Attachment]] = []
+        for expected_name, mime in _ARCHIVE_SIDECAR_TYPES.items():
+            member_name = selected.get(expected_name)
+            if member_name is None:
+                continue
+            normalized_member = _normalized_archive_path(member_name).as_posix()
+            matches = [
+                product
+                for product_name, product in factory.products.items()
+                if _normalized_archive_path(product_name).as_posix()
+                == normalized_member
+                or _normalized_archive_path(product_name).as_posix().endswith(
+                    "/" + normalized_member
+                )
+            ]
+            if len(matches) != 1:
+                raise llm.ModelError(
+                    f"Could not uniquely extract 7z sidecar {member_name!r}"
+                )
+            sidecars.append(
+                (
+                    expected_name,
+                    llm.Attachment(type=mime, content=matches[0].getvalue()),
+                )
+            )
+        return sidecars
+    except llm.ModelError:
+        raise
+    except py7zr.Bad7zFile:
+        return []
+    except Exception as exc:
+        raise llm.ModelError(
+            f"Failed to read 7z attachment {filename}: {exc}"
+        ) from exc
+
+
+def _archive_sidecar_attachments(
+    attachment: llm.Attachment,
+    *,
+    filename: str | None = None,
+) -> list[tuple[str, llm.Attachment]]:
+    filename = filename or _attachment_filename(attachment, 0)
+    lower_name = filename.lower()
+    content_type = attachment.type or ""
+
+    if lower_name.endswith(".7z") or content_type in {
+        "application/x-7z-compressed",
+        "application/7z",
+    }:
+        return _sevenzip_sidecar_attachments(
+            attachment,
+            filename=filename,
+        )
+
+    return _zip_sidecar_attachments(
+        attachment,
+        filename=filename,
+    )
 
 
 def _file_processing_timeout() -> float:
@@ -710,7 +953,7 @@ def _prepare_openwebui_request(
                 continue
 
             filename = _attachment_filename(part.attachment, 0)
-            sidecars = _zip_sidecar_attachments(
+            sidecars = _archive_sidecar_attachments(
                 part.attachment,
                 filename=filename,
             )
