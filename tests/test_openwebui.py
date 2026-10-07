@@ -1,3 +1,5 @@
+import io
+import zipfile
 import json
 from types import SimpleNamespace
 
@@ -497,3 +499,62 @@ def test_attachment_context_can_be_routed_to_status_callback():
     assert seen == [
         "attachment context · SKILL.md=full · kb.zip=rag"
     ]
+
+
+
+def test_zip_sidecar_extraction_prefers_machine_readable_bundle_files():
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "ec-tide-splunk-investigation-kb/rule-index.json",
+            '{"67e794d5-73b2-45e5-b570-ceb5e0bba352":"rule.yaml"}',
+        )
+        archive.writestr(
+            "ec-tide-splunk-investigation-kb/splunk-rules.jsonl",
+            '{"uuid":"67e794d5-73b2-45e5-b570-ceb5e0bba352"}\n',
+        )
+        archive.writestr(
+            "ec-tide-splunk-investigation-kb/macros.json",
+            '{"macro":"value"}',
+        )
+        archive.writestr(
+            "ec-tide-splunk-investigation-kb/rules/unrelated.yaml",
+            "name: unrelated",
+        )
+
+    attachment = llm.Attachment(
+        type="application/zip",
+        content=payload.getvalue(),
+    )
+    sidecars = openwebui._zip_sidecar_attachments(
+        attachment,
+        filename="ec-tide-splunk-investigation-kb.zip",
+    )
+
+    assert [name for name, _ in sidecars] == [
+        "rule-index.json",
+        "splunk-rules.jsonl",
+        "macros.json",
+    ]
+    assert b"67e794d5-73b2-45e5-b570-ceb5e0bba352" in sidecars[0][1].content
+    assert sidecars[1][1].type == "application/x-ndjson"
+    assert sidecars[2][1].type == "application/json"
+
+
+def test_zip_without_expected_sidecars_is_left_unchanged():
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("notes/readme.txt", "hello")
+
+    attachment = llm.Attachment(
+        type="application/zip",
+        content=payload.getvalue(),
+    )
+
+    assert (
+        openwebui._zip_sidecar_attachments(
+            attachment,
+            filename="other.zip",
+        )
+        == []
+    )
