@@ -633,6 +633,184 @@ def _content_type_for_path(path: Path) -> str:
     return content_type or "application/octet-stream"
 
 
+def _list_user_files(client: OpenWebUIClient) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        payload = _owui_http_json(
+            client,
+            "GET",
+            "/api/v1/files/",
+            params={"page": page, "content": "false"},
+        )
+        if not isinstance(payload, dict):
+            raise llm.ModelError("Open WebUI returned an invalid file list")
+        page_items = payload.get("items") or []
+        if not isinstance(page_items, list):
+            raise llm.ModelError("Open WebUI returned an invalid file list")
+        items.extend(item for item in page_items if isinstance(item, dict))
+        total = payload.get("total")
+        if not page_items:
+            break
+        if isinstance(total, int) and len(items) >= total:
+            break
+        page += 1
+    return items
+
+
+def _knowledge_file_candidates(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Index prior uploads for this KB by the raw local-sync SHA-256."""
+    by_hash: dict[str, list[dict[str, Any]]] = {}
+    for item in _list_user_files(client):
+        meta = item.get("meta") or {}
+        if not isinstance(meta, dict):
+            continue
+        sync_meta = meta.get("data") or {}
+        if not isinstance(sync_meta, dict):
+            continue
+        if str(sync_meta.get("knowledge_id") or "") != knowledge_id:
+            continue
+        file_hash = str(meta.get("file_hash") or "")
+        if not file_hash:
+            continue
+        by_hash.setdefault(file_hash, []).append(item)
+
+    # Prefer the oldest upload: if a later retry failed with duplicate content,
+    # the older file ID is the one that already owns the KB vector chunks.
+    for candidates in by_hash.values():
+        candidates.sort(
+            key=lambda item: (
+                int(item.get("created_at") or 0),
+                str(item.get("id") or ""),
+            )
+        )
+    return by_hash
+
+
+def _candidate_sync_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    meta = item.get("meta") or {}
+    if not isinstance(meta, dict):
+        return {}
+    data = meta.get("data") or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _matching_resume_candidates(
+    entry: dict[str, Any],
+    directory_id: str | None,
+    candidates_by_hash: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    candidates = candidates_by_hash.get(str(entry["checksum"]), [])
+    filename = str(entry["filename"])
+    exact: list[dict[str, Any]] = []
+    fallback: list[dict[str, Any]] = []
+    for item in candidates:
+        candidate_name = str(
+            (item.get("meta") or {}).get("name")
+            if isinstance(item.get("meta"), dict)
+            else item.get("filename") or ""
+        )
+        if not candidate_name:
+            candidate_name = str(item.get("filename") or "")
+        if candidate_name != filename:
+            continue
+
+        sync_meta = _candidate_sync_metadata(item)
+        candidate_directory = sync_meta.get("directory_id") or None
+        if candidate_directory == directory_id:
+            exact.append(item)
+        elif candidate_directory is None:
+            fallback.append(item)
+    return [*exact, *fallback]
+
+
+def _resume_knowledge_file(
+    client: OpenWebUIClient,
+    *,
+    knowledge_id: str,
+    entry: dict[str, Any],
+    directory_id: str | None,
+    candidates_by_hash: dict[str, list[dict[str, Any]]],
+    on_status: Callable[[str], None] | None = None,
+    interactive_status: bool = False,
+) -> bool:
+    candidates = _matching_resume_candidates(
+        entry,
+        directory_id,
+        candidates_by_hash,
+    )
+    if not candidates:
+        return False
+
+    display_path = (
+        f"{entry['path']}/{entry['filename']}"
+        if entry["path"]
+        else str(entry["filename"])
+    )
+
+    for item in candidates:
+        file_id = str(item.get("id") or "")
+        if not file_id:
+            continue
+        data = item.get("data") or {}
+        status = str(data.get("status") or "") if isinstance(data, dict) else ""
+
+        if status in {"pending", "processing"}:
+            if on_status is not None:
+                on_status(
+                    f"knowledge sync · waiting for prior upload · {display_path}"
+                )
+            with httpx2.Client(
+                trust_env=True,
+                timeout=max(float(client.timeout), 120.0),
+            ) as http:
+                try:
+                    _wait_for_file_processing(
+                        http,
+                        client,
+                        file_id,
+                        str(entry["filename"]),
+                        ordinal=1,
+                        total=1,
+                        on_status=on_status,
+                        interactive_status=interactive_status,
+                    )
+                except llm.ModelError:
+                    # A failed retry may be sitting in front of the original
+                    # viable upload. Continue through the older/newer candidates.
+                    continue
+
+        if on_status is not None:
+            on_status(f"knowledge sync · resuming prior upload · {display_path}")
+
+        body: dict[str, Any] = {"file_id": file_id}
+        if directory_id:
+            body["directory_id"] = directory_id
+        try:
+            _owui_http_json(
+                client,
+                "POST",
+                f"/api/v1/knowledge/{knowledge_id}/file/add",
+                json_body=body,
+                timeout=max(float(client.timeout), 600.0),
+            )
+            return True
+        except llm.ModelError as exc:
+            # If this is a later duplicate retry, another candidate with the
+            # same raw hash may be the actual owner of the existing chunks.
+            if "Duplicate content detected" in str(exc):
+                continue
+            # EMPTY_CONTENT can occur for an upload interrupted before its
+            # initial per-file extraction completed; another candidate may work.
+            if "empty" in str(exc).lower() or "not processed" in str(exc).lower():
+                continue
+            raise
+    return False
+
+
 def _create_knowledge_directory(
     client: OpenWebUIClient,
     knowledge_id: str,
@@ -866,6 +1044,13 @@ def _sync_knowledge_folder(
         if (entry["path"], entry["filename"]) in wanted
     ]
 
+    candidates_by_hash = _knowledge_file_candidates(
+        client,
+        knowledge_id,
+    )
+    reused = 0
+    uploaded_count = 0
+
     for ordinal, entry in enumerate(files_to_upload, start=1):
         directory_id = (
             directory_ids.get(entry["path"])
@@ -879,6 +1064,19 @@ def _sync_knowledge_folder(
                 entry["path"],
                 directory_ids,
             )
+
+        if _resume_knowledge_file(
+            client,
+            knowledge_id=knowledge_id,
+            entry=entry,
+            directory_id=directory_id,
+            candidates_by_hash=candidates_by_hash,
+            on_status=on_status,
+            interactive_status=interactive_status,
+        ):
+            reused += 1
+            continue
+
         _upload_knowledge_sync_file(
             client,
             knowledge_id=knowledge_id,
@@ -889,13 +1087,15 @@ def _sync_knowledge_folder(
             on_status=on_status,
             interactive_status=interactive_status,
         )
+        uploaded_count += 1
 
     return {
         "added": len(added),
         "modified": len(modified),
         "deleted": len(deleted),
         "unmodified": int(diff.get("unmodified_count") or 0),
-        "uploaded": len(files_to_upload),
+        "uploaded": uploaded_count,
+        "reused": reused,
     }
 
 
@@ -2394,7 +2594,8 @@ def register_commands(cli):
         click.echo(
             f"Synced {knowledge.get('name') or knowledge_id}: "
             f"{result['added']} added, {result['modified']} modified, "
-            f"{result['deleted']} deleted, {result['unmodified']} unchanged."
+            f"{result['deleted']} deleted, {result['unmodified']} unchanged, "
+            f"{result.get('reused', 0)} resumed."
         )
 
     @knowledge_group.command(name="register")
@@ -2481,7 +2682,8 @@ def register_commands(cli):
             f"{'Created' if created else 'Reused'} and registered "
             f"{knowledge.get('name') or knowledge_id} ({knowledge_id}); "
             f"{result['added']} added, {result['modified']} modified, "
-            f"{result['deleted']} deleted, {result['unmodified']} unchanged."
+            f"{result['deleted']} deleted, {result['unmodified']} unchanged, "
+            f"{result.get('reused', 0)} resumed."
         )
 
     @openwebui_group.command(name="tools")
