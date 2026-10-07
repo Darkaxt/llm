@@ -149,6 +149,7 @@ def _run_chat(
     click.echo("Type 'exit' or 'quit' to exit")
     click.echo("Type '!multi' to enter multiple lines, then '!end' to finish")
     click.echo("Type '!edit' to open your default editor and modify the prompt")
+    click.echo("Press Ctrl+C during generation to cancel the current response")
     if db is not None:
         click.echo(
             "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
@@ -209,11 +210,15 @@ def _run_chat(
         if transform_prompt is not None:
             prompt = transform_prompt(prompt)
 
-        response = prompt_callback(prompt, fragments, attachments)
-        display_stream_events(
-            response.stream_events(),
-            show_reasoning=show_reasoning,
-        )
+        try:
+            response = prompt_callback(prompt, fragments, attachments)
+            display_stream_events(
+                response.stream_events(),
+                show_reasoning=show_reasoning,
+            )
+        except KeyboardInterrupt:
+            click.echo("\nCancelled current response.", err=True)
+            continue
         if after_response is not None:
             after_response(response)
         print()
