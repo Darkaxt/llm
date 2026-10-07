@@ -645,9 +645,11 @@ class OpenWebUIModel(llm.Model):
 
         def on_tool(line: str) -> None:
             tool_activity.append(line)
+            click.echo(f"[Open WebUI tool] {line}", err=True)
 
         def on_status(line: str) -> None:
             status_activity.append(line)
+            click.echo(f"[Open WebUI] {line}", err=True)
 
         def worker() -> None:
             try:
