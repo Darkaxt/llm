@@ -442,6 +442,7 @@ def _zip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]:
 def _sevenzip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]:
     try:
         import py7zr
+        from py7zr.io import BytesIOFactory
     except ImportError as exc:
         raise click.ClickException(
             "7z knowledge sync requires py7zr; reinstall with "
@@ -478,7 +479,7 @@ def _sevenzip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]
             if not selected:
                 return []
 
-            factory = py7zr.BytesIOFactory(_KB_ARCHIVE_MAX_MEMBER_BYTES + 1)
+            factory = BytesIOFactory(_KB_ARCHIVE_MAX_MEMBER_BYTES + 1)
             archive.extract(
                 targets=[raw_name for raw_name, _ in selected],
                 factory=factory,
@@ -1166,6 +1167,7 @@ def _sevenzip_sidecar_attachments(
 
     try:
         import py7zr
+        from py7zr.io import BytesIOFactory
     except ImportError as exc:
         raise llm.ModelError(
             "7z attachment support requires py7zr; reinstall the project "
