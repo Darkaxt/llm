@@ -11,6 +11,14 @@ import llm.cli
 from llm.logs import LogStore, merged_log_rows
 
 
+def _strip_chat_session_banner(output):
+    return re.sub(
+        r"Conversation ID: [^\\n]+\\nAutosave JSONL: [^\\n]+\\n",
+        "",
+        output,
+    )
+
+
 def logged_rows(db):
     """Chronological log rows from the store, reduced to the fields
     these tests care about."""
@@ -43,7 +51,7 @@ def test_chat_basic(mock_model, logs_db):
         catch_exceptions=False,
     )
     assert result.exit_code == 0
-    assert result.output == (
+    assert _strip_chat_session_banner(result.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
         "\nType '!multi' to enter multiple lines, then '!end' to finish"
@@ -93,7 +101,7 @@ def test_chat_basic(mock_model, logs_db):
         catch_exceptions=False,
     )
     assert result2.exit_code == 0
-    assert result2.output == (
+    assert _strip_chat_session_banner(result2.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
         "\nType '!multi' to enter multiple lines, then '!end' to finish"
@@ -130,7 +138,7 @@ def test_chat_system(mock_model, logs_db):
         input="Hi\nquit\n",
     )
     assert result.exit_code == 0
-    assert result.output == (
+    assert _strip_chat_session_banner(result.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
         "\nType '!multi' to enter multiple lines, then '!end' to finish"
@@ -304,7 +312,7 @@ def test_chat_tools(logs_db):
         catch_exceptions=False,
     )
     assert result.exit_code == 0
-    normalized_output = re.sub(r"tc_[0-9a-z]{26}", "tc_TCID", result.output)
+    normalized_output = re.sub(r"tc_[0-9a-z]{26}", "tc_TCID", _strip_chat_session_banner(result.output))
     assert normalized_output == (
         "Chatting with echo\n"
         "Type 'exit' or 'quit' to exit\n"
@@ -391,3 +399,39 @@ def test_run_chat_ctrl_c_cancels_current_response(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "Cancelled current response." in captured.err
     assert after == []
+
+
+
+@pytest.mark.xfail(sys.platform == "win32", reason="Expected to fail on Windows")
+def test_chat_autosaves_jsonl(mock_model, logs_db, user_path):
+    runner = CliRunner()
+    mock_model.enqueue(["saved answer"])
+    result = runner.invoke(
+        llm.cli.cli,
+        ["chat", "-m", "mock"],
+        input="saved prompt\nquit\n",
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    match = re.search(r"Conversation ID: ([^\n]+)", result.output)
+    assert match is not None
+    conversation_id = match.group(1).strip()
+
+    export_path = user_path / "conversations" / f"{conversation_id}.jsonl"
+    assert export_path.exists()
+
+    records = [
+        json.loads(line)
+        for line in export_path.read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records[0]["type"] == "conversation"
+    assert records[0]["conversation_id"] == conversation_id
+    assert records[0]["model"] == "mock"
+
+    turns = [record for record in records if record["type"] == "turn"]
+    assert len(turns) == 1
+    assert turns[0]["conversation_id"] == conversation_id
+    assert turns[0]["prompt"] == "saved prompt"
+    assert turns[0]["response"] == "saved answer"
