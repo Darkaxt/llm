@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 import textwrap
+import time
 import warnings
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -63,6 +64,10 @@ from llm import (
     user_dir,
 )
 from llm.models import ChainResponse, _BaseChainResponse, _BaseConversation
+
+from .chat_journal import append_record as append_chat_journal_record
+from .chat_journal import ensure_session as ensure_chat_journal_session
+from .chat_journal import journal_path as chat_journal_path
 
 from .logs import (
     LogStore,
@@ -186,14 +191,36 @@ def _read_chat_prompt(session=None) -> str:
 
 
 def _chat_export_dir() -> pathlib.Path:
-    configured = os.environ.get("LLM_CHAT_EXPORT_DIR")
-    path = pathlib.Path(configured).expanduser() if configured else user_dir() / "conversations"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return chat_journal_path("_probe_").parent
 
 
 def _chat_export_path(conversation_id: str) -> pathlib.Path:
-    return _chat_export_dir() / f"{conversation_id}.jsonl"
+    return chat_journal_path(conversation_id)
+
+
+def _serialize_chat_attachment(attachment: Attachment) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": attachment.type,
+        "path": attachment.path,
+        "url": attachment.url,
+    }
+    try:
+        payload["id"] = attachment.id()
+    except Exception:
+        pass
+    if attachment.content is not None:
+        payload["content_size"] = len(attachment.content)
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _serialize_chat_fragment(fragment: Fragment) -> dict[str, Any]:
+    payload = {
+        "source": getattr(fragment, "source", None),
+        "content": getattr(fragment, "content", None),
+    }
+    if payload["content"] is None:
+        payload["content"] = str(fragment)
+    return {key: value for key, value in payload.items() if value is not None}
 
 
 def _write_conversation_jsonl(
@@ -202,40 +229,43 @@ def _write_conversation_jsonl(
     *,
     model_label: str,
 ) -> pathlib.Path:
-    """Atomically mirror a conversation to portable newline-delimited JSON."""
-    path = _chat_export_path(conversation.id)
+    """Ensure the durable append-only JSONL journal exists."""
+    return ensure_chat_journal_session(
+        conversation.id,
+        model=model_label,
+        name=conversation.name,
+    )
+
+
+def _append_completed_turn_jsonl(
+    db,
+    conversation: _BaseConversation,
+    *,
+    model_label: str,
+    turn_id: str,
+    response: Any,
+) -> None:
     rows = merged_log_rows(LogStore(db), thread_id=conversation.id)
-    rows.reverse()
-    attachments_by_id = annotate_log_rows(db, rows, expand=True) if rows else {}
-
-    persisted_name = conversation.name
-    if not persisted_name and rows:
-        persisted_name = rows[0].get("conversation_name")
-
-    session = {
-        "type": "conversation",
-        "conversation_id": conversation.id,
-        "model": model_label,
-        "name": persisted_name,
-    }
-    lines = [json.dumps(session, ensure_ascii=False)]
-    for row in rows:
+    row = rows[0] if rows else None
+    if row is not None:
+        attachments_by_id = annotate_log_rows(db, [row], expand=True)
+        row = dict(row)
         row["attachments"] = [
             {k: v for k, v in attachment.items() if k != "response_id"}
             for attachment in attachments_by_id.get(row["id"], [])
         ]
-        lines.append(
-            json.dumps(
-                {"type": "turn", **row},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    return path
+    append_chat_journal_record(
+        conversation.id,
+        {
+            "type": "turn_completed",
+            "turn_id": turn_id,
+            "model": model_label,
+            "db_turn": row,
+            "provider_response_json": getattr(response, "response_json", None),
+        },
+    )
+
 
 
 def _chat_turn_headers_enabled() -> bool:
@@ -288,6 +318,7 @@ def _run_chat(
     prompt_session = _build_chat_prompt_session() if sys.stdin.isatty() and sys.stdout.isatty() else None
 
     turn_headers = _chat_turn_headers_enabled()
+    turn_counter = 0
 
     while True:
         if turn_headers:
@@ -316,28 +347,91 @@ def _run_chat(
         if transform_prompt is not None:
             prompt = transform_prompt(prompt)
 
+        turn_counter += 1
+        turn_id = f"{conversation.id if conversation is not None else 'transient'}:{turn_counter}:{time.time_ns()}"
+        if conversation is not None and export_jsonl:
+            append_chat_journal_record(
+                conversation.id,
+                {
+                    "type": "user_message",
+                    "turn_id": turn_id,
+                    "model": model_label,
+                    "prompt": prompt,
+                    "fragments": [
+                        _serialize_chat_fragment(fragment)
+                        for fragment in fragments
+                    ],
+                    "attachments": [
+                        _serialize_chat_attachment(attachment)
+                        for attachment in attachments
+                    ],
+                },
+            )
+
         if turn_headers:
             _print_chat_turn_header("Assistant")
 
         try:
             response = prompt_callback(prompt, fragments, attachments)
+
+            def journaled_events():
+                for event in response.stream_events():
+                    if conversation is not None and export_jsonl:
+                        append_chat_journal_record(
+                            conversation.id,
+                            {
+                                "type": "assistant_stream",
+                                "turn_id": turn_id,
+                                "event_type": event.type,
+                                "chunk": event.chunk,
+                                "part_index": event.part_index,
+                                "tool_call_id": event.tool_call_id,
+                                "tool_name": event.tool_name,
+                                "server_executed": event.server_executed,
+                                "redacted": event.redacted,
+                                "provider_metadata": event.provider_metadata,
+                                "message_index": event.message_index,
+                            },
+                        )
+                    yield event
+
             display_stream_events(
-                response.stream_events(),
+                journaled_events(),
                 show_reasoning=show_reasoning,
             )
         except KeyboardInterrupt:
+            if conversation is not None and export_jsonl:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "type": "turn_cancelled",
+                        "turn_id": turn_id,
+                    },
+                )
             click.echo("\nCancelled current response.", err=True)
             continue
         except llm.ModelError as exc:
+            if conversation is not None and export_jsonl:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "type": "turn_error",
+                        "turn_id": turn_id,
+                        "error": str(exc),
+                        "error_class": type(exc).__name__,
+                    },
+                )
             click.echo(f"\nModel error: {exc}", err=True)
             continue
         if after_response is not None:
             after_response(response)
         if conversation is not None and db is not None and export_jsonl:
-            _write_conversation_jsonl(
+            _append_completed_turn_jsonl(
                 db,
                 conversation,
                 model_label=model_label,
+                turn_id=turn_id,
+                response=response,
             )
         print()
 
