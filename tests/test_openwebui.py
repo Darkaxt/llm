@@ -791,6 +791,11 @@ def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
         "_upload_knowledge_sync_file",
         lambda client, **kwargs: uploads.append(kwargs) or {"id": "file"},
     )
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_file_candidates",
+        lambda client, knowledge_id: {},
+    )
 
     client = SimpleNamespace(
         base_url="https://example.test",
