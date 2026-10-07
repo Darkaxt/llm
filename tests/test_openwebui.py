@@ -445,3 +445,55 @@ def test_current_openwebui_structured_output_parsing():
             "done": True,
         }
     ]
+
+
+
+def test_file_progress_can_be_routed_to_status_callback(monkeypatch):
+    seen = []
+    monkeypatch.setattr(openwebui.time, "monotonic", lambda: 65.0)
+
+    openwebui._render_file_progress(
+        filename="bundle.zip",
+        status="processing",
+        started=5.0,
+        tick=3,
+        ordinal=3,
+        total=3,
+        on_status=seen.append,
+    )
+
+    assert seen == [
+        "attachments 3/3 · bundle.zip · processing · 01:00"
+    ]
+
+
+def test_attachment_context_can_be_routed_to_status_callback():
+    files = [
+        {
+            "type": "file",
+            "id": "skill",
+            "name": "SKILL.md",
+            "size": 1024,
+            "content_type": "text/markdown",
+        },
+        {
+            "type": "file",
+            "id": "kb",
+            "name": "kb.zip",
+            "size": 1024 * 1024,
+            "content_type": "application/zip",
+        },
+    ]
+    seen = []
+
+    openwebui._apply_attachment_context_policy(
+        files,
+        "auto",
+        on_status=seen.append,
+    )
+
+    assert files[0]["context"] == "full"
+    assert "context" not in files[1]
+    assert seen == [
+        "attachment context · SKILL.md=full · kb.zip=rag"
+    ]
