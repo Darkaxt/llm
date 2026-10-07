@@ -430,11 +430,27 @@ def test_chat_autosaves_jsonl(mock_model, logs_db, user_path):
     assert records[0]["conversation_id"] == conversation_id
     assert records[0]["model"] == "mock"
 
-    turns = [record for record in records if record["type"] == "turn"]
-    assert len(turns) == 1
-    assert turns[0]["conversation_id"] == conversation_id
-    assert turns[0]["prompt"] == "saved prompt"
-    assert turns[0]["response"] == "saved answer"
+    user_messages = [
+        record for record in records if record["type"] == "user_message"
+    ]
+    assert len(user_messages) == 1
+    assert user_messages[0]["conversation_id"] == conversation_id
+    assert user_messages[0]["prompt"] == "saved prompt"
+
+    streamed = [
+        record
+        for record in records
+        if record["type"] == "assistant_stream"
+        and record["event_type"] == "text"
+    ]
+    assert "".join(record["chunk"] for record in streamed) == "saved answer"
+
+    completed = [
+        record for record in records if record["type"] == "turn_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["db_turn"]["prompt"] == "saved prompt"
+    assert completed[0]["db_turn"]["response"] == "saved answer"
 
 
 
@@ -473,3 +489,48 @@ def test_chat_turn_headers_only_for_interactive_tty(monkeypatch):
 
     monkeypatch.setattr(llm.cli.sys, "stdout", FakeTTY(False))
     assert llm.cli._chat_turn_headers_enabled() is False
+
+
+
+def test_chat_journal_keeps_prompt_on_model_error(tmp_path, monkeypatch):
+    from llm.chat_journal import ensure_session
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-error", name=None)
+    ensure_session(conversation.id, model="mock")
+
+    prompts = iter(["important prompt", "quit"])
+    monkeypatch.setattr(
+        llm.cli,
+        "_read_chat_prompt",
+        lambda session=None: next(prompts),
+    )
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    def fail(prompt, fragments, attachments):
+        raise llm.ModelError("backend failed")
+
+    llm.cli._run_chat(
+        "mock",
+        fail,
+        db=None,
+        conversation=conversation,
+        export_jsonl=True,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "conv-error.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        record["type"] == "user_message"
+        and record["prompt"] == "important prompt"
+        for record in records
+    )
+    assert any(
+        record["type"] == "turn_error"
+        and record["error"] == "backend failed"
+        for record in records
+    )
