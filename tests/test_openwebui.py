@@ -8,7 +8,7 @@ from llm.default_plugins import openwebui
 from llm.parts import Message, TextPart
 
 
-def test_messages_for_openwebui_uses_full_chain():
+def test_prepare_openwebui_request_uses_full_chain():
     model = openwebui.OpenWebUIModel("glm")
     prompt = llm.Prompt(
         None,
@@ -20,12 +20,62 @@ def test_messages_for_openwebui_uses_full_chain():
             Message(role="user", parts=[TextPart(text="second")]),
         ],
     )
-    assert openwebui._messages_for_openwebui(prompt) == [
+    messages, files = openwebui._prepare_openwebui_request(
+        prompt, SimpleNamespace(base_url="https://example.test")
+    )
+    assert messages == [
         {"role": "system", "content": "system"},
         {"role": "user", "content": "first"},
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": "second"},
     ]
+    assert files == []
+
+
+def test_prepare_openwebui_request_uploads_and_reuses_attachment(tmp_path, monkeypatch):
+    path = tmp_path / "case.md"
+    path.write_text("# Validation case\nCheck this file.")
+    attachment = llm.Attachment(type="text/markdown", path=str(path))
+    part = AttachmentPart(attachment=attachment)
+    model = openwebui.OpenWebUIModel("glm")
+    prompt = llm.Prompt(
+        None,
+        model,
+        messages=[
+            Message(
+                role="user",
+                parts=[TextPart(text="Validate this file"), part],
+            )
+        ],
+    )
+    uploaded = {
+        "type": "file",
+        "id": "file-1",
+        "url": "file-1",
+        "name": "case.md",
+        "status": "uploaded",
+        "content_type": "text/markdown",
+        "context": "full",
+        "file": {"id": "file-1"},
+    }
+    calls = []
+    monkeypatch.setattr(
+        openwebui,
+        "_upload_attachment",
+        lambda client, attachment, index: calls.append(index) or uploaded,
+    )
+    client = SimpleNamespace(base_url="https://example.test")
+
+    messages, files = openwebui._prepare_openwebui_request(prompt, client)
+    assert messages == [{"role": "user", "content": "Validate this file"}]
+    assert files == [uploaded]
+    assert calls == [1]
+
+    # Provider metadata on the AttachmentPart prevents duplicate uploads on
+    # subsequent turns / resumed message chains against the same server.
+    messages, files = openwebui._prepare_openwebui_request(prompt, client)
+    assert files == [uploaded]
+    assert calls == [1]
 
 
 def test_register_models_from_cache(monkeypatch):
