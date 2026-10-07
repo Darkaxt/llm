@@ -1,11 +1,9 @@
 import json
 from types import SimpleNamespace
 
-import pytest
-
 import llm
 from llm.default_plugins import openwebui
-from llm.parts import Message, TextPart
+from llm.parts import AttachmentPart, Message, TextPart
 
 
 def test_prepare_openwebui_request_uses_full_chain():
