@@ -40,6 +40,7 @@ dependencies = [
     "pip",
     "pyreadline3; sys_platform == 'win32'",
     "puremagic",
+    "prompt-toolkit>=3.0.53",
     "openwebui-sdk>=0.1.1",
 ]
 
