@@ -104,33 +104,37 @@ def display_stream_events(events, *, show_reasoning=True):
     """Consume a sync iterator of StreamEvents and write them.
 
     Text events go to stdout. Reasoning events go to stderr in dim style.
-    A newline is written to stderr at each reasoning→text transition so
-    the assistant text starts on a fresh visual line.
+    Transitions in either direction always start on a fresh terminal line so
+    visible reasoning cannot run into answer prose (or vice versa).
     """
-    was_reasoning = False
+    last_visible_type = None
     for event in events:
         if event.type == "text":
-            if was_reasoning and show_reasoning:
+            if last_visible_type == "reasoning" and show_reasoning:
                 click.echo("", err=True)
-                was_reasoning = False
             click.echo(event.chunk, nl=False)
+            last_visible_type = "text"
         elif event.type == "reasoning" and show_reasoning:
-            was_reasoning = True
+            if last_visible_type == "text":
+                click.echo("", err=True)
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
+            last_visible_type = "reasoning"
 
 
 async def display_async_stream_events(events, *, show_reasoning=True):
     """Async counterpart of display_stream_events."""
-    was_reasoning = False
+    last_visible_type = None
     async for event in events:
         if event.type == "text":
-            if was_reasoning and show_reasoning:
+            if last_visible_type == "reasoning" and show_reasoning:
                 click.echo("", err=True)
-                was_reasoning = False
             click.echo(event.chunk, nl=False)
+            last_visible_type = "text"
         elif event.type == "reasoning" and show_reasoning:
-            was_reasoning = True
+            if last_visible_type == "text":
+                click.echo("", err=True)
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
+            last_visible_type = "reasoning"
 
 
 def _build_chat_prompt_session():
