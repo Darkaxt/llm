@@ -3,6 +3,7 @@ import zipfile
 import json
 
 import pytest
+import click
 from types import SimpleNamespace
 
 import llm
@@ -827,3 +828,48 @@ def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
         "unmodified": 0,
         "uploaded": 2,
     }
+
+
+def test_local_knowledge_manifest_expands_zip_as_virtual_tree(tmp_path):
+    (tmp_path / "SKILL.md").write_text("# skill", encoding="utf-8")
+    (tmp_path / "SPEC.md").write_text("# spec", encoding="utf-8")
+
+    archive_path = tmp_path / "ec-tide-splunk-investigation-kb.zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "ec-tide-splunk-investigation-kb/rule-index.json",
+            '{"rule":"value"}',
+        )
+        archive.writestr(
+            "ec-tide-splunk-investigation-kb/rules/aws/rule.yaml",
+            "name: aws rule",
+        )
+
+    manifest = openwebui._local_knowledge_manifest(tmp_path)
+    virtual_paths = {
+        (item["path"], item["filename"])
+        for item in manifest
+    }
+
+    assert ("", "SKILL.md") in virtual_paths
+    assert ("", "SPEC.md") in virtual_paths
+    assert (
+        "ec-tide-splunk-investigation-kb",
+        "rule-index.json",
+    ) in virtual_paths
+    assert (
+        "ec-tide-splunk-investigation-kb/rules/aws",
+        "rule.yaml",
+    ) in virtual_paths
+    assert ("", "ec-tide-splunk-investigation-kb.zip") not in virtual_paths
+
+
+def test_local_knowledge_manifest_rejects_archive_virtual_path_collision(tmp_path):
+    (tmp_path / "bundle").mkdir()
+    (tmp_path / "bundle" / "same.txt").write_text("local", encoding="utf-8")
+    archive_path = tmp_path / "data.zip"
+    with zipfile.ZipFile(archive_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("bundle/same.txt", "archive")
+
+    with pytest.raises(click.ClickException, match="duplicate virtual path"):
+        openwebui._local_knowledge_manifest(tmp_path)
