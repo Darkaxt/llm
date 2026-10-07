@@ -708,13 +708,9 @@ def _matching_resume_candidates(
     exact: list[dict[str, Any]] = []
     fallback: list[dict[str, Any]] = []
     for item in candidates:
-        candidate_name = str(
-            (item.get("meta") or {}).get("name")
-            if isinstance(item.get("meta"), dict)
-            else item.get("filename") or ""
-        )
-        if not candidate_name:
-            candidate_name = str(item.get("filename") or "")
+        meta = item.get("meta") or {}
+        meta_name = meta.get("name") if isinstance(meta, dict) else None
+        candidate_name = str(meta_name or item.get("filename") or "")
         if candidate_name != filename:
             continue
 
@@ -759,29 +755,36 @@ def _resume_knowledge_file(
         status = str(data.get("status") or "") if isinstance(data, dict) else ""
 
         if status in {"pending", "processing"}:
-            if on_status is not None:
-                on_status(
-                    f"knowledge sync · waiting for prior upload · {display_path}"
-                )
-            with httpx2.Client(
-                trust_env=True,
-                timeout=max(float(client.timeout), 120.0),
-            ) as http:
-                try:
-                    _wait_for_file_processing(
-                        http,
-                        client,
-                        file_id,
-                        str(entry["filename"]),
-                        ordinal=1,
-                        total=1,
-                        on_status=on_status,
-                        interactive_status=interactive_status,
+            # A just-started upload may still legitimately finish and auto-link.
+            # Give it a short grace period, but do not inherit the normal
+            # 10-minute file timeout when recovering an interrupted sync.
+            created_at = int(item.get("created_at") or 0)
+            age = max(0.0, time.time() - created_at) if created_at else 9999.0
+            if age < 30.0:
+                if on_status is not None:
+                    on_status(
+                        f"knowledge sync · waiting briefly for prior upload · "
+                        f"{display_path}"
                     )
-                except llm.ModelError:
-                    # A failed retry may be sitting in front of the original
-                    # viable upload. Continue through the older/newer candidates.
-                    continue
+                with httpx2.Client(
+                    trust_env=True,
+                    timeout=max(float(client.timeout), 120.0),
+                ) as http:
+                    try:
+                        _wait_for_file_processing(
+                            http,
+                            client,
+                            file_id,
+                            str(entry["filename"]),
+                            ordinal=1,
+                            total=1,
+                            on_status=on_status,
+                            interactive_status=interactive_status,
+                            timeout_seconds=max(1.0, 30.0 - age),
+                        )
+                    except llm.ModelError:
+                        # Still attempt the server's repair/re-add path below.
+                        pass
 
         if on_status is not None:
             on_status(f"knowledge sync · resuming prior upload · {display_path}")
@@ -1591,6 +1594,7 @@ def _wait_for_file_processing(
     started: float | None = None,
     on_status: Callable[[str], None] | None = None,
     interactive_status: bool = False,
+    timeout_seconds: float | None = None,
 ) -> None:
     """Wait for Open WebUI's background extraction/RAG processing.
 
@@ -1599,7 +1603,12 @@ def _wait_for_file_processing(
     the same semantics without tying a long-running SSE connection to the CLI.
     """
     started = started if started is not None else time.monotonic()
-    deadline = started + _file_processing_timeout()
+    processing_timeout = (
+        float(timeout_seconds)
+        if timeout_seconds is not None
+        else _file_processing_timeout()
+    )
+    deadline = started + processing_timeout
     headers = {
         "Accept": "application/json",
         "Authorization": f"Bearer {client.token}",
@@ -1611,7 +1620,7 @@ def _wait_for_file_processing(
         if time.monotonic() >= deadline:
             raise llm.ModelError(
                 f"Open WebUI timed out processing {filename} "
-                f"after {_file_processing_timeout():g}s"
+                f"after {processing_timeout:g}s"
             )
 
         try:
