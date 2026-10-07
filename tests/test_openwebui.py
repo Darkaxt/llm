@@ -422,6 +422,11 @@ def test_current_openwebui_structured_output_parsing():
             "role": "assistant",
             "content": [{"type": "output_text", "text": "The search succeeded."}],
         },
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "output_text", "text": "Summarize the returned event."}],
+        },
     ]
 
     assert (
