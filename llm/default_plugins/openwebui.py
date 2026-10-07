@@ -898,6 +898,26 @@ def _sync_knowledge_folder(
     }
 
 
+def _journal_file_reference(item: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "type",
+        "id",
+        "name",
+        "description",
+        "context",
+        "collection_name",
+        "content_type",
+        "size",
+        "status",
+        "url",
+    )
+    return {
+        key: item.get(key)
+        for key in keys
+        if item.get(key) is not None
+    }
+
+
 def _tool_kind(tool_id: str) -> str:
     if tool_id.startswith("server:mcp:"):
         return "mcp"
@@ -1920,6 +1940,27 @@ class OpenWebUIModel(llm.Model):
             )
         except (APIError, AuthError) as exc:
             raise llm.ModelError(str(exc)) from exc
+
+        journal_provider(
+            {
+                "type": "provider_request",
+                "model": self.remote_model_id,
+                "messages": messages,
+                "tool_ids": tool_ids,
+                "files": [
+                    _journal_file_reference(item)
+                    for item in attached_files
+                    if isinstance(item, dict)
+                ],
+                "options": {
+                    "temperature": prompt.options.temperature,
+                    "openwebui_attachment_context": (
+                        prompt.options.openwebui_attachment_context
+                    ),
+                    "openwebui_tools": prompt.options.openwebui_tools,
+                },
+            }
+        )
 
         events: queue.Queue[tuple[str, Any]] = queue.Queue()
         tool_activity: list[str] = []
