@@ -661,11 +661,11 @@ class OpenWebUIModel(llm.Model):
 
         def on_tool(line: str) -> None:
             tool_activity.append(line)
-            click.echo(f"[Open WebUI tool] {line}", err=True)
+            events.put(("tool", line))
 
         def on_status(line: str) -> None:
             status_activity.append(line)
-            click.echo(f"[Open WebUI] {line}", err=True)
+            events.put(("status", line))
 
         def worker() -> None:
             try:
@@ -716,6 +716,7 @@ class OpenWebUIModel(llm.Model):
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
 
+        output_line_open = False
         while True:
             if _escape_pressed():
                 raise KeyboardInterrupt
@@ -724,10 +725,20 @@ class OpenWebUIModel(llm.Model):
             except queue.Empty:
                 continue
             if kind == "text":
-                yield str(payload)
+                chunk = str(payload)
+                output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
+                yield chunk
             elif kind == "reasoning":
                 if not prompt.hide_reasoning:
-                    yield StreamEvent(type="reasoning", chunk=str(payload))
+                    chunk = str(payload)
+                    output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
+                    yield StreamEvent(type="reasoning", chunk=chunk)
+            elif kind in ("tool", "status"):
+                if output_line_open:
+                    click.echo("", err=True)
+                prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
+                click.echo(f"{prefix} {payload}", err=True)
+                output_line_open = False
             elif kind == "error":
                 if isinstance(payload, (APIError, AuthError)):
                     raise llm.ModelError(str(payload)) from payload
