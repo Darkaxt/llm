@@ -879,20 +879,16 @@ def test_local_knowledge_manifest_expands_7z_as_virtual_tree(tmp_path):
     import py7zr
 
     archive_path = tmp_path / "bundle.7z"
-    source_dir = tmp_path / "source"
-    source_dir.mkdir()
-    nested = source_dir / "bundle"
-    nested.mkdir()
-    (nested / "rule-index.json").write_text('{"rule":"value"}', encoding="utf-8")
-
     with py7zr.SevenZipFile(archive_path, "w") as archive:
-        archive.writeall(source_dir, arcname="")
+        archive.writestr(
+            '{"rule":"value"}',
+            "bundle/rule-index.json",
+        )
 
     manifest = openwebui._local_knowledge_manifest(tmp_path)
     virtual_paths = {
         (item["path"], item["filename"])
         for item in manifest
-        if not item["_local_path"].startswith(str(source_dir))
     }
 
     assert ("bundle", "rule-index.json") in virtual_paths
