@@ -361,6 +361,321 @@ def _enabled_tool_ids(config: dict[str, Any]) -> list[str]:
     return [str(value) for value in raw if value]
 
 
+def _local_knowledge_manifest(root: Path) -> list[dict[str, Any]]:
+    root = root.expanduser().resolve()
+    if not root.exists():
+        raise click.ClickException(f"Knowledge source folder does not exist: {root}")
+    if not root.is_dir():
+        raise click.ClickException(f"Knowledge source is not a folder: {root}")
+
+    manifest: list[dict[str, Any]] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        # Match Open WebUI's directory picker behavior: ignore hidden content.
+        dirnames[:] = sorted(
+            name
+            for name in dirnames
+            if not name.startswith(".")
+            and not (Path(dirpath) / name).is_symlink()
+        )
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            full_path = Path(dirpath) / filename
+            if full_path.is_symlink() or not full_path.is_file():
+                continue
+            relative = full_path.relative_to(root)
+            parent = relative.parent.as_posix()
+            if parent == ".":
+                parent = ""
+            digest = hashlib.sha256()
+            size = 0
+            with full_path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+            manifest.append(
+                {
+                    "filename": filename,
+                    "path": parent,
+                    "checksum": digest.hexdigest(),
+                    "size": size,
+                    "_local_path": str(full_path),
+                }
+            )
+    return manifest
+
+
+def _content_type_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        return "application/x-ndjson"
+    if suffix in {".yaml", ".yml"}:
+        return "application/yaml"
+    content_type, _ = mimetypes.guess_type(path.name)
+    return content_type or "application/octet-stream"
+
+
+def _create_knowledge_directory(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+    directory_path: str,
+    directory_ids: dict[str, str],
+) -> str:
+    segments = [segment for segment in directory_path.split("/") if segment]
+    current_path = ""
+    parent_id: str | None = None
+    for segment in segments:
+        current_path = (
+            f"{current_path}/{segment}" if current_path else segment
+        )
+        existing = directory_ids.get(current_path)
+        if existing:
+            parent_id = existing
+            continue
+        payload = _owui_http_json(
+            client,
+            "POST",
+            f"/api/v1/knowledge/{knowledge_id}/dirs/create",
+            json_body={
+                "name": segment,
+                **({"parent_id": parent_id} if parent_id else {}),
+            },
+        )
+        if not isinstance(payload, dict) or not payload.get("id"):
+            raise llm.ModelError(
+                f"Open WebUI failed to create knowledge directory "
+                f"{current_path!r}"
+            )
+        parent_id = str(payload["id"])
+        directory_ids[current_path] = parent_id
+    if not parent_id:
+        raise llm.ModelError(
+            f"Could not resolve knowledge directory {directory_path!r}"
+        )
+    return parent_id
+
+
+def _upload_knowledge_sync_file(
+    client: OpenWebUIClient,
+    *,
+    knowledge_id: str,
+    entry: dict[str, Any],
+    directory_id: str | None,
+    ordinal: int,
+    total: int,
+    on_status: Callable[[str], None] | None = None,
+    interactive_status: bool = False,
+) -> dict[str, Any]:
+    path = Path(str(entry["_local_path"]))
+    try:
+        content = path.read_bytes()
+    except Exception as exc:
+        raise llm.ModelError(
+            f"Could not read knowledge source file {path}: {exc}"
+        ) from exc
+
+    metadata = {
+        "knowledge_id": knowledge_id,
+        "file_hash": entry["checksum"],
+        "directory_id": directory_id,
+    }
+    started = time.monotonic()
+    _render_file_progress(
+        filename=(
+            f"{entry['path']}/{entry['filename']}"
+            if entry["path"]
+            else entry["filename"]
+        ),
+        status="uploading to knowledge",
+        started=started,
+        tick=0,
+        ordinal=ordinal,
+        total=total,
+        on_status=on_status,
+    )
+
+    with httpx2.Client(
+        trust_env=True,
+        timeout=max(float(client.timeout), 120.0),
+    ) as http:
+        try:
+            result = http.post(
+                f"{client.base_url}/api/v1/files/",
+                params={
+                    "process": "true",
+                    "process_in_background": "true",
+                },
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {client.token}",
+                },
+                data={"metadata": json.dumps(metadata)},
+                files={
+                    "file": (
+                        entry["filename"],
+                        content,
+                        _content_type_for_path(path),
+                    )
+                },
+            )
+            result.raise_for_status()
+            uploaded = result.json()
+        except Exception as exc:
+            raise llm.ModelError(
+                f"Open WebUI failed to upload knowledge file {path}: {exc}"
+            ) from exc
+
+        if not isinstance(uploaded, dict) or not uploaded.get("id"):
+            raise llm.ModelError(
+                f"Open WebUI returned an invalid knowledge upload "
+                f"response for {path}"
+            )
+
+        _wait_for_file_processing(
+            http,
+            client,
+            str(uploaded["id"]),
+            str(entry["filename"]),
+            ordinal=ordinal,
+            total=total,
+            started=started,
+            on_status=on_status,
+            interactive_status=interactive_status,
+        )
+        return uploaded
+
+
+def _sync_knowledge_folder(
+    client: OpenWebUIClient,
+    knowledge: dict[str, Any],
+    root: Path,
+    *,
+    on_status: Callable[[str], None] | None = None,
+    interactive_status: bool = False,
+) -> dict[str, int]:
+    knowledge_id = str(knowledge["id"])
+    root = root.expanduser().resolve()
+
+    if on_status is not None:
+        on_status(f"knowledge sync · hashing {root}")
+    manifest = _local_knowledge_manifest(root)
+    wire_manifest = [
+        {
+            key: entry[key]
+            for key in ("filename", "path", "checksum", "size")
+        }
+        for entry in manifest
+    ]
+
+    if on_status is not None:
+        on_status(
+            f"knowledge sync · comparing {len(wire_manifest)} local files"
+        )
+    diff = _owui_http_json(
+        client,
+        "POST",
+        f"/api/v1/knowledge/{knowledge_id}/sync/diff",
+        json_body={"manifest": wire_manifest},
+        timeout=max(float(client.timeout), 300.0),
+    )
+    if not isinstance(diff, dict):
+        raise llm.ModelError("Open WebUI returned an invalid knowledge sync diff")
+
+    added = diff.get("added") or []
+    modified = diff.get("modified") or []
+    deleted = diff.get("deleted") or []
+    rmdir = diff.get("rmdir") or []
+    mkdir = diff.get("mkdir") or []
+    directory_ids = {
+        str(path): str(directory_id)
+        for path, directory_id in (diff.get("directory_map") or {}).items()
+        if path and directory_id
+    }
+
+    stale_ids = [
+        str(item.get("file_id"))
+        for item in deleted
+        if isinstance(item, dict) and item.get("file_id")
+    ] + [
+        str(item.get("stale_file_id"))
+        for item in modified
+        if isinstance(item, dict) and item.get("stale_file_id")
+    ]
+
+    if stale_ids or rmdir:
+        if on_status is not None:
+            on_status(
+                f"knowledge sync · removing {len(stale_ids)} stale files"
+            )
+        _owui_http_json(
+            client,
+            "POST",
+            f"/api/v1/knowledge/{knowledge_id}/sync/cleanup",
+            json_body={
+                "file_ids": stale_ids,
+                "dir_ids": [str(value) for value in rmdir],
+            },
+            timeout=max(float(client.timeout), 300.0),
+        )
+
+    for directory_path in sorted(
+        (str(path) for path in mkdir if path),
+        key=lambda value: (value.count("/"), value.casefold()),
+    ):
+        _create_knowledge_directory(
+            client,
+            knowledge_id,
+            directory_path,
+            directory_ids,
+        )
+
+    wanted = {
+        (str(item.get("path") or ""), str(item.get("filename") or ""))
+        for item in [*added, *modified]
+        if isinstance(item, dict)
+    }
+    files_to_upload = [
+        entry
+        for entry in manifest
+        if (entry["path"], entry["filename"]) in wanted
+    ]
+
+    for ordinal, entry in enumerate(files_to_upload, start=1):
+        directory_id = (
+            directory_ids.get(entry["path"])
+            if entry["path"]
+            else None
+        )
+        if entry["path"] and not directory_id:
+            directory_id = _create_knowledge_directory(
+                client,
+                knowledge_id,
+                entry["path"],
+                directory_ids,
+            )
+        _upload_knowledge_sync_file(
+            client,
+            knowledge_id=knowledge_id,
+            entry=entry,
+            directory_id=directory_id,
+            ordinal=ordinal,
+            total=len(files_to_upload),
+            on_status=on_status,
+            interactive_status=interactive_status,
+        )
+
+    return {
+        "added": len(added),
+        "modified": len(modified),
+        "deleted": len(deleted),
+        "unmodified": int(diff.get("unmodified_count") or 0),
+        "uploaded": len(files_to_upload),
+    }
+
+
 def _tool_kind(tool_id: str) -> str:
     if tool_id.startswith("server:mcp:"):
         return "mcp"
