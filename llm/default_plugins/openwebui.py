@@ -269,7 +269,7 @@ class OpenWebUIModel(llm.Model):
             )
 
         client = _client(config)
-        messages = _messages_for_openwebui(prompt)
+        messages, attached_files = _prepare_openwebui_request(prompt, client)
 
         try:
             tool_ids = client.resolve_tools(
