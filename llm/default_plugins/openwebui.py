@@ -11,7 +11,6 @@ import json
 import os
 import queue
 import threading
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterator
 
