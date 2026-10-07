@@ -54,7 +54,7 @@ def test_chat_basic(mock_model, logs_db):
     assert _strip_chat_session_banner(result.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
-        "\nType '!multi' to enter multiple lines, then '!end' to finish"
+        "\nEnter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
         "\nType '!edit' to open your default editor and modify the prompt"
         "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
@@ -104,7 +104,7 @@ def test_chat_basic(mock_model, logs_db):
     assert _strip_chat_session_banner(result2.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
-        "\nType '!multi' to enter multiple lines, then '!end' to finish"
+        "\nEnter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
         "\nType '!edit' to open your default editor and modify the prompt"
         "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
@@ -141,7 +141,7 @@ def test_chat_system(mock_model, logs_db):
     assert _strip_chat_session_banner(result.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
-        "\nType '!multi' to enter multiple lines, then '!end' to finish"
+        "\nEnter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
         "\nType '!edit' to open your default editor and modify the prompt"
         "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
@@ -316,7 +316,7 @@ def test_chat_tools(logs_db):
     assert normalized_output == (
         "Chatting with echo\n"
         "Type 'exit' or 'quit' to exit\n"
-        "Type '!multi' to enter multiple lines, then '!end' to finish\n"
+        "Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)\n"
         "Type '!edit' to open your default editor and modify the prompt\n"
         "Press Ctrl+C during generation to cancel the current response\n"
         "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments\n"
@@ -435,3 +435,13 @@ def test_chat_autosaves_jsonl(mock_model, logs_db, user_path):
     assert turns[0]["conversation_id"] == conversation_id
     assert turns[0]["prompt"] == "saved prompt"
     assert turns[0]["response"] == "saved answer"
+
+
+
+def test_read_chat_prompt_noninteractive_uses_click(monkeypatch):
+    monkeypatch.setattr(
+        llm.cli.click,
+        "prompt",
+        lambda *args, **kwargs: "hello",
+    )
+    assert llm.cli._read_chat_prompt(None) == "hello"
