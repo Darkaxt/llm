@@ -218,6 +218,8 @@ async def run_chat_with_tools_with_files(
         "tool_results": [],  # [{name, result}] for structured result capture
         "error": None,
         "last_event_at": time.monotonic(),
+        "phase": "initial model",
+        "phase_started_at": time.monotonic(),
     }
     done = asyncio.Event()
 
@@ -257,6 +259,13 @@ async def run_chat_with_tools_with_files(
             if done_before is None or done_before != done_now:
                 suffix = " done" if done_now else " ..."
                 out_tool(f"↳ {ev['name']}{suffix}")
+                if done_now:
+                    state["phase"] = "model continuation"
+                    state["phase_started_at"] = time.monotonic()
+                    out_status("tool result received; waiting for model continuation")
+                else:
+                    state["phase"] = "tool execution"
+                    state["phase_started_at"] = time.monotonic()
             state["tool_done"][key] = done_now
             if done_now:
                 new_results.append(
@@ -367,6 +376,13 @@ async def run_chat_with_tools_with_files(
                 done_before = state["tool_done"].get(name)
                 if done_before is None or done_before != done_now:
                     out_tool(format_tool_line(ev))
+                    if done_now:
+                        state["phase"] = "model continuation"
+                        state["phase_started_at"] = time.monotonic()
+                        out_status("tool result received; waiting for model continuation")
+                    else:
+                        state["phase"] = "tool execution"
+                        state["phase_started_at"] = time.monotonic()
                 state["tool_done"][name] = done_now
 
                 if done_now:
@@ -546,12 +562,15 @@ async def run_chat_with_tools_with_files(
                     timeout=min(heartbeat_seconds, remaining),
                 )
             except _AsyncTimeoutError:
-                idle = time.monotonic() - state["last_event_at"]
+                now = time.monotonic()
+                idle = now - state["last_event_at"]
+                phase_elapsed = now - state["phase_started_at"]
                 # Keep the socket/session alive exactly as the browser does.
                 with contextlib.suppress(Exception):
                     await sio.emit("heartbeat", {})
                 out_status(
-                    f"waiting for Open WebUI ({int(elapsed + heartbeat_seconds)}s elapsed, "
+                    f"waiting for {state['phase']} "
+                    f"({int(phase_elapsed)}s phase, {int(elapsed + heartbeat_seconds)}s total, "
                     f"{int(idle)}s since last event)"
                 )
     finally:
