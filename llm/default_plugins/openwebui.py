@@ -7,8 +7,10 @@ model discovery, streaming, reasoning and the Socket.IO tool execution path.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import mimetypes
 import os
 import queue
 import shutil
@@ -156,6 +158,200 @@ def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
         for model in client.list_models()
         if model.id
     ]
+
+
+def _owui_http_json(
+    client: OpenWebUIClient,
+    method: str,
+    path: str,
+    *,
+    json_body: Any = None,
+    params: dict[str, Any] | None = None,
+    data: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
+    timeout: float | None = None,
+) -> Any:
+    """Make an authenticated Open WebUI API request with useful errors."""
+    url = f"{client.base_url.rstrip('/')}/{path.lstrip('/')}"
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {client.token}",
+    }
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
+
+    try:
+        with httpx2.Client(
+            trust_env=True,
+            timeout=timeout or max(float(client.timeout), 120.0),
+        ) as http:
+            response = http.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                data=data,
+                files=files,
+            )
+            if not response.is_success:
+                detail: Any = None
+                try:
+                    payload = response.json()
+                    if isinstance(payload, dict):
+                        detail = (
+                            payload.get("detail")
+                            or payload.get("message")
+                            or payload.get("error")
+                        )
+                    if detail is None:
+                        detail = payload
+                except Exception:
+                    detail = response.text
+                raise llm.ModelError(
+                    f"Open WebUI {method.upper()} {path} failed "
+                    f"({response.status_code}): {detail or response.reason_phrase}"
+                )
+            if response.status_code == 204 or not response.content:
+                return None
+            try:
+                return response.json()
+            except Exception as exc:
+                raise llm.ModelError(
+                    f"Open WebUI {method.upper()} {path} returned invalid JSON"
+                ) from exc
+    except llm.ModelError:
+        raise
+    except Exception as exc:
+        raise llm.ModelError(
+            f"Open WebUI {method.upper()} {path} failed: {exc}"
+        ) from exc
+
+
+def _enabled_knowledge_ids(config: dict[str, Any]) -> list[str]:
+    raw = config.get("enabled_knowledge_ids", [])
+    if not isinstance(raw, list):
+        return []
+    return [str(value) for value in raw if value]
+
+
+def _knowledge_sources(config: dict[str, Any]) -> dict[str, str]:
+    raw = config.get("knowledge_sources", {})
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(knowledge_id): str(path)
+        for knowledge_id, path in raw.items()
+        if knowledge_id and path
+    }
+
+
+def _list_knowledge_bases(client: OpenWebUIClient) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        payload = _owui_http_json(
+            client,
+            "GET",
+            "/api/v1/knowledge/",
+            params={"page": page},
+        )
+        if not isinstance(payload, dict):
+            raise llm.ModelError("Open WebUI returned an invalid knowledge list")
+        page_items = payload.get("items") or []
+        if not isinstance(page_items, list):
+            raise llm.ModelError("Open WebUI returned an invalid knowledge list")
+        items.extend(item for item in page_items if isinstance(item, dict))
+        total = payload.get("total")
+        if not page_items:
+            break
+        if isinstance(total, int) and len(items) >= total:
+            break
+        page += 1
+    return items
+
+
+def _get_knowledge_by_id(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+) -> dict[str, Any]:
+    payload = _owui_http_json(
+        client,
+        "GET",
+        f"/api/v1/knowledge/{knowledge_id}",
+    )
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise llm.ModelError(
+            f"Open WebUI returned an invalid knowledge base for {knowledge_id}"
+        )
+    return payload
+
+
+def _resolve_knowledge_selector(
+    client: OpenWebUIClient,
+    selector: str,
+) -> dict[str, Any]:
+    available = _list_knowledge_bases(client)
+    if not available:
+        raise click.ClickException("Open WebUI returned no knowledge bases")
+
+    exact_id = [
+        item for item in available if str(item.get("id") or "") == selector
+    ]
+    if exact_id:
+        return exact_id[0]
+
+    folded = selector.casefold()
+    exact_name = [
+        item
+        for item in available
+        if str(item.get("name") or "").casefold() == folded
+    ]
+    if len(exact_name) == 1:
+        return exact_name[0]
+    if len(exact_name) > 1:
+        matches = ", ".join(
+            f"{item.get('name')} ({item.get('id')})" for item in exact_name
+        )
+        raise click.ClickException(
+            f"Knowledge base name is ambiguous: {matches}"
+        )
+
+    partial = [
+        item
+        for item in available
+        if folded in str(item.get("id") or "").casefold()
+        or folded in str(item.get("name") or "").casefold()
+    ]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        matches = ", ".join(
+            f"{item.get('name')} ({item.get('id')})" for item in partial
+        )
+        raise click.ClickException(
+            f"Knowledge selector {selector!r} is ambiguous: {matches}"
+        )
+    raise click.ClickException(
+        f"No Open WebUI knowledge base matches {selector!r}"
+    )
+
+
+def _enabled_knowledge_items(
+    config: dict[str, Any],
+    client: OpenWebUIClient,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for knowledge_id in _enabled_knowledge_ids(config):
+        try:
+            knowledge = _get_knowledge_by_id(client, knowledge_id)
+        except llm.ModelError as exc:
+            raise llm.ModelError(
+                f"Enabled Open WebUI knowledge base {knowledge_id} "
+                f"is unavailable: {exc}"
+            ) from exc
+        items.append({"type": "collection", **knowledge})
+    return items
 
 
 def _enabled_tool_ids(config: dict[str, Any]) -> list[str]:
