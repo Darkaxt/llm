@@ -151,3 +151,14 @@ def test_config_round_trip(tmp_path, monkeypatch):
     openwebui._save_config(config)
     assert openwebui._load_config() == config
     assert json.loads((tmp_path / "openwebui.json").read_text()) == config
+
+
+def test_openwebui_model_accepts_general_attachment_types(tmp_path):
+    path = tmp_path / "bundle.zip"
+    path.write_bytes(b"PK\\x03\\x04test")
+    model = openwebui.OpenWebUIModel("glm")
+    # The provider defers file-policy enforcement to Open WebUI rather than
+    # LLM's static attachment_types allowlist.
+    model._validate_attachments(
+        [llm.Attachment(type="application/zip", path=str(path))]
+    )
