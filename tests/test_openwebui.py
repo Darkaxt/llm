@@ -339,3 +339,57 @@ def test_resolve_tool_selector_matches_mcp_name():
     tool = openwebui._resolve_tool_selector(client, "Splunk MCP")
     assert tool.id == "server:mcp:splunk-main"
     assert openwebui._tool_kind(tool.id) == "mcp"
+
+
+
+def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {
+            "url": "https://example.test",
+            "token": "jwt",
+            "models": [],
+            "enabled_tool_ids": ["server:mcp:splunk-mcp"],
+        },
+    )
+
+    class FakeClient:
+        base_url = "https://example.test"
+        token = "jwt"
+        timeout = 600
+
+        def resolve_tools(self, model_id, extra_tool_ids=None, no_tools=False):
+            return list(extra_tool_ids or [])
+
+        def run_chat(self, **kwargs):
+            raise AssertionError("SDK run_chat must not be used for tool-enabled chats")
+
+    monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_prepare_openwebui_request",
+        lambda prompt, client: ([{"role": "user", "content": "test"}], []),
+    )
+
+    calls = []
+
+    def fake_runner(**kwargs):
+        calls.append(kwargs)
+        return {
+            "answer": "ok",
+            "reasoning": None,
+            "tool_calls": [],
+            "raw_content": "ok",
+        }
+
+    monkeypatch.setattr(openwebui, "run_chat_with_tools_with_files", fake_runner)
+
+    model = openwebui.OpenWebUIModel("glm-5.3")
+    prompt = llm.Prompt("test", model)
+    response = SimpleNamespace(response_json=None)
+
+    assert list(model.execute(prompt, True, response, None)) == []
+    assert len(calls) == 1
+    assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert calls[0]["files"] == []
