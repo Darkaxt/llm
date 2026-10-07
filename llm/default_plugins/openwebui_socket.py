@@ -1,4 +1,8 @@
-# Vendored compatibility shim from vedmaka/openwebui-sdk sockets.py\n# Source commit: f55e6391173d46bb9d664ab7129fde8b57c40497\n# Local change: allow Open WebUI top-level files metadata in tool-enabled chats.\n\n"""Socket.IO chat runner - the only path over which Open WebUI actually
+# Vendored compatibility shim from vedmaka/openwebui-sdk sockets.py
+# Source commit: f55e6391173d46bb9d664ab7129fde8b57c40497
+# Local change: allow Open WebUI top-level files metadata in tool-enabled chats.
+
+"""Socket.IO chat runner - the only path over which Open WebUI actually
 *executes* tools.
 
 Why this module exists
@@ -77,13 +81,14 @@ def _need_socketio() -> Any:
     return socketio
 
 
-async def run_chat_with_tools(
+async def run_chat_with_tools_with_files(
     *,
     base_url: str,
     token: str,
     model: str,
     messages: list[dict[str, str]],
     tool_ids: list[str],
+    files: list[dict[str, Any]] | None = None,
     timeout: int = 300,
     on_text: Callable[[str], None] | None = None,
     on_tool: Callable[[str], None] | None = None,
@@ -319,6 +324,7 @@ async def run_chat_with_tools(
             "id": message_id,
             "session_id": session_id,
             "tool_ids": tool_ids,
+            "files": files or None,
             "features": {
                 "image_generation": False,
                 "code_interpreter": False,
