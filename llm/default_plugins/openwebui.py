@@ -13,11 +13,14 @@ import queue
 import threading
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 import click
+import httpx2
 import llm
+from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
 from llm.parts import AttachmentPart, ReasoningPart, StreamEvent, TextPart, ToolResultPart
-from openwebui_sdk import OpenWebUIClient
+from openwebui_sdk import ChatResult, OpenWebUIClient
 from openwebui_sdk.errors import APIError, AuthError
 
 CONFIG_FILENAME = "openwebui.json"
