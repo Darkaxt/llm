@@ -89,6 +89,53 @@ def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
     ]
 
 
+def _enabled_tool_ids(config: dict[str, Any]) -> list[str]:
+    raw = config.get("enabled_tool_ids", [])
+    if not isinstance(raw, list):
+        return []
+    return [str(value) for value in raw if value]
+
+
+def _tool_kind(tool_id: str) -> str:
+    if tool_id.startswith("server:mcp:"):
+        return "mcp"
+    if tool_id.startswith("server:"):
+        return "server"
+    return "tool"
+
+
+def _resolve_tool_selector(client: OpenWebUIClient, selector: str):
+    tools = client.list_tools()
+    if not tools:
+        raise click.ClickException("Open WebUI returned no available tools")
+
+    exact_id = [tool for tool in tools if tool.id == selector]
+    if exact_id:
+        return exact_id[0]
+
+    folded = selector.casefold()
+    exact_name = [tool for tool in tools if tool.name.casefold() == folded]
+    if len(exact_name) == 1:
+        return exact_name[0]
+    if len(exact_name) > 1:
+        matches = ", ".join(f"{tool.name} ({tool.id})" for tool in exact_name)
+        raise click.ClickException(f"Tool name is ambiguous: {matches}")
+
+    partial = [
+        tool
+        for tool in tools
+        if folded in tool.id.casefold() or folded in tool.name.casefold()
+    ]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        matches = ", ".join(f"{tool.name} ({tool.id})" for tool in partial)
+        raise click.ClickException(
+            f"Tool selector {selector!r} is ambiguous: {matches}"
+        )
+    raise click.ClickException(f"No Open WebUI tool matches {selector!r}")
+
+
 def _persist_session(config: dict[str, Any], client: OpenWebUIClient) -> dict[str, Any]:
     session = client.session()
     config = dict(config)
@@ -580,6 +627,7 @@ class OpenWebUIModel(llm.Model):
         try:
             tool_ids = client.resolve_tools(
                 self.remote_model_id,
+                extra_tool_ids=_enabled_tool_ids(config),
                 no_tools=not prompt.options.openwebui_tools,
             )
         except (APIError, AuthError) as exc:
@@ -760,3 +808,86 @@ def register_commands(cli):
             click.echo(
                 f"openwebui/{item.get('id')}\t{item.get('name') or item.get('id')}"
             )
+
+
+    @openwebui_group.command(name="tools")
+    def tools():
+        """List Open WebUI tools and MCP servers visible to this user."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            available = client.list_tools()
+        except (APIError, AuthError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        enabled = set(_enabled_tool_ids(config))
+        if not available:
+            click.echo("No Open WebUI tools are visible to this user.")
+            return
+        for tool in available:
+            marker = "*" if tool.id in enabled else " "
+            click.echo(
+                f"{marker}\t{_tool_kind(tool.id)}\t{tool.name}\t{tool.id}"
+            )
+
+    @openwebui_group.group(name="tool")
+    def tool_group():
+        """Enable or disable Open WebUI tools for CLI chats."""
+
+    @tool_group.command(name="enable")
+    @click.argument("selector")
+    def tool_enable(selector: str):
+        """Persist an Open WebUI tool/MCP server as enabled for CLI chats."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            tool = _resolve_tool_selector(client, selector)
+        except (APIError, AuthError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        enabled = _enabled_tool_ids(config)
+        if tool.id not in enabled:
+            enabled.append(tool.id)
+            config["enabled_tool_ids"] = enabled
+            _save_config(config)
+        click.echo(
+            f"Enabled {_tool_kind(tool.id)} tool {tool.name} ({tool.id})"
+        )
+
+    @tool_group.command(name="disable")
+    @click.argument("selector")
+    def tool_disable(selector: str):
+        """Remove a persisted Open WebUI tool/MCP server from CLI chats."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            tool = _resolve_tool_selector(client, selector)
+        except (APIError, AuthError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        enabled = [
+            tool_id
+            for tool_id in _enabled_tool_ids(config)
+            if tool_id != tool.id
+        ]
+        config["enabled_tool_ids"] = enabled
+        _save_config(config)
+        click.echo(
+            f"Disabled {_tool_kind(tool.id)} tool {tool.name} ({tool.id})"
+        )
+
+    @tool_group.command(name="clear")
+    def tool_clear():
+        """Disable all CLI-persisted Open WebUI tools."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        config["enabled_tool_ids"] = []
+        _save_config(config)
+        click.echo("Disabled all CLI-persisted Open WebUI tools.")
