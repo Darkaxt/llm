@@ -54,6 +54,19 @@ def _save_config(config: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _chat_timeout() -> int:
+    raw = os.environ.get("LLM_OPENWEBUI_CHAT_TIMEOUT", "600")
+    try:
+        timeout = int(float(raw))
+    except ValueError as exc:
+        raise llm.ModelError(
+            "LLM_OPENWEBUI_CHAT_TIMEOUT must be a number of seconds"
+        ) from exc
+    if timeout <= 0:
+        raise llm.ModelError("LLM_OPENWEBUI_CHAT_TIMEOUT must be greater than zero")
+    return timeout
+
+
 def _client(config: dict[str, Any]) -> OpenWebUIClient:
     url = config.get("url")
     token = config.get("token")
@@ -61,7 +74,11 @@ def _client(config: dict[str, Any]) -> OpenWebUIClient:
         raise llm.ModelError(
             "Open WebUI is not configured. Run: llm openwebui login --url URL --email EMAIL"
         )
-    return OpenWebUIClient(base_url=str(url), token=str(token))
+    return OpenWebUIClient(
+        base_url=str(url),
+        token=str(token),
+        timeout=_chat_timeout(),
+    )
 
 
 def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
@@ -599,6 +616,7 @@ class OpenWebUIModel(llm.Model):
                             messages=messages,
                             tool_ids=tool_ids,
                             files=attached_files,
+                            timeout=client.timeout,
                             on_text=on_text,
                             on_reasoning=on_reasoning,
                             on_tool=on_tool,
