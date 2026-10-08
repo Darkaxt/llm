@@ -161,9 +161,7 @@ async def _stop_remote_chat_tasks(
             timeout=15,
         ) as response:
             if response.status >= 400:
-                on_status(
-                    f"could not stop remote chat tasks (HTTP {response.status})"
-                )
+                on_status(f"could not stop remote chat tasks (HTTP {response.status})")
                 return False
             on_status("remote chat task cancellation requested")
             return True
@@ -707,11 +705,9 @@ async def run_chat_with_tools_with_files(
             message_id=message_id,
             user_message_id=user_message_id,
         )
-        # NOTE: we intentionally do NOT send params.function_calling here. The
-        # server reads it from the model config (model_info.params.function_calling,
-        # main.py:1131) - a model with native FC configured uses it automatically,
-        # one without uses Open WebUI's prompt-based calling. The CLI never
-        # overrides model config.
+        # Native mode keeps the model's default function-calling behavior.
+        # Background legacy mode explicitly opts out of hidden builtin tools
+        # while retaining the selected server-side MCP tools.
 
         if sessionless_server_tools:
             # Current Open WebUI only injects hidden builtin tools for requests
@@ -792,11 +788,7 @@ async def run_chat_with_tools_with_files(
                 remaining_progress = progress_limit - (
                     now - state["last_progress_at"]
                 )
-                wait_for = min(
-                    1.0,
-                    remaining_idle,
-                    remaining_progress,
-                )
+                wait_for = min(1.0, remaining_idle, remaining_progress)
                 try:
                     await asyncio.wait_for(done.wait(), timeout=wait_for)
                 except _AsyncTimeoutError:
