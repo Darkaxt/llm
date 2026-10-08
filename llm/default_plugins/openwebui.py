@@ -2608,6 +2608,7 @@ class OpenWebUIModel(llm.Model):
                         prompt.options.openwebui_attachment_context
                     ),
                     "openwebui_tools": prompt.options.openwebui_tools,
+                    "sessionless_server_tools": bool(knowledge_items),
                 },
                 "model_item": {
                     "id": model_item.get("id"),
@@ -2672,14 +2673,10 @@ class OpenWebUIModel(llm.Model):
                                     {"temperature": prompt.options.temperature}
                                     if prompt.options.temperature is not None
                                     else {}
-                                ),
-                                **(
-                                    {"function_calling": "legacy"}
-                                    if knowledge_items
-                                    else {}
-                                ),
+                                )
                             },
                             timeout=client.timeout,
+                            sessionless_server_tools=bool(knowledge_items),
                             on_text=on_text,
                             on_reasoning=on_reasoning,
                             on_tool=on_tool,
