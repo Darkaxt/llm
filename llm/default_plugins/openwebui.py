@@ -2846,6 +2846,99 @@ def register_commands(cli):
             f"{result.get('reused', 0)} resumed."
         )
 
+    @knowledge_group.command(name="rebuild")
+    @click.argument("selector")
+    @click.argument(
+        "source",
+        required=False,
+        type=click.Path(file_okay=False, path_type=Path),
+    )
+    @click.option(
+        "--yes",
+        is_flag=True,
+        help="Skip the destructive reset confirmation.",
+    )
+    def knowledge_rebuild(selector: str, source: Path | None, yes: bool):
+        """Reset a knowledge base in place and repopulate it from its local folder."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+
+        try:
+            knowledge = _resolve_knowledge_selector(client, selector)
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        if knowledge.get("write_access") is False:
+            raise click.ClickException(
+                f"Knowledge base {knowledge.get('name') or knowledge.get('id')} "
+                "is read-only for this user."
+            )
+
+        knowledge_id = str(knowledge["id"])
+        sources = _knowledge_sources(config)
+        if source is None:
+            stored = sources.get(knowledge_id)
+            if not stored:
+                raise click.ClickException(
+                    "No local source folder is registered for this knowledge "
+                    "base; provide PATH on this rebuild."
+                )
+            source = Path(stored)
+
+        source = source.expanduser().resolve()
+        # Validate and hash source before destructive reset so obvious local
+        # problems cannot leave a previously healthy KB empty.
+        manifest = _local_knowledge_manifest(source)
+        if not manifest:
+            raise click.ClickException(
+                f"Knowledge source folder contains no visible files: {source}. "
+                "Refusing to rebuild from an empty folder."
+            )
+
+        name = str(knowledge.get("name") or knowledge_id)
+        if not yes:
+            click.confirm(
+                f"Reset and fully rebuild knowledge base {name!r} "
+                f"({knowledge_id}) from {source}? This deletes the current KB "
+                "index/file links before re-uploading.",
+                abort=True,
+            )
+
+        status_bar = _OpenWebUIStatusBar()
+        try:
+            status_bar.update(f"knowledge rebuild · resetting {name}")
+            _reset_knowledge_base(client, knowledge_id)
+            status_bar.update(
+                f"knowledge rebuild · repopulating {len(manifest)} files"
+            )
+            result = _sync_knowledge_folder(
+                client,
+                knowledge,
+                source,
+                on_status=status_bar.update,
+                interactive_status=status_bar.enabled,
+                detect_interrupted=False,
+            )
+        except (llm.ModelError, click.ClickException) as exc:
+            status_bar.clear()
+            raise click.ClickException(
+                f"Knowledge rebuild failed after reset: {exc}"
+            ) from exc
+        finally:
+            status_bar.clear()
+
+        sources[knowledge_id] = str(source)
+        config["knowledge_sources"] = sources
+        _save_config(config)
+
+        click.echo(
+            f"Rebuilt {name} ({knowledge_id}) in place: "
+            f"{result['uploaded']} uploaded, "
+            f"{result['unmodified']} unchanged after reset."
+        )
+
     @knowledge_group.command(name="register")
     @click.argument("name")
     @click.argument(
