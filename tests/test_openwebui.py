@@ -848,7 +848,8 @@ def test_enabled_knowledge_is_prefetched_without_forced_rag(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["files"] == []
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
-    assert calls[0]["params"]["function_calling"] == "legacy"
+    assert "function_calling" not in calls[0]["params"]
+    assert calls[0]["sessionless_server_tools"] is True
     assert calls[0]["messages"][0]["role"] == "system"
     assert "resolved TIDE" in calls[0]["messages"][0]["content"]
     assert calls[0]["messages"][1] == {
@@ -1303,6 +1304,28 @@ def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
         "timestamp": 1234,
     }
 
+
+
+def test_browser_chat_body_can_omit_session_id_for_server_tools(monkeypatch):
+    monkeypatch.setattr(openwebui_socket.time, "time", lambda: 1234.0)
+
+    body = openwebui_socket._build_browser_chat_body(
+        model="deepseek-v41-flash",
+        model_item={"id": "deepseek-v41-flash"},
+        messages=[{"role": "user", "content": "investigate"}],
+        tool_ids=["server:mcp:splunk-mcp"],
+        files=[],
+        params={},
+        chat_id="temporary:listener-socket",
+        session_id=None,
+        message_id="assistant-1",
+        user_message_id="user-1",
+    )
+
+    assert "session_id" not in body
+    assert body["chat_id"] == "temporary:listener-socket"
+    assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert body["params"] == {}
 
 def test_cli_tool_selection_does_not_merge_model_default_tools(monkeypatch):
     monkeypatch.setattr(
