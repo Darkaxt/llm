@@ -17,6 +17,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Literal
@@ -44,6 +45,7 @@ class _OpenWebUIStatusBar:
         )
         self.visible = False
         self.current = ""
+        self._lock = threading.Lock()
 
     def _width(self) -> int:
         return max(20, shutil.get_terminal_size((120, 24)).columns)
@@ -60,27 +62,29 @@ class _OpenWebUIStatusBar:
         return prefix + normalized
 
     def update(self, text: str, *, kind: str = "status") -> None:
-        self.current = str(text)
-        if not self.enabled:
-            prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
-            click.echo(f"{prefix} {text}", err=True)
-            return
+        with self._lock:
+            self.current = str(text)
+            if not self.enabled:
+                prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
+                click.echo(f"{prefix} {text}", err=True)
+                return
 
-        width = self._width()
-        line = self._render_text(text, kind=kind)
-        # Use only carriage returns/spaces rather than ANSI cursor control so
-        # this remains reliable in Windows Terminal/PowerShell.
-        sys.stderr.write("\r" + (" " * (width - 1)) + "\r" + line)
-        sys.stderr.flush()
-        self.visible = True
+            width = self._width()
+            line = self._render_text(text, kind=kind)
+            # Use only carriage returns/spaces rather than ANSI cursor control so
+            # this remains reliable in Windows Terminal/PowerShell.
+            sys.stderr.write("\r" + (" " * (width - 1)) + "\r" + line)
+            sys.stderr.flush()
+            self.visible = True
 
     def clear(self) -> None:
-        if not self.enabled or not self.visible:
-            return
-        width = self._width()
-        sys.stderr.write("\r" + (" " * (width - 1)) + "\r")
-        sys.stderr.flush()
-        self.visible = False
+        with self._lock:
+            if not self.enabled or not self.visible:
+                return
+            width = self._width()
+            sys.stderr.write("\r" + (" " * (width - 1)) + "\r")
+            sys.stderr.flush()
+            self.visible = False
 
 
 def _escape_pressed() -> bool:
@@ -1530,6 +1534,22 @@ def _file_processing_timeout() -> float:
     if timeout <= 0:
         raise llm.ModelError("LLM_OPENWEBUI_FILE_TIMEOUT must be greater than zero")
     return timeout
+
+
+def _knowledge_sync_concurrency() -> int:
+    raw = os.environ.get("LLM_OPENWEBUI_KB_CONCURRENCY", "4")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise llm.ModelError(
+            "LLM_OPENWEBUI_KB_CONCURRENCY must be an integer"
+        ) from exc
+    if value < 1:
+        raise llm.ModelError(
+            "LLM_OPENWEBUI_KB_CONCURRENCY must be at least 1"
+        )
+    # Keep accidental values from overwhelming the Open WebUI deployment.
+    return min(value, 16)
 
 
 def _format_elapsed(seconds: float) -> str:
