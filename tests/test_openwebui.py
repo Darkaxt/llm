@@ -754,7 +754,16 @@ def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
     ]
 
 
-def test_enabled_knowledge_is_prefetched_without_forced_rag(monkeypatch):
+@pytest.mark.parametrize(
+    "transport, sessionless, function_calling",
+    [
+        ("sessionless_native", True, None),
+        ("background_legacy", False, "legacy"),
+    ],
+)
+def test_enabled_knowledge_is_prefetched_without_forced_rag(
+    monkeypatch, transport, sessionless, function_calling
+):
     monkeypatch.setattr(
         openwebui,
         "_load_config",
@@ -841,15 +850,19 @@ def test_enabled_knowledge_is_prefetched_without_forced_rag(monkeypatch):
     )
 
     model = openwebui.OpenWebUIModel("glm-5.3")
-    prompt = llm.Prompt("investigate", model)
+    prompt = llm.Prompt(
+        "investigate",
+        model,
+        options=model.Options(openwebui_mcp_transport=transport),
+    )
     response = SimpleNamespace(response_json=None)
 
     assert list(model.execute(prompt, True, response, None)) == []
     assert len(calls) == 1
     assert calls[0]["files"] == []
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
-    assert "function_calling" not in calls[0]["params"]
-    assert calls[0]["sessionless_server_tools"] is True
+    assert calls[0]["params"].get("function_calling") == function_calling
+    assert calls[0]["sessionless_server_tools"] is sessionless
     assert calls[0]["messages"][0]["role"] == "system"
     assert "resolved TIDE" in calls[0]["messages"][0]["content"]
     assert calls[0]["messages"][1] == {
@@ -1466,3 +1479,58 @@ def test_server_mcp_guard_can_be_explicitly_overridden(monkeypatch):
         SimpleNamespace(),
         ["server:mcp:splunk-mcp"],
     ) == ("0.9.1", False)
+
+
+
+def test_sessionless_http_drop_can_recover_completed_socket_event():
+    import asyncio
+
+    async def scenario():
+        done = asyncio.Event()
+        state = {"error": None}
+        statuses = []
+
+        async def complete_soon():
+            await asyncio.sleep(0)
+            done.set()
+
+        task = asyncio.create_task(complete_soon())
+        await openwebui_socket._recover_sessionless_completion(
+            done,
+            state,
+            OSError(64, "network connection lost"),
+            statuses.append,
+            grace_seconds=0.1,
+        )
+        await task
+        assert state["error"] is None
+        assert any("HTTP connection lost" in value for value in statuses)
+
+    asyncio.run(scenario())
+
+
+def test_sessionless_http_drop_avoids_automatic_replay():
+    import asyncio
+
+    async def scenario():
+        done = asyncio.Event()
+        state = {"error": None}
+        await openwebui_socket._recover_sessionless_completion(
+            done,
+            state,
+            OSError(64, "network connection lost"),
+            lambda status: None,
+            grace_seconds=0.01,
+        )
+        assert "may still be running" in state["error"]
+        assert "!retry" in state["error"]
+
+    asyncio.run(scenario())
+
+
+def test_sessionless_recovery_grace_validation(monkeypatch):
+    monkeypatch.setenv("LLM_OPENWEBUI_RECOVERY_GRACE", "nan")
+    with pytest.raises(Exception, match="must be non-negative"):
+        openwebui_socket._sessionless_recovery_grace()
+    monkeypatch.setenv("LLM_OPENWEBUI_RECOVERY_GRACE", "15")
+    assert openwebui_socket._sessionless_recovery_grace() == 15.0

@@ -1,6 +1,7 @@
 # Vendored compatibility shim from vedmaka/openwebui-sdk sockets.py
 # Source commit: f55e6391173d46bb9d664ab7129fde8b57c40497
 # Local change: allow Open WebUI top-level files metadata in tool-enabled chats.
+# Recovery: preserve a live Socket.IO subscription after sessionless HTTP loss.
 
 """Socket.IO chat runner - the only path over which Open WebUI actually
 *executes* tools.
@@ -38,6 +39,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
+import os
 import time
 import uuid
 from asyncio import TimeoutError as _AsyncTimeoutError
@@ -52,6 +55,52 @@ from openwebui_sdk.render import (
     extract_tool_events,
     format_tool_line,
 )
+
+
+def _sessionless_recovery_grace() -> float:
+    """How long to keep listening for a final server event after HTTP disconnects."""
+    value = os.environ.get("LLM_OPENWEBUI_RECOVERY_GRACE", "60")
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise ConfigError("LLM_OPENWEBUI_RECOVERY_GRACE must be a number of seconds") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ConfigError("LLM_OPENWEBUI_RECOVERY_GRACE must be non-negative and finite")
+    return min(seconds, 600.0)
+
+
+async def _recover_sessionless_completion(
+    done: asyncio.Event,
+    state: dict[str, Any],
+    error: Exception,
+    on_status: Callable[[str], None],
+    *,
+    grace_seconds: float,
+) -> None:
+    """Do not replay a potentially executing MCP request after HTTP loss.
+
+    Open WebUI can still deliver its final chat event through Socket.IO after
+    the proxy has closed the synchronous HTTP response. Prefer that result over
+    a duplicate request, which could execute remote tools twice.
+    """
+    if done.is_set() or state.get("error"):
+        return
+    on_status(
+        "HTTP connection lost; waiting up to "
+        f"{grace_seconds:g}s for the original server response"
+    )
+    if grace_seconds:
+        try:
+            await asyncio.wait_for(done.wait(), timeout=grace_seconds)
+        except _AsyncTimeoutError:
+            pass
+    if not done.is_set() and not state.get("error"):
+        state["error"] = (
+            f"sessionless Open WebUI HTTP connection lost: {error}. "
+            "No final server event was received; the remote request may still "
+            "be running. Use !retry in chat to explicitly resend the failed "
+            "turn (read-only tools only)."
+        )
 
 
 def _need_socketio() -> Any:
@@ -284,6 +333,7 @@ async def run_chat_with_tools_with_files(
         "tool_results": [],  # [{name, result}] for structured result capture
         "error": None,
         "last_event_at": time.monotonic(),
+        "last_progress_at": time.monotonic(),
         "phase": "initial model",
         "phase_started_at": time.monotonic(),
     }
@@ -355,6 +405,13 @@ async def run_chat_with_tools_with_files(
         event = payload.get("data") or {}
         etype = event.get("type")
         data = event.get("data") or {}
+        if etype in ("chat:message:delta", "message", "chat:message", "replace"):
+            if data.get("content"):
+                state["last_progress_at"] = time.monotonic()
+        elif etype == "chat:completion" and (
+            data.get("content") or data.get("output") or data.get("done")
+        ):
+            state["last_progress_at"] = time.monotonic()
 
         if etype == "status":
             action = data.get("action") or data.get("description")
@@ -666,7 +723,8 @@ async def run_chat_with_tools_with_files(
                     out_status(
                         f"waiting for {state['phase']} "
                         f"({int(phase_elapsed)}s phase, {int(elapsed)}s total, "
-                        f"{int(idle)}s since last event)"
+                        f"{int(idle)}s since last event, "
+                        f"{int(now - state['last_progress_at'])}s since progress)"
                     )
 
             try:
@@ -676,9 +734,18 @@ async def run_chat_with_tools_with_files(
                     state["error"] = "sessionless Open WebUI request cancelled"
             except Exception as exc:
                 if not state["error"]:
-                    state["error"] = (
-                        f"sessionless Open WebUI request failed: {exc}"
-                    )
+                    if isinstance(exc, (aiohttp.ClientError, OSError, _AsyncTimeoutError)):
+                        await _recover_sessionless_completion(
+                            done,
+                            state,
+                            exc,
+                            out_status,
+                            grace_seconds=_sessionless_recovery_grace(),
+                        )
+                    else:
+                        state["error"] = (
+                            f"sessionless Open WebUI request failed: {exc}"
+                        )
 
             if not done.is_set() and not state["error"]:
                 state["error"] = (
@@ -749,7 +816,8 @@ async def run_chat_with_tools_with_files(
                 out_status(
                     f"waiting for {state['phase']} "
                     f"({int(phase_elapsed)}s phase, {int(elapsed)}s total, "
-                    f"{int(idle)}s since last event)"
+                    f"{int(idle)}s since last event, "
+                        f"{int(now - state['last_progress_at'])}s since progress)"
                 )
     finally:
         with contextlib.suppress(Exception):

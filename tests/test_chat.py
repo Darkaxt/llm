@@ -534,3 +534,58 @@ def test_chat_journal_keeps_prompt_on_model_error(tmp_path, monkeypatch):
         and record["error"] == "backend failed"
         for record in records
     )
+
+
+
+def test_chat_retry_replays_failed_turn_without_retransforming(tmp_path, monkeypatch):
+    from llm.chat_journal import ensure_session
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-retry", name=None)
+    ensure_session(conversation.id, model="mock")
+    prompts = iter(["important investigation", "!retry", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    received = []
+    transforms = []
+    completed = []
+
+    def transform(prompt):
+        transforms.append(prompt)
+        return prompt + " [prepared]"
+
+    class FakeResponse:
+        def stream_events(self):
+            return iter(())
+
+    def invoke(prompt, fragments, attachments):
+        received.append(prompt)
+        if len(received) == 1:
+            raise llm.ModelError("temporary network failure")
+        return FakeResponse()
+
+    llm.cli._run_chat(
+        "mock",
+        invoke,
+        conversation=conversation,
+        transform_prompt=transform,
+        after_response=completed.append,
+    )
+    assert received == [
+        "important investigation [prepared]",
+        "important investigation [prepared]",
+    ]
+    assert transforms == ["important investigation"]
+    assert len(completed) == 1
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "conv-retry.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    attempts = [record for record in records if record["type"] == "user_message"]
+    assert len(attempts) == 2
+    assert attempts[1]["retry_of_turn_id"] == attempts[0]["turn_id"]
+    assert any(record["type"] == "turn_error" for record in records)

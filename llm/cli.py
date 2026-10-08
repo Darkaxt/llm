@@ -320,54 +320,64 @@ def _run_chat(
 
     turn_headers = _chat_turn_headers_enabled()
     turn_counter = 0
+    last_failed = None
 
     while True:
         if turn_headers:
             _print_chat_turn_header("You")
         prompt = _read_chat_prompt(prompt_session)
-        fragments = []
-        attachments = []
-        if argument_fragments:
-            fragments += argument_fragments
-            # Fragments from command options are added to the first message only.
-            argument_fragments = []
-        if argument_attachments:
-            attachments = argument_attachments
-            argument_attachments = []
-        if prompt.strip() == "!edit":
-            edited_prompt = click.edit()
-            if edited_prompt is None:
-                click.echo("Editor closed without saving.", err=True)
+        retry_of = None
+        if prompt.strip() == "!retry":
+            if last_failed is None:
+                click.echo("No failed or cancelled turn to retry.", err=True)
                 continue
-            prompt = edited_prompt.strip()
-        if db is not None and prompt.strip().startswith("!fragment "):
-            prompt, fragments, attachments = process_fragments_in_chat(db, prompt)
+            prompt, failed_fragments, failed_attachments, retry_of = last_failed
+            fragments = list(failed_fragments)
+            attachments = list(failed_attachments)
+        else:
+            fragments = []
+            attachments = []
+            if argument_fragments:
+                fragments += argument_fragments
+                # Fragments from command options apply to the first attempt only.
+                argument_fragments = []
+            if argument_attachments:
+                attachments = argument_attachments
+                argument_attachments = []
+            if prompt.strip() == "!edit":
+                edited_prompt = click.edit()
+                if edited_prompt is None:
+                    click.echo("Editor closed without saving.", err=True)
+                    continue
+                prompt = edited_prompt.strip()
+            if db is not None and prompt.strip().startswith("!fragment "):
+                prompt, fragments, attachments = process_fragments_in_chat(db, prompt)
 
-        if prompt.strip() in ("exit", "quit"):
-            break
-        if transform_prompt is not None:
-            prompt = transform_prompt(prompt)
+            if prompt.strip() in ("exit", "quit"):
+                break
+            if transform_prompt is not None:
+                prompt = transform_prompt(prompt)
 
         turn_counter += 1
         turn_id = f"{conversation.id if conversation is not None else 'transient'}:{turn_counter}:{time.time_ns()}"
         if conversation is not None and export_jsonl:
-            append_chat_journal_record(
-                conversation.id,
-                {
-                    "type": "user_message",
-                    "turn_id": turn_id,
-                    "model": model_label,
-                    "prompt": prompt,
-                    "fragments": [
-                        _serialize_chat_fragment(fragment)
-                        for fragment in fragments
-                    ],
-                    "attachments": [
-                        _serialize_chat_attachment(attachment)
-                        for attachment in attachments
-                    ],
-                },
-            )
+            record = {
+                "type": "user_message",
+                "turn_id": turn_id,
+                "model": model_label,
+                "prompt": prompt,
+                "fragments": [
+                    _serialize_chat_fragment(fragment)
+                    for fragment in fragments
+                ],
+                "attachments": [
+                    _serialize_chat_attachment(attachment)
+                    for attachment in attachments
+                ],
+            }
+            if retry_of is not None:
+                record["retry_of_turn_id"] = retry_of
+            append_chat_journal_record(conversation.id, record)
 
         if turn_headers:
             _print_chat_turn_header("Assistant")
@@ -401,6 +411,7 @@ def _run_chat(
                 show_reasoning=show_reasoning,
             )
         except KeyboardInterrupt:
+            last_failed = (prompt, list(fragments), list(attachments), turn_id)
             if conversation is not None and export_jsonl:
                 append_chat_journal_record(
                     conversation.id,
@@ -412,6 +423,7 @@ def _run_chat(
             click.echo("\nCancelled current response.", err=True)
             continue
         except ModelError as exc:
+            last_failed = (prompt, list(fragments), list(attachments), turn_id)
             if conversation is not None and export_jsonl:
                 append_chat_journal_record(
                     conversation.id,
@@ -438,6 +450,7 @@ def _run_chat(
             raise
         if after_response is not None:
             after_response(response)
+        last_failed = None
         if conversation is not None and db is not None and export_jsonl:
             _append_completed_turn_jsonl(
                 db,
@@ -1651,10 +1664,15 @@ def chat(
             **kwargs,
         )
 
-        # System prompt and system fragments only sent for the first message
+        # Do not consume the system prompt until a response completes.
+        # An initial transport error must leave it intact for !retry.
+        return response
+
+    def save_completed_chat_response(response):
+        nonlocal system, argument_system_fragments
+        response.log_to_db(db)
         system = None
         argument_system_fragments = []
-        return response
 
     _run_chat(
         model.model_id,
@@ -1663,7 +1681,7 @@ def chat(
         initial_fragments=argument_fragments,
         initial_attachments=argument_attachments,
         transform_prompt=transform_chat_prompt,
-        after_response=lambda response: response.log_to_db(db),
+        after_response=save_completed_chat_response,
         show_reasoning=not hide_reasoning,
         conversation=conversation,
     )

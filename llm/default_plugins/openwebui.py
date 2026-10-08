@@ -2538,6 +2538,9 @@ class OpenWebUIModel(llm.Model):
     class Options(llm.Options):
         temperature: float | None = None
         openwebui_tools: bool = True
+        openwebui_mcp_transport: Literal["sessionless_native", "background_legacy"] = (
+            "sessionless_native"
+        )
         openwebui_attachment_context: Literal["auto", "full", "rag"] = "auto"
 
     def __init__(self, remote_model_id: str, display_name: str | None = None):
@@ -2677,7 +2680,11 @@ class OpenWebUIModel(llm.Model):
                         prompt.options.openwebui_attachment_context
                     ),
                     "openwebui_tools": prompt.options.openwebui_tools,
-                    "sessionless_server_tools": bool(knowledge_items),
+                    "sessionless_server_tools": (
+                        bool(knowledge_items)
+                        and prompt.options.openwebui_mcp_transport == "sessionless_native"
+                    ),
+                    "openwebui_mcp_transport": prompt.options.openwebui_mcp_transport,
                 },
                 "server": {
                     "version": server_version,
@@ -2746,10 +2753,20 @@ class OpenWebUIModel(llm.Model):
                                     {"temperature": prompt.options.temperature}
                                     if prompt.options.temperature is not None
                                     else {}
-                                )
+                                ),
+                                **(
+                                    {"function_calling": "legacy"}
+                                    if prompt.options.openwebui_mcp_transport
+                                    == "background_legacy"
+                                    else {}
+                                ),
                             },
                             timeout=client.timeout,
-                            sessionless_server_tools=bool(knowledge_items),
+                            sessionless_server_tools=(
+                                bool(knowledge_items)
+                                and prompt.options.openwebui_mcp_transport
+                                == "sessionless_native"
+                            ),
                             on_text=on_text,
                             on_reasoning=on_reasoning,
                             on_tool=on_tool,
