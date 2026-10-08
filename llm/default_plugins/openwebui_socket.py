@@ -162,6 +162,64 @@ def _structured_tool_events(output: Any) -> list[dict[str, Any]]:
     return events
 
 
+def _build_browser_chat_body(
+    *,
+    model: str,
+    model_item: dict[str, Any] | None,
+    messages: list[dict[str, Any]],
+    tool_ids: list[str],
+    files: list[dict[str, Any]] | None,
+    params: dict[str, Any] | None,
+    chat_id: str,
+    session_id: str,
+    message_id: str,
+    user_message_id: str,
+) -> dict[str, Any]:
+    """Build the current Open WebUI browser-compatible chat request payload."""
+    last_user_content = ""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                last_user_content = content
+            else:
+                last_user_content = json.dumps(content, ensure_ascii=False)
+            break
+
+    return {
+        "model": model,
+        "model_item": model_item or {"id": model},
+        "messages": messages,
+        "stream": True,
+        "params": dict(params or {}),
+        "chat_id": chat_id,
+        "id": message_id,
+        "session_id": session_id,
+        "parent_id": None,
+        "user_message": {
+            "id": user_message_id,
+            "parentId": None,
+            "childrenIds": [message_id],
+            "role": "user",
+            "content": last_user_content,
+            "timestamp": int(time.time()),
+        },
+        "tool_ids": tool_ids or None,
+        "tool_servers": [],
+        "files": files or None,
+        "filter_ids": None,
+        "skill_ids": None,
+        "features": {
+            "image_generation": False,
+            "code_interpreter": False,
+            "web_search": False,
+        },
+        "variables": {},
+        "chat_variables": {},
+        "background_tasks": {},
+    }
+
+
 async def run_chat_with_tools_with_files(
     *,
     base_url: str,
@@ -503,52 +561,18 @@ async def run_chat_with_tools_with_files(
         # omitted (main.py:1124). So a minimal client that omits it makes the
         # background task crash with AttributeError('NoneType' ... 'get') before
         # emitting any chat-events - the request 200s but you get nothing.
-        last_user_content = ""
-        for message in reversed(messages):
-            if message.get("role") == "user":
-                content = message.get("content")
-                if isinstance(content, str):
-                    last_user_content = content
-                else:
-                    last_user_content = json.dumps(content, ensure_ascii=False)
-                break
-
-        # Mirror current Chat.svelte's request envelope. Several modern Open
-        # WebUI middleware paths (Knowledge, built-in tools, model capabilities)
-        # assume these fields are present even though older/minimal clients
-        # could omit them.
-        body: dict[str, Any] = {
-            "model": model,
-            "model_item": model_item or {"id": model},
-            "messages": messages,
-            "stream": True,
-            "params": dict(params or {}),
-            "chat_id": chat_id,
-            "id": message_id,
-            "session_id": session_id,
-            "parent_id": None,
-            "user_message": {
-                "id": user_message_id,
-                "parentId": None,
-                "childrenIds": [message_id],
-                "role": "user",
-                "content": last_user_content,
-                "timestamp": int(time.time()),
-            },
-            "tool_ids": tool_ids or None,
-            "tool_servers": [],
-            "files": files or None,
-            "filter_ids": None,
-            "skill_ids": None,
-            "features": {
-                "image_generation": False,
-                "code_interpreter": False,
-                "web_search": False,
-            },
-            "variables": {},
-            "chat_variables": {},
-            "background_tasks": {},
-        }
+        body = _build_browser_chat_body(
+            model=model,
+            model_item=model_item,
+            messages=messages,
+            tool_ids=tool_ids,
+            files=files,
+            params=params,
+            chat_id=chat_id,
+            session_id=session_id,
+            message_id=message_id,
+            user_message_id=user_message_id,
+        )
         # NOTE: we intentionally do NOT send params.function_calling here. The
         # server reads it from the model config (model_info.params.function_calling,
         # main.py:1131) - a model with native FC configured uses it automatically,
