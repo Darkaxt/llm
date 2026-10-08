@@ -754,7 +754,7 @@ def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
     ]
 
 
-def test_enabled_knowledge_is_tool_scoped_without_forced_rag(monkeypatch):
+def test_enabled_knowledge_is_prefetched_without_forced_rag(monkeypatch):
     monkeypatch.setattr(
         openwebui,
         "_load_config",
@@ -805,6 +805,25 @@ def test_enabled_knowledge_is_tool_scoped_without_forced_rag(monkeypatch):
             }
         ],
     )
+    monkeypatch.setattr(
+        openwebui,
+        "_resolve_knowledge_context",
+        lambda client, knowledge_items, messages, on_status=None: (
+            [
+                {
+                    "role": "system",
+                    "content": "<persistent_knowledge>resolved TIDE</persistent_knowledge>",
+                },
+                *messages,
+            ],
+            {
+                "knowledge_bases": [
+                    {"id": "kb-1", "name": "TIDE Splunk Investigation"}
+                ],
+                "context_chars": 55,
+            },
+        ),
+    )
 
     async def fake_runner(**kwargs):
         calls.append(kwargs)
@@ -829,36 +848,139 @@ def test_enabled_knowledge_is_tool_scoped_without_forced_rag(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["files"] == []
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert calls[0]["params"]["function_calling"] == "legacy"
     assert calls[0]["messages"][0]["role"] == "system"
-    assert "TIDE Splunk Investigation" in calls[0]["messages"][0]["content"]
-    assert "knowledge_id=kb-1" in calls[0]["messages"][0]["content"]
+    assert "resolved TIDE" in calls[0]["messages"][0]["content"]
     assert calls[0]["messages"][1] == {
         "role": "user",
         "content": "investigate",
     }
 
 
-def test_knowledge_scope_instruction_appends_existing_system_message():
-    messages = [
-        {"role": "system", "content": "existing system"},
-        {"role": "user", "content": "test"},
-    ]
-    scoped = openwebui._apply_knowledge_scope_instruction(
-        messages,
+def test_resolve_knowledge_context_extracts_exact_tide_evidence(monkeypatch):
+    uuid_value = "67e794d5-73b2-45e5-b570-ceb5e0bba352"
+    contents = {
+        "skill": "# SKILL\nFollow the workflow.",
+        "spec": "# SPEC\nEvidence requirements.",
+        "index": json.dumps(
+            {
+                uuid_value: {
+                    "name": "CSOC integration for AWS GUARDDUTY",
+                    "rule_file": "guardduty.yaml",
+                },
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": {
+                    "name": "unrelated"
+                },
+            }
+        ),
+        "rules": "\n".join(
+            [
+                json.dumps(
+                    {
+                        "uuid": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        "search": "index=other",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "uuid": uuid_value,
+                        "name": "CSOC integration for AWS GUARDDUTY",
+                        "search": "`aws_cloudtrail` eventName=CreateKeyPair",
+                    }
+                ),
+            ]
+        ),
+        "macros": json.dumps(
+            {
+                "aws_cloudtrail": {
+                    "definition": "index=aws sourcetype=aws:cloudtrail"
+                },
+                "unrelated_macro": {"definition": "index=other"},
+            }
+        ),
+    }
+    file_map = {
+        "SKILL.md": {"id": "skill", "filename": "SKILL.md"},
+        "SPEC.md": {"id": "spec", "filename": "SPEC.md"},
+        "rule-index.json": {"id": "index", "filename": "rule-index.json"},
+        "splunk-rules.jsonl": {
+            "id": "rules",
+            "filename": "splunk-rules.jsonl",
+        },
+        "macros.json": {"id": "macros", "filename": "macros.json"},
+    }
+
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_exact_file",
+        lambda client, knowledge_id, filename: file_map.get(filename),
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_file_text",
+        lambda client, file_id: contents[file_id],
+    )
+
+    messages, meta = openwebui._resolve_knowledge_context(
+        SimpleNamespace(),
         [
             {
                 "id": "kb-1",
                 "name": "TIDE Splunk Investigation",
             }
         ],
+        [
+            {
+                "role": "user",
+                "content": f"Investigate exact MDR UUID {uuid_value}",
+            }
+        ],
     )
 
-    assert scoped[0]["role"] == "system"
-    assert scoped[0]["content"].startswith("existing system\n\n")
-    assert "TIDE Splunk Investigation" in scoped[0]["content"]
-    assert scoped[1] == messages[1]
-    assert messages[0]["content"] == "existing system"
+    assert messages[0]["role"] == "system"
+    context = messages[0]["content"]
+    assert "# SKILL" in context
+    assert "# SPEC" in context
+    assert uuid_value in context
+    assert "CSOC integration for AWS GUARDDUTY" in context
+    assert "aws_cloudtrail" in context
+    assert "index=aws sourcetype=aws:cloudtrail" in context
+    assert "unrelated_macro" not in context
+    assert "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" not in context
+    assert messages[1]["role"] == "user"
+    assert meta["uuids"] == [uuid_value]
+    assert meta["context_chars"] == len(context)
 
+
+def test_resolve_knowledge_context_appends_existing_system_message(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_exact_file",
+        lambda client, knowledge_id, filename: (
+            {"id": "skill", "filename": "SKILL.md"}
+            if filename == "SKILL.md"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_file_text",
+        lambda client, file_id: "# Skill",
+    )
+
+    original = [
+        {"role": "system", "content": "existing system"},
+        {"role": "user", "content": "test"},
+    ]
+    scoped, _ = openwebui._resolve_knowledge_context(
+        SimpleNamespace(),
+        [{"id": "kb-1", "name": "TIDE"}],
+        original,
+    )
+
+    assert scoped[0]["content"].startswith("existing system\n\n")
+    assert "# Skill" in scoped[0]["content"]
+    assert original[0]["content"] == "existing system"
 
 
 def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
