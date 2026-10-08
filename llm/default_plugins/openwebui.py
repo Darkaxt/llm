@@ -165,6 +165,28 @@ def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
     ]
 
 
+def _get_model_item(
+    client: OpenWebUIClient,
+    model_id: str,
+) -> dict[str, Any]:
+    """Return the exact model descriptor the Open WebUI browser sends."""
+    payload = _owui_http_json(
+        client,
+        "GET",
+        "/api/models",
+        timeout=max(float(client.timeout), 120.0),
+    )
+    models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        raise llm.ModelError("Open WebUI returned an invalid /api/models response")
+    for item in models:
+        if isinstance(item, dict) and str(item.get("id") or "") == model_id:
+            return item
+    raise llm.ModelError(
+        f"Open WebUI model {model_id!r} is no longer present in /api/models"
+    )
+
+
 def _owui_http_json(
     client: OpenWebUIClient,
     method: str,
@@ -369,23 +391,24 @@ def _enabled_knowledge_items(
     config: dict[str, Any],
     client: OpenWebUIClient,
 ) -> list[dict[str, Any]]:
+    """Return collection entries shaped exactly like the browser Knowledge picker."""
+    enabled_ids = _enabled_knowledge_ids(config)
+    if not enabled_ids:
+        return []
+
+    available = {
+        str(item.get("id")): item
+        for item in _list_knowledge_bases(client)
+        if isinstance(item, dict) and item.get("id")
+    }
     items: list[dict[str, Any]] = []
-    for knowledge_id in _enabled_knowledge_ids(config):
-        try:
-            knowledge = _get_knowledge_by_id(client, knowledge_id)
-        except llm.ModelError as exc:
+    for knowledge_id in enabled_ids:
+        knowledge = available.get(knowledge_id)
+        if knowledge is None:
             raise llm.ModelError(
-                f"Enabled Open WebUI knowledge base {knowledge_id} "
-                f"is unavailable: {exc}"
-            ) from exc
-        items.append(
-            {
-                "type": "collection",
-                "id": str(knowledge["id"]),
-                "name": knowledge.get("name"),
-                "description": knowledge.get("description"),
-            }
-        )
+                f"Enabled Open WebUI knowledge base {knowledge_id} is unavailable"
+            )
+        items.append({"type": "collection", **knowledge})
     return items
 
 
@@ -2185,6 +2208,7 @@ class OpenWebUIModel(llm.Model):
             raise
 
         try:
+            model_item = _get_model_item(client, self.remote_model_id)
             tool_ids = client.resolve_tools(
                 self.remote_model_id,
                 extra_tool_ids=_enabled_tool_ids(config),
@@ -2210,6 +2234,13 @@ class OpenWebUIModel(llm.Model):
                         prompt.options.openwebui_attachment_context
                     ),
                     "openwebui_tools": prompt.options.openwebui_tools,
+                },
+                "model_item": {
+                    "id": model_item.get("id"),
+                    "name": model_item.get("name"),
+                    "owned_by": model_item.get("owned_by"),
+                    "direct": model_item.get("direct"),
+                    "info": model_item.get("info"),
                 },
             }
         )
@@ -2258,9 +2289,17 @@ class OpenWebUIModel(llm.Model):
                             base_url=client.base_url,
                             token=client.token or "",
                             model=self.remote_model_id,
+                            model_item=model_item,
                             messages=messages,
                             tool_ids=tool_ids,
                             files=attached_files,
+                            params={
+                                **(
+                                    {"temperature": prompt.options.temperature}
+                                    if prompt.options.temperature is not None
+                                    else {}
+                                )
+                            },
                             timeout=client.timeout,
                             on_text=on_text,
                             on_reasoning=on_reasoning,
