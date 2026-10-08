@@ -171,7 +171,7 @@ def _build_browser_chat_body(
     files: list[dict[str, Any]] | None,
     params: dict[str, Any] | None,
     chat_id: str,
-    session_id: str,
+    session_id: str | None,
     message_id: str,
     user_message_id: str,
 ) -> dict[str, Any]:
@@ -186,7 +186,7 @@ def _build_browser_chat_body(
                 last_user_content = json.dumps(content, ensure_ascii=False)
             break
 
-    return {
+    body = {
         "model": model,
         "model_item": model_item or {"id": model},
         "messages": messages,
@@ -194,7 +194,6 @@ def _build_browser_chat_body(
         "params": dict(params or {}),
         "chat_id": chat_id,
         "id": message_id,
-        "session_id": session_id,
         "parent_id": None,
         "user_message": {
             "id": user_message_id,
@@ -216,6 +215,9 @@ def _build_browser_chat_body(
         "chat_variables": {},
         "background_tasks": {},
     }
+    if session_id:
+        body["session_id"] = session_id
+    return body
 
 
 async def run_chat_with_tools_with_files(
@@ -234,6 +236,7 @@ async def run_chat_with_tools_with_files(
     on_status: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
     chat_id: str | None = None,
+    sessionless_server_tools: bool = False,
 ) -> dict[str, Any]:
     """Run a tool-enabled chat over the Socket.IO path.
 
@@ -559,6 +562,9 @@ async def run_chat_with_tools_with_files(
         # omitted (main.py:1124). So a minimal client that omits it makes the
         # background task crash with AttributeError('NoneType' ... 'get') before
         # emitting any chat-events - the request 200s but you get nothing.
+        request_session_id = (
+            None if sessionless_server_tools else session_id
+        )
         body = _build_browser_chat_body(
             model=model,
             model_item=model_item,
@@ -567,7 +573,7 @@ async def run_chat_with_tools_with_files(
             files=files,
             params=params,
             chat_id=chat_id,
-            session_id=session_id,
+            session_id=request_session_id,
             message_id=message_id,
             user_message_id=user_message_id,
         )
@@ -577,36 +583,101 @@ async def run_chat_with_tools_with_files(
         # one without uses Open WebUI's prompt-based calling. The CLI never
         # overrides model config.
 
-        ack = await asyncio.to_thread(
-            http.json_request,
-            f"{base_url}/api/chat/completions",
-            method="POST",
-            token=token,
-            json_body=body,
-            timeout=timeout,
-            endpoint="POST /api/chat/completions (socket session)",
-        )
-
-        if not (isinstance(ack, dict) and ack.get("status")):
-            raise APIError(
-                f"unexpected chat ack: {ack!r}; server did not start a background task"
+        if sessionless_server_tools:
+            # Current Open WebUI only injects hidden builtin tools for requests
+            # carrying session_id. Keep this authenticated socket connected to
+            # the user room for events, but omit session_id from the POST so the
+            # server resolves only explicit tool_ids (e.g. Splunk MCP). Server-
+            # side MCP functions still execute in the native streaming tool loop.
+            remote_chat_id = chat_id
+            out_status(
+                "request submitted · native server tools · hidden builtins suppressed"
+            )
+            request_timeout = max(float(timeout) * 6.0, 3600.0)
+            post_task = asyncio.create_task(
+                asyncio.to_thread(
+                    http.json_request,
+                    f"{base_url}/api/chat/completions",
+                    method="POST",
+                    token=token,
+                    json_body=body,
+                    timeout=request_timeout,
+                    endpoint="POST /api/chat/completions (sessionless server tools)",
+                )
             )
 
-        task_ids = ack.get("task_ids")
-        if not isinstance(task_ids, list):
-            task_id = ack.get("task_id")
-            task_ids = [task_id] if task_id else []
-        remote_task_ids = [str(task_id) for task_id in task_ids if task_id]
-        ack_chat_id = ack.get("chat_id")
-        remote_chat_id = str(ack_chat_id) if ack_chat_id else chat_id
-        details = []
-        if remote_task_ids:
-            details.append("task " + ",".join(remote_task_ids))
-        if remote_chat_id:
-            details.append(f"chat {remote_chat_id}")
-        out_status(
-            "request accepted" + (f" ({'; '.join(details)})" if details else "")
-        )
+            started_at = time.monotonic()
+            heartbeat_seconds = 15.0
+            while not done.is_set() and not post_task.done():
+                now = time.monotonic()
+                idle = now - state["last_event_at"]
+                remaining_idle = timeout - idle
+                if remaining_idle <= 0:
+                    state["error"] = (
+                        f"timed out after {timeout}s without an Open WebUI event"
+                    )
+                    break
+                try:
+                    await asyncio.wait_for(
+                        done.wait(),
+                        timeout=min(heartbeat_seconds, remaining_idle),
+                    )
+                except _AsyncTimeoutError:
+                    now = time.monotonic()
+                    elapsed = now - started_at
+                    idle = now - state["last_event_at"]
+                    phase_elapsed = now - state["phase_started_at"]
+                    with contextlib.suppress(Exception):
+                        await sio.emit("heartbeat", {})
+                    out_status(
+                        f"waiting for {state['phase']} "
+                        f"({int(phase_elapsed)}s phase, {int(elapsed)}s total, "
+                        f"{int(idle)}s since last event)"
+                    )
+
+            try:
+                await post_task
+            except Exception as exc:
+                if not state["error"]:
+                    state["error"] = (
+                        f"sessionless Open WebUI request failed: {exc}"
+                    )
+
+            if not done.is_set() and not state["error"]:
+                state["error"] = (
+                    "Open WebUI request completed without a final chat event"
+                )
+        else:
+            ack = await asyncio.to_thread(
+                http.json_request,
+                f"{base_url}/api/chat/completions",
+                method="POST",
+                token=token,
+                json_body=body,
+                timeout=timeout,
+                endpoint="POST /api/chat/completions (socket session)",
+            )
+
+            if not (isinstance(ack, dict) and ack.get("status")):
+                raise APIError(
+                    f"unexpected chat ack: {ack!r}; server did not start a background task"
+                )
+
+            task_ids = ack.get("task_ids")
+            if not isinstance(task_ids, list):
+                task_id = ack.get("task_id")
+                task_ids = [task_id] if task_id else []
+            remote_task_ids = [str(task_id) for task_id in task_ids if task_id]
+            ack_chat_id = ack.get("chat_id")
+            remote_chat_id = str(ack_chat_id) if ack_chat_id else chat_id
+            details = []
+            if remote_task_ids:
+                details.append("task " + ",".join(remote_task_ids))
+            if remote_chat_id:
+                details.append(f"chat {remote_chat_id}")
+            out_status(
+                "request accepted" + (f" ({'; '.join(details)})" if details else "")
+            )
 
         # ---- wait for completion, with visible idle heartbeat ----
         #
@@ -616,7 +687,7 @@ async def run_chat_with_tools_with_files(
         # real event prevents active investigations being killed at 600s.
         started_at = time.monotonic()
         heartbeat_seconds = 15.0
-        while not done.is_set():
+        while not sessionless_server_tools and not done.is_set():
             now = time.monotonic()
             idle = now - state["last_event_at"]
             remaining_idle = timeout - idle
