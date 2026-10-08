@@ -6,6 +6,10 @@ import llm_echo
 import pytest
 import sqlite_utils
 from pydantic import Field
+
+import llm
+from llm.plugins import pm
+
 # Both "httpx2-pytest" and "pytest-httpx2" install the same pytest_httpx2
 # package. This suite uses the former (pytest-httpx-compatible API), whereas
 # the latter is a RESPX-based plugin without IteratorStream/add_response.
@@ -20,9 +24,6 @@ except ImportError as exc:
         "  python -m pip uninstall -y pytest-httpx2 httpx2-pytest\n"
         "  python -m pip install 'httpx2-pytest>=2'"
     ) from exc
-
-import llm
-from llm.plugins import pm
 
 
 def pytest_configure(config):
