@@ -131,6 +131,24 @@ def test_execute_streams_text_and_reasoning(monkeypatch):
             )
 
     monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "name": "GLM",
+            "info": {"meta": {"capabilities": {}}},
+        },
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "name": "GLM",
+            "info": {"meta": {"capabilities": {}}},
+        },
+    )
 
     model = openwebui.OpenWebUIModel("glm-5.3")
     prompt = llm.Prompt("test", model)
@@ -374,6 +392,15 @@ def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
             raise AssertionError("SDK run_chat must not be used for tool-enabled chats")
 
     monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "name": "GLM",
+            "info": {"meta": {"capabilities": {}}},
+        },
+    )
     monkeypatch.setattr(
         openwebui,
         "_prepare_openwebui_request",
@@ -660,17 +687,22 @@ def test_local_knowledge_manifest_preserves_relative_paths(tmp_path):
     assert manifest[0]["checksum"] != manifest[1]["checksum"]
 
 
-def test_enabled_knowledge_items_use_minimal_collection_shape(monkeypatch):
+def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
     monkeypatch.setattr(
         openwebui,
-        "_get_knowledge_by_id",
-        lambda client, knowledge_id: {
-            "id": knowledge_id,
-            "name": "TIDE Splunk Investigation",
-            "description": "Reusable TIDE knowledge",
-            "files": [{"id": "huge-file-list-entry"}],
-            "access_grants": [{"permission": "read"}],
-        },
+        "_list_knowledge_bases",
+        lambda client: [
+            {
+                "id": "kb-1",
+                "name": "TIDE Splunk Investigation",
+                "description": "Reusable TIDE knowledge",
+                "user_id": "user-1",
+                "data": {"file_ids": ["file-1"]},
+                "meta": {"source": "local"},
+                "access_grants": [{"permission": "read"}],
+                "write_access": True,
+            }
+        ],
     )
     config = {"enabled_knowledge_ids": ["kb-1"]}
     client = SimpleNamespace()
@@ -683,6 +715,11 @@ def test_enabled_knowledge_items_use_minimal_collection_shape(monkeypatch):
             "id": "kb-1",
             "name": "TIDE Splunk Investigation",
             "description": "Reusable TIDE knowledge",
+            "user_id": "user-1",
+            "data": {"file_ids": ["file-1"]},
+            "meta": {"source": "local"},
+            "access_grants": [{"permission": "read"}],
+            "write_access": True,
         }
     ]
 
@@ -1027,3 +1064,51 @@ def test_clean_rebuild_sync_bypasses_orphan_detection(tmp_path, monkeypatch):
     assert result["uploaded"] == 1
     assert len(uploads) == 1
 
+
+
+def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
+    monkeypatch.setattr(openwebui_socket.time, "time", lambda: 1234.0)
+    model_item = {
+        "id": "deepseek-v41-flash",
+        "name": "DeepSeek V4.1 Flash",
+        "info": {"meta": {"capabilities": {"file_upload": True}}},
+    }
+    collection = {
+        "type": "collection",
+        "id": "kb-1",
+        "name": "TIDE Splunk Investigation",
+        "write_access": True,
+    }
+
+    body = openwebui_socket._build_browser_chat_body(
+        model="deepseek-v41-flash",
+        model_item=model_item,
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "investigate"},
+        ],
+        tool_ids=["server:mcp:splunk-mcp"],
+        files=[collection],
+        params={"temperature": 0.2},
+        chat_id="temporary:socket-1",
+        session_id="socket-1",
+        message_id="assistant-1",
+        user_message_id="user-1",
+    )
+
+    assert body["model_item"] == model_item
+    assert body["files"] == [collection]
+    assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert body["params"] == {"temperature": 0.2}
+    assert body["parent_id"] is None
+    assert body["chat_variables"] == {}
+    assert body["tool_servers"] == []
+    assert body["background_tasks"] == {}
+    assert body["user_message"] == {
+        "id": "user-1",
+        "parentId": None,
+        "childrenIds": ["assistant-1"],
+        "role": "user",
+        "content": "investigate",
+        "timestamp": 1234,
+    }
