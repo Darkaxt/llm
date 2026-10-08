@@ -351,8 +351,27 @@ def test_enabled_tool_ids_are_merged_into_runtime(monkeypatch):
             [{"id": "file-1", "type": "file"}],
         ),
     )
+    calls = []
+
+    async def capture_runner(**kwargs):
+        calls.append(kwargs)
+        return {
+            "answer": "ok",
+            "reasoning": None,
+            "tool_calls": [],
+            "raw_content": "ok",
+        }
+
+    monkeypatch.setattr(
+        openwebui,
+        "run_chat_with_tools_with_files",
+        capture_runner,
+    )
+
     assert list(model.execute(prompt, True, response, None)) == []
-    assert seen["extra"] == ["server:mcp:splunk"]
+    assert len(calls) == 1
+    assert calls[0]["tool_ids"] == ["server:mcp:splunk"]
+    assert "extra" not in seen
 
 
 def test_resolve_tool_selector_matches_mcp_name():
@@ -428,6 +447,7 @@ def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert calls[0]["files"] == []
+    assert calls[0]["model_item"]["info"]["meta"]["capabilities"] == {}
 
 
 
@@ -724,7 +744,7 @@ def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
     ]
 
 
-def test_enabled_knowledge_is_added_to_chat_request(monkeypatch):
+def test_enabled_knowledge_is_tool_scoped_without_forced_rag(monkeypatch):
     monkeypatch.setattr(
         openwebui,
         "_load_config",
@@ -732,6 +752,7 @@ def test_enabled_knowledge_is_added_to_chat_request(monkeypatch):
             "url": "https://example.test",
             "token": "jwt",
             "models": [],
+            "enabled_tool_ids": ["server:mcp:splunk-mcp"],
             "enabled_knowledge_ids": ["kb-1"],
         },
     )
@@ -743,24 +764,21 @@ def test_enabled_knowledge_is_added_to_chat_request(monkeypatch):
         token = "jwt"
         timeout = 600
 
-        def resolve_tools(self, model_id, extra_tool_ids=None, no_tools=False):
-            return []
-
-        def run_chat(self, **kwargs):
-            calls.append(kwargs)
-            return SimpleNamespace(
-                answer="ok",
-                reasoning=None,
-                tool_calls=[],
-                raw_content="ok",
-            )
-
     monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "name": "GLM",
+            "info": {"meta": {"capabilities": {"builtin_tools": True}}},
+        },
+    )
     monkeypatch.setattr(
         openwebui,
         "_prepare_openwebui_request",
         lambda prompt, client, **kwargs: (
-            [{"role": "user", "content": "test"}],
+            [{"role": "user", "content": "investigate"}],
             [],
         ),
     )
@@ -773,24 +791,64 @@ def test_enabled_knowledge_is_added_to_chat_request(monkeypatch):
                 "id": "kb-1",
                 "name": "TIDE Splunk Investigation",
                 "description": "Reusable TIDE knowledge",
+                "write_access": True,
             }
         ],
     )
 
+    async def fake_runner(**kwargs):
+        calls.append(kwargs)
+        return {
+            "answer": "ok",
+            "reasoning": None,
+            "tool_calls": [],
+            "raw_content": "ok",
+        }
+
+    monkeypatch.setattr(
+        openwebui,
+        "run_chat_with_tools_with_files",
+        fake_runner,
+    )
+
     model = openwebui.OpenWebUIModel("glm-5.3")
-    prompt = llm.Prompt("test", model)
+    prompt = llm.Prompt("investigate", model)
     response = SimpleNamespace(response_json=None)
 
     assert list(model.execute(prompt, True, response, None)) == []
     assert len(calls) == 1
-    assert calls[0]["extra"]["files"] == [
-        {
-            "type": "collection",
-            "id": "kb-1",
-            "name": "TIDE Splunk Investigation",
-            "description": "Reusable TIDE knowledge",
-        }
+    assert calls[0]["files"] == []
+    assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert calls[0]["messages"][0]["role"] == "system"
+    assert "TIDE Splunk Investigation" in calls[0]["messages"][0]["content"]
+    assert "knowledge_id=kb-1" in calls[0]["messages"][0]["content"]
+    assert calls[0]["messages"][1] == {
+        "role": "user",
+        "content": "investigate",
+    }
+
+
+def test_knowledge_scope_instruction_appends_existing_system_message():
+    messages = [
+        {"role": "system", "content": "existing system"},
+        {"role": "user", "content": "test"},
     ]
+    scoped = openwebui._apply_knowledge_scope_instruction(
+        messages,
+        [
+            {
+                "id": "kb-1",
+                "name": "TIDE Splunk Investigation",
+            }
+        ],
+    )
+
+    assert scoped[0]["role"] == "system"
+    assert scoped[0]["content"].startswith("existing system\n\n")
+    assert "TIDE Splunk Investigation" in scoped[0]["content"]
+    assert scoped[1] == messages[1]
+    assert messages[0]["content"] == "existing system"
+
 
 
 def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
@@ -1112,3 +1170,78 @@ def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
         "content": "investigate",
         "timestamp": 1234,
     }
+
+
+def test_cli_tool_selection_does_not_merge_model_default_tools(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {
+            "url": "https://example.test",
+            "token": "jwt",
+            "models": [],
+            "enabled_tool_ids": ["server:mcp:splunk-mcp"],
+        },
+    )
+
+    class FakeClient:
+        base_url = "https://example.test"
+        token = "jwt"
+        timeout = 600
+
+    monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "info": {
+                "meta": {
+                    "toolIds": [
+                        "server:mcp:splunk-mcp",
+                        "server:mcp:misp-prod",
+                    ],
+                    "capabilities": {"builtin_tools": True},
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_prepare_openwebui_request",
+        lambda prompt, client, **kwargs: (
+            [{"role": "user", "content": "test"}],
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_enabled_knowledge_items",
+        lambda config, client: [],
+    )
+
+    calls = []
+
+    async def fake_runner(**kwargs):
+        calls.append(kwargs)
+        return {
+            "answer": "ok",
+            "reasoning": None,
+            "tool_calls": [],
+            "raw_content": "ok",
+        }
+
+    monkeypatch.setattr(
+        openwebui,
+        "run_chat_with_tools_with_files",
+        fake_runner,
+    )
+
+    model = openwebui.OpenWebUIModel("deepseek-v41-flash")
+    response = SimpleNamespace(response_json=None)
+    assert list(
+        model.execute(llm.Prompt("test", model), True, response, None)
+    ) == []
+
+    assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert "server:mcp:misp-prod" not in calls[0]["tool_ids"]
