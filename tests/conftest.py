@@ -6,7 +6,20 @@ import llm_echo
 import pytest
 import sqlite_utils
 from pydantic import Field
-from pytest_httpx2 import IteratorStream
+# Both "httpx2-pytest" and "pytest-httpx2" install the same pytest_httpx2
+# package. This suite uses the former (pytest-httpx-compatible API), whereas
+# the latter is a RESPX-based plugin without IteratorStream/add_response.
+try:
+    from pytest_httpx2 import IteratorStream
+except ImportError as exc:
+    raise pytest.UsageError(
+        "The LLM tests require 'httpx2-pytest>=2', not the separate "
+        "'pytest-httpx2' distribution. Both use the 'pytest_httpx2' import "
+        "name, but only httpx2-pytest exports IteratorStream. Repair the "
+        "selected Python environment with:\n"
+        "  python -m pip uninstall -y pytest-httpx2 httpx2-pytest\n"
+        "  python -m pip install 'httpx2-pytest>=2'"
+    ) from exc
 
 import llm
 from llm.plugins import pm
