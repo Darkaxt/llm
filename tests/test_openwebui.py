@@ -900,109 +900,130 @@ def test_local_knowledge_manifest_expands_7z_as_virtual_tree(tmp_path):
     assert ("bundle", "rule-index.json") in virtual_paths
     assert ("", "bundle.7z") not in virtual_paths
 
+def test_interrupted_knowledge_sync_fails_before_mutation(tmp_path, monkeypatch):
+    (tmp_path / "rule-index.json").write_text("{}", encoding="utf-8")
+    checksum = openwebui.hashlib.sha256(b"{}").hexdigest()
+    requests = []
+
+    def fake_json(client, method, path, **kwargs):
+        requests.append((method, path, kwargs))
+        if path.endswith("/sync/diff"):
+            return {
+                "added": [{"filename": "rule-index.json", "path": ""}],
+                "modified": [],
+                "deleted": [{"file_id": "stale", "filename": "old.txt"}],
+                "mkdir": [],
+                "rmdir": ["old-dir"],
+                "unmodified_count": 0,
+                "directory_map": {},
+            }
+        raise AssertionError(
+            f"Sync mutated server before interrupted-state failure: {path}"
+        )
+
+    monkeypatch.setattr(openwebui, "_owui_http_json", fake_json)
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_file_candidates",
+        lambda client, knowledge_id: {
+            checksum: [
+                {
+                    "id": "prior-file",
+                    "filename": "rule-index.json",
+                    "meta": {
+                        "name": "rule-index.json",
+                        "file_hash": checksum,
+                        "data": {"knowledge_id": "kb-1"},
+                    },
+                }
+            ]
+        },
+    )
+
+    client = SimpleNamespace(timeout=600)
+    knowledge = {"id": "kb-1", "name": "TIDE Splunk Investigation"}
+
+    with pytest.raises(
+        click.ClickException,
+        match="knowledge rebuild",
+    ):
+        openwebui._sync_knowledge_folder(
+            client,
+            knowledge,
+            tmp_path,
+        )
+
+    assert len(requests) == 1
+    assert requests[0][1].endswith("/sync/diff")
 
 
-def test_resume_knowledge_file_reuses_oldest_matching_upload(monkeypatch):
+def test_reset_knowledge_base_preserves_id_and_resets_directories(monkeypatch):
     calls = []
-
-    candidates_by_hash = {
-        "abc": [
-            {
-                "id": "old-file",
-                "filename": "rule-index.json",
-                "created_at": 10,
-                "data": {"status": "completed"},
-                "meta": {
-                    "name": "rule-index.json",
-                    "file_hash": "abc",
-                    "data": {
-                        "knowledge_id": "kb-1",
-                        "directory_id": "dir-1",
-                    },
-                },
-            },
-            {
-                "id": "new-failed-retry",
-                "filename": "rule-index.json",
-                "created_at": 20,
-                "data": {
-                    "status": "failed",
-                    "error": "Duplicate content detected.",
-                },
-                "meta": {
-                    "name": "rule-index.json",
-                    "file_hash": "abc",
-                    "data": {
-                        "knowledge_id": "kb-1",
-                        "directory_id": "dir-1",
-                    },
-                },
-            },
-        ]
-    }
 
     def fake_json(client, method, path, **kwargs):
         calls.append((method, path, kwargs))
-        if path.endswith("/file/add"):
-            assert kwargs["json_body"]["file_id"] == "old-file"
-            return {"id": "kb-1"}
-        raise AssertionError(path)
+        return {"id": "kb-1", "name": "TIDE Splunk Investigation"}
 
     monkeypatch.setattr(openwebui, "_owui_http_json", fake_json)
 
-    entry = {
-        "filename": "rule-index.json",
-        "path": "bundle",
-        "checksum": "abc",
-    }
-    client = SimpleNamespace(timeout=600)
-
-    assert openwebui._resume_knowledge_file(
-        client,
-        knowledge_id="kb-1",
-        entry=entry,
-        directory_id="dir-1",
-        candidates_by_hash=candidates_by_hash,
+    result = openwebui._reset_knowledge_base(
+        SimpleNamespace(timeout=600),
+        "kb-1",
     )
-    assert len(calls) == 1
+
+    assert result["id"] == "kb-1"
+    assert calls == [
+        (
+            "POST",
+            "/api/v1/knowledge/kb-1/reset",
+            {
+                "params": {"include_directories": "true"},
+                "timeout": 600.0,
+            },
+        )
+    ]
 
 
-def test_matching_resume_candidates_requires_filename_and_prefers_directory():
-    candidates_by_hash = {
-        "abc": [
-            {
-                "id": "wrong-name",
-                "filename": "macros.json",
-                "meta": {
-                    "name": "macros.json",
-                    "data": {"directory_id": "dir-1"},
-                },
-            },
-            {
-                "id": "fallback-root",
-                "filename": "rule-index.json",
-                "meta": {
-                    "name": "rule-index.json",
-                    "data": {},
-                },
-            },
-            {
-                "id": "exact",
-                "filename": "rule-index.json",
-                "meta": {
-                    "name": "rule-index.json",
-                    "data": {"directory_id": "dir-1"},
-                },
-            },
-        ]
-    }
+def test_clean_rebuild_sync_bypasses_orphan_detection(tmp_path, monkeypatch):
+    (tmp_path / "rule-index.json").write_text("{}", encoding="utf-8")
+    requests = []
+    uploads = []
 
-    matches = openwebui._matching_resume_candidates(
-        {
-            "filename": "rule-index.json",
-            "checksum": "abc",
-        },
-        "dir-1",
-        candidates_by_hash,
+    def fake_json(client, method, path, **kwargs):
+        requests.append((method, path, kwargs))
+        if path.endswith("/sync/diff"):
+            return {
+                "added": [{"filename": "rule-index.json", "path": ""}],
+                "modified": [],
+                "deleted": [],
+                "mkdir": [],
+                "rmdir": [],
+                "unmodified_count": 0,
+                "directory_map": {},
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr(openwebui, "_owui_http_json", fake_json)
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_file_candidates",
+        lambda client, knowledge_id: (_ for _ in ()).throw(
+            AssertionError("orphan inventory must be bypassed during rebuild")
+        ),
     )
-    assert [item["id"] for item in matches] == ["exact", "fallback-root"]
+    monkeypatch.setattr(
+        openwebui,
+        "_upload_knowledge_sync_file",
+        lambda client, **kwargs: uploads.append(kwargs) or {"id": "new-file"},
+    )
+
+    result = openwebui._sync_knowledge_folder(
+        SimpleNamespace(timeout=600),
+        {"id": "kb-1", "name": "TIDE"},
+        tmp_path,
+        detect_interrupted=False,
+    )
+
+    assert result["uploaded"] == 1
+    assert len(uploads) == 1
+
