@@ -322,6 +322,16 @@ def test_enabled_tool_ids_are_merged_into_runtime(monkeypatch):
             return list(extra_tool_ids or [])
 
     monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "name": "GLM",
+            "info": {"meta": {"capabilities": {}}},
+        },
+    )
+
     async def fake_tool_runner(**kwargs):
         return {
             "answer": "ok",
