@@ -158,6 +158,71 @@ def _client(config: dict[str, Any]) -> OpenWebUIClient:
     )
 
 
+def _server_config(client: OpenWebUIClient) -> dict[str, Any]:
+    payload = _owui_http_json(
+        client,
+        "GET",
+        "/api/config",
+        timeout=max(float(client.timeout), 30.0),
+    )
+    if not isinstance(payload, dict):
+        raise llm.ModelError("Open WebUI returned an invalid /api/config response")
+    return payload
+
+
+def _version_triplet(value: Any) -> tuple[int, int, int] | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+_OPENWEBUI_MCP_CLEANUP_FIXED = (0, 9, 3)
+
+
+def _server_mcp_cleanup_status(
+    client: OpenWebUIClient,
+) -> tuple[str | None, bool | None]:
+    payload = _server_config(client)
+    version = payload.get("version")
+    version_text = str(version) if version is not None else None
+    parsed = _version_triplet(version_text)
+    if parsed is None:
+        return version_text, None
+    return version_text, parsed >= _OPENWEBUI_MCP_CLEANUP_FIXED
+
+
+def _allow_unsafe_server_mcp() -> bool:
+    return os.environ.get(
+        "LLM_OPENWEBUI_ALLOW_UNSAFE_SERVER_MCP",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _guard_server_mcp_version(
+    client: OpenWebUIClient,
+    tool_ids: list[str],
+) -> tuple[str | None, bool | None]:
+    if not any(str(tool_id).startswith("server:mcp:") for tool_id in tool_ids):
+        return None, None
+
+    version, safe = _server_mcp_cleanup_status(client)
+    if safe is False and not _allow_unsafe_server_mcp():
+        raise llm.ModelError(
+            "Refusing to route MCP through Open WebUI "
+            f"{version or '<unknown>'}: versions before 0.9.3 contain a known "
+            "Streamable-HTTP MCP cleanup bug that can wedge/crash the Open WebUI "
+            "worker (AnyIO cancel-scope task ownership; fixed upstream by "
+            "open-webui/open-webui commit adda20509 / release 0.9.3). "
+            "Upgrade/backport that fix, disable the MCP tool, or set "
+            "LLM_OPENWEBUI_ALLOW_UNSAFE_SERVER_MCP=1 only if this deployment "
+            "already carries an equivalent backport."
+        )
+    return version, safe
+
+
 def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
     return [
         {"id": model.id, "name": model.name or model.id}
@@ -2580,6 +2645,10 @@ class OpenWebUIModel(llm.Model):
                 if prompt.options.openwebui_tools
                 else []
             )
+            server_version, server_mcp_safe = _guard_server_mcp_version(
+                client,
+                tool_ids,
+            )
         except (APIError, AuthError) as exc:
             raise llm.ModelError(str(exc)) from exc
 
@@ -2609,6 +2678,10 @@ class OpenWebUIModel(llm.Model):
                     ),
                     "openwebui_tools": prompt.options.openwebui_tools,
                     "sessionless_server_tools": bool(knowledge_items),
+                },
+                "server": {
+                    "version": server_version,
+                    "mcp_cleanup_safe": server_mcp_safe,
                 },
                 "model_item": {
                     "id": model_item.get("id"),
@@ -2851,9 +2924,27 @@ def register_commands(cli):
         client = _client(config)
         try:
             config = _persist_session(config, client)
+            server_version, server_mcp_safe = _server_mcp_cleanup_status(client)
         except (APIError, AuthError) as exc:
             raise click.ClickException(str(exc)) from exc
-        click.echo(json.dumps(config.get("user", {}), indent=2, ensure_ascii=False))
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        output = {
+            "user": config.get("user", {}),
+            "server": {
+                "version": server_version,
+                "mcp_cleanup_fix": (
+                    "present"
+                    if server_mcp_safe is True
+                    else "missing"
+                    if server_mcp_safe is False
+                    else "unknown"
+                ),
+                "minimum_safe_version": "0.9.3",
+            },
+        }
+        click.echo(json.dumps(output, indent=2, ensure_ascii=False))
 
     @openwebui_group.command(name="sync")
     def sync():
