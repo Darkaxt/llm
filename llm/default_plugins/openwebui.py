@@ -1045,6 +1045,7 @@ def _sync_knowledge_folder(
     *,
     on_status: Callable[[str], None] | None = None,
     interactive_status: bool = False,
+    detect_interrupted: bool = True,
 ) -> dict[str, int]:
     knowledge_id = str(knowledge["id"])
     root = root.expanduser().resolve()
@@ -1138,9 +1139,10 @@ def _sync_knowledge_folder(
         if (entry["path"], entry["filename"]) in wanted
     ]
 
-    candidates_by_hash = _knowledge_file_candidates(
-        client,
-        knowledge_id,
+    candidates_by_hash = (
+        _knowledge_file_candidates(client, knowledge_id)
+        if detect_interrupted
+        else {}
     )
 
     # Resolve target directories and detect interrupted-population leftovers.
@@ -1165,10 +1167,14 @@ def _sync_knowledge_folder(
                 directory_ids,
             )
 
-        candidate = _select_resume_candidate(
-            entry,
-            directory_id,
-            candidates_by_hash,
+        candidate = (
+            _select_resume_candidate(
+                entry,
+                directory_id,
+                candidates_by_hash,
+            )
+            if detect_interrupted
+            else None
         )
         if candidate is not None:
             display = (
