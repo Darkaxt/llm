@@ -167,9 +167,11 @@ async def run_chat_with_tools_with_files(
     base_url: str,
     token: str,
     model: str,
-    messages: list[dict[str, str]],
+    model_item: dict[str, Any] | None = None,
+    messages: list[dict[str, Any]],
     tool_ids: list[str],
     files: list[dict[str, Any]] | None = None,
+    params: dict[str, Any] | None = None,
     timeout: int = 300,
     on_text: Callable[[str], None] | None = None,
     on_tool: Callable[[str], None] | None = None,
@@ -213,6 +215,7 @@ async def run_chat_with_tools_with_files(
     # WebUI treats a bare UUID as a persisted chat ID and returns 404 if that
     # chat does not exist. Unsaved browser chats use "temporary:<socket-id>".
     message_id = str(uuid.uuid4())
+    user_message_id = str(uuid.uuid4())
 
     state: dict[str, Any] = {
         "answer": "",        # last rendered answer prose (stripped)
@@ -500,21 +503,51 @@ async def run_chat_with_tools_with_files(
         # omitted (main.py:1124). So a minimal client that omits it makes the
         # background task crash with AttributeError('NoneType' ... 'get') before
         # emitting any chat-events - the request 200s but you get nothing.
+        last_user_content = ""
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                content = message.get("content")
+                if isinstance(content, str):
+                    last_user_content = content
+                else:
+                    last_user_content = json.dumps(content, ensure_ascii=False)
+                break
+
+        # Mirror current Chat.svelte's request envelope. Several modern Open
+        # WebUI middleware paths (Knowledge, built-in tools, model capabilities)
+        # assume these fields are present even though older/minimal clients
+        # could omit them.
         body: dict[str, Any] = {
             "model": model,
+            "model_item": model_item or {"id": model},
             "messages": messages,
             "stream": True,
+            "params": dict(params or {}),
             "chat_id": chat_id,
             "id": message_id,
             "session_id": session_id,
-            "tool_ids": tool_ids,
+            "parent_id": None,
+            "user_message": {
+                "id": user_message_id,
+                "parentId": None,
+                "childrenIds": [message_id],
+                "role": "user",
+                "content": last_user_content,
+                "timestamp": int(time.time()),
+            },
+            "tool_ids": tool_ids or None,
+            "tool_servers": [],
             "files": files or None,
+            "filter_ids": None,
+            "skill_ids": None,
             "features": {
                 "image_generation": False,
                 "code_interpreter": False,
                 "web_search": False,
             },
             "variables": {},
+            "chat_variables": {},
+            "background_tasks": {},
         }
         # NOTE: we intentionally do NOT send params.function_calling here. The
         # server reads it from the model config (model_info.params.function_calling,
