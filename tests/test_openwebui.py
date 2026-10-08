@@ -1400,3 +1400,69 @@ def test_cli_tool_selection_does_not_merge_model_default_tools(monkeypatch):
 
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert "server:mcp:misp-prod" not in calls[0]["tool_ids"]
+
+
+def test_server_mcp_guard_blocks_versions_before_0_9_3(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_server_config",
+        lambda client: {"version": "0.9.2"},
+    )
+    monkeypatch.delenv(
+        "LLM_OPENWEBUI_ALLOW_UNSAFE_SERVER_MCP",
+        raising=False,
+    )
+
+    with pytest.raises(
+        llm.ModelError,
+        match="versions before 0.9.3",
+    ):
+        openwebui._guard_server_mcp_version(
+            SimpleNamespace(),
+            ["server:mcp:splunk-mcp"],
+        )
+
+
+def test_server_mcp_guard_allows_0_9_3_and_newer(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_server_config",
+        lambda client: {"version": "0.9.3"},
+    )
+
+    assert openwebui._guard_server_mcp_version(
+        SimpleNamespace(),
+        ["server:mcp:splunk-mcp"],
+    ) == ("0.9.3", True)
+
+
+def test_server_mcp_guard_ignores_non_mcp_tools(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_server_config",
+        lambda client: (_ for _ in ()).throw(
+            AssertionError("/api/config should not be called")
+        ),
+    )
+
+    assert openwebui._guard_server_mcp_version(
+        SimpleNamespace(),
+        ["local-tool"],
+    ) == (None, None)
+
+
+def test_server_mcp_guard_can_be_explicitly_overridden(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_server_config",
+        lambda client: {"version": "0.9.1"},
+    )
+    monkeypatch.setenv(
+        "LLM_OPENWEBUI_ALLOW_UNSAFE_SERVER_MCP",
+        "1",
+    )
+
+    assert openwebui._guard_server_mcp_version(
+        SimpleNamespace(),
+        ["server:mcp:splunk-mcp"],
+    ) == ("0.9.1", False)
