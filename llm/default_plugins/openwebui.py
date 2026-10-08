@@ -727,6 +727,75 @@ def _matching_resume_candidates(
     return [*exact, *fallback]
 
 
+def _select_resume_candidate(
+    entry: dict[str, Any],
+    directory_id: str | None,
+    candidates_by_hash: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """Pick the oldest viable prior upload for this exact logical file."""
+    for item in _matching_resume_candidates(
+        entry,
+        directory_id,
+        candidates_by_hash,
+    ):
+        file_id = str(item.get("id") or "")
+        if not file_id:
+            continue
+        data = item.get("data") or {}
+        status = str(data.get("status") or "") if isinstance(data, dict) else ""
+        # A failed duplicate retry is never the file that owns the existing
+        # vector chunks. Prefer completed/processing/original candidates.
+        error = str(data.get("error") or "") if isinstance(data, dict) else ""
+        if status == "failed" and "Duplicate content detected" in error:
+            continue
+        return item
+    return None
+
+
+def _batch_adopt_knowledge_files(
+    client: OpenWebUIClient,
+    *,
+    knowledge_id: str,
+    entries: list[tuple[dict[str, Any], str | None, dict[str, Any]]],
+    on_status: Callable[[str], None] | None = None,
+) -> int:
+    """Attach/reprocess already-uploaded file IDs in native Open WebUI batches."""
+    if not entries:
+        return 0
+
+    adopted = 0
+    batch_size = 50
+    for offset in range(0, len(entries), batch_size):
+        batch = entries[offset : offset + batch_size]
+        if on_status is not None:
+            on_status(
+                f"knowledge sync · adopting existing files · "
+                f"{offset + 1}-{offset + len(batch)}/{len(entries)}"
+            )
+        body = []
+        for _entry, directory_id, candidate in batch:
+            item: dict[str, Any] = {"file_id": str(candidate["id"])}
+            if directory_id:
+                item["directory_id"] = directory_id
+            body.append(item)
+
+        response = _owui_http_json(
+            client,
+            "POST",
+            f"/api/v1/knowledge/{knowledge_id}/files/batch/add",
+            json_body=body,
+            timeout=max(float(client.timeout), 1200.0),
+        )
+        if isinstance(response, dict):
+            warnings = response.get("warnings")
+            if warnings:
+                raise llm.ModelError(
+                    f"Open WebUI batch adoption reported warnings: {warnings}"
+                )
+        adopted += len(batch)
+    return adopted
+
+
 def _resume_knowledge_file(
     client: OpenWebUIClient,
     *,
@@ -1056,10 +1125,12 @@ def _sync_knowledge_folder(
         knowledge_id,
     )
 
-    # Resolve every target directory before workers start. Directory creation
-    # itself is serialized to avoid parent/child races; uploads and server-side
-    # extraction/embedding are then bounded-concurrent.
-    work_items: list[tuple[int, dict[str, Any], str | None]] = []
+    # Resolve target directories, then split missing logical files into:
+    # 1) prior uploads that can be adopted in one native batch;
+    # 2) genuinely absent files that still need uploading.
+    adopt_items: list[tuple[dict[str, Any], str | None, dict[str, Any]]] = []
+    fresh_items: list[tuple[int, dict[str, Any], str | None]] = []
+
     for ordinal, entry in enumerate(files_to_upload, start=1):
         directory_id = (
             directory_ids.get(entry["path"])
@@ -1073,8 +1144,25 @@ def _sync_knowledge_folder(
                 entry["path"],
                 directory_ids,
             )
-        work_items.append((ordinal, entry, directory_id))
 
+        candidate = _select_resume_candidate(
+            entry,
+            directory_id,
+            candidates_by_hash,
+        )
+        if candidate is not None:
+            adopt_items.append((entry, directory_id, candidate))
+        else:
+            fresh_items.append((ordinal, entry, directory_id))
+
+    adopted = _batch_adopt_knowledge_files(
+        client,
+        knowledge_id=knowledge_id,
+        entries=adopt_items,
+        on_status=on_status,
+    )
+
+    work_items = fresh_items
     if not work_items:
         return {
             "added": len(added),
@@ -1082,13 +1170,13 @@ def _sync_knowledge_folder(
             "deleted": len(deleted),
             "unmodified": int(diff.get("unmodified_count") or 0),
             "uploaded": 0,
-            "reused": 0,
+            "reused": adopted,
         }
 
     concurrency = min(_knowledge_sync_concurrency(), len(work_items))
     progress_lock = threading.Lock()
     completed_count = 0
-    reused = 0
+    reused = adopted
     uploaded_count = 0
     active: dict[str, str] = {}
 
@@ -1133,34 +1221,20 @@ def _sync_knowledge_folder(
             emit_progress(path_label)
 
         try:
-            if _resume_knowledge_file(
+            _upload_knowledge_sync_file(
                 client,
                 knowledge_id=knowledge_id,
                 entry=entry,
                 directory_id=directory_id,
-                candidates_by_hash=candidates_by_hash,
+                ordinal=ordinal,
+                total=len(work_items),
                 on_status=worker_status,
                 interactive_status=False,
-            ):
-                outcome = "resumed"
-            else:
-                _upload_knowledge_sync_file(
-                    client,
-                    knowledge_id=knowledge_id,
-                    entry=entry,
-                    directory_id=directory_id,
-                    ordinal=ordinal,
-                    total=len(work_items),
-                    on_status=worker_status,
-                    interactive_status=False,
-                )
-                outcome = "uploaded"
+            )
+            outcome = "uploaded"
 
             with progress_lock:
-                if outcome == "resumed":
-                    reused += 1
-                else:
-                    uploaded_count += 1
+                uploaded_count += 1
                 completed_count += 1
                 active.pop(path_label, None)
             emit_progress(f"{path_label} · {outcome}")
@@ -1644,7 +1718,7 @@ def _file_processing_timeout() -> float:
 
 
 def _knowledge_sync_concurrency() -> int:
-    raw = os.environ.get("LLM_OPENWEBUI_KB_CONCURRENCY", "4")
+    raw = os.environ.get("LLM_OPENWEBUI_KB_CONCURRENCY", "1")
     try:
         value = int(raw)
     except ValueError as exc:
