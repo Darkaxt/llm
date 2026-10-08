@@ -2376,7 +2376,26 @@ class OpenWebUIModel(llm.Model):
                 elif kind == "error":
                     status_bar.clear()
                     if isinstance(payload, (APIError, AuthError)):
-                        raise llm.ModelError(str(payload)) from payload
+                        context_bits = []
+                        if status_activity:
+                            context_bits.append(
+                                f"last status: {status_activity[-1]}"
+                            )
+                        if remote_execution.get("remote_chat_id"):
+                            context_bits.append(
+                                f"remote chat: {remote_execution['remote_chat_id']}"
+                            )
+                        task_ids = remote_execution.get("remote_task_ids") or []
+                        if task_ids:
+                            context_bits.append(
+                                "remote task(s): " + ",".join(task_ids)
+                            )
+                        suffix = (
+                            " [" + "; ".join(context_bits) + "]"
+                            if context_bits
+                            else ""
+                        )
+                        raise llm.ModelError(str(payload) + suffix) from payload
                     raise payload
                 elif kind == "done":
                     status_bar.clear()
