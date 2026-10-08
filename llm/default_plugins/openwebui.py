@@ -1020,6 +1020,24 @@ def _upload_knowledge_sync_file(
         return uploaded
 
 
+def _reset_knowledge_base(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+) -> dict[str, Any]:
+    payload = _owui_http_json(
+        client,
+        "POST",
+        f"/api/v1/knowledge/{knowledge_id}/reset",
+        params={"include_directories": "true"},
+        timeout=max(float(client.timeout), 600.0),
+    )
+    if not isinstance(payload, dict) or not payload.get("id"):
+        raise llm.ModelError(
+            f"Open WebUI returned an invalid reset response for {knowledge_id}"
+        )
+    return payload
+
+
 def _sync_knowledge_folder(
     client: OpenWebUIClient,
     knowledge: dict[str, Any],
@@ -1125,11 +1143,13 @@ def _sync_knowledge_folder(
         knowledge_id,
     )
 
-    # Resolve target directories, then split missing logical files into:
-    # 1) prior uploads that can be adopted in one native batch;
-    # 2) genuinely absent files that still need uploading.
-    adopt_items: list[tuple[dict[str, Any], str | None, dict[str, Any]]] = []
-    fresh_items: list[tuple[int, dict[str, Any], str | None]] = []
+    # Resolve target directories and detect interrupted-population leftovers.
+    # Normal sync is intentionally conservative: if Open WebUI already has an
+    # unlinked upload matching a file that sync/diff says is missing, do not
+    # enter a slow repair/re-embedding path automatically. Fail fast and direct
+    # the user to the explicit rebuild workflow instead.
+    work_items: list[tuple[int, dict[str, Any], str | None]] = []
+    interrupted: list[str] = []
 
     for ordinal, entry in enumerate(files_to_upload, start=1):
         directory_id = (
@@ -1151,18 +1171,29 @@ def _sync_knowledge_folder(
             candidates_by_hash,
         )
         if candidate is not None:
-            adopt_items.append((entry, directory_id, candidate))
-        else:
-            fresh_items.append((ordinal, entry, directory_id))
+            display = (
+                f"{entry['path']}/{entry['filename']}"
+                if entry["path"]
+                else str(entry["filename"])
+            )
+            interrupted.append(display)
+            continue
 
-    adopted = _batch_adopt_knowledge_files(
-        client,
-        knowledge_id=knowledge_id,
-        entries=adopt_items,
-        on_status=on_status,
-    )
+        work_items.append((ordinal, entry, directory_id))
 
-    work_items = fresh_items
+    if interrupted:
+        preview = ", ".join(interrupted[:5])
+        if len(interrupted) > 5:
+            preview += f", … (+{len(interrupted) - 5} more)"
+        raise click.ClickException(
+            "Interrupted knowledge population detected: "
+            f"{len(interrupted)} file(s) are missing from the KB but matching "
+            "prior Open WebUI uploads already exist. Refusing slow/ambiguous "
+            "automatic recovery. Run: llm openwebui knowledge rebuild "
+            f"\"{knowledge.get('name') or knowledge_id}\". "
+            f"Examples: {preview}"
+        )
+
     if not work_items:
         return {
             "added": len(added),
@@ -1170,13 +1201,14 @@ def _sync_knowledge_folder(
             "deleted": len(deleted),
             "unmodified": int(diff.get("unmodified_count") or 0),
             "uploaded": 0,
-            "reused": adopted,
+            "reused": 0,
         }
+
 
     concurrency = min(_knowledge_sync_concurrency(), len(work_items))
     progress_lock = threading.Lock()
     completed_count = 0
-    reused = adopted
+    reused = 0
     uploaded_count = 0
     active: dict[str, str] = {}
 
