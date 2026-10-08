@@ -593,18 +593,51 @@ async def run_chat_with_tools_with_files(
             out_status(
                 "request submitted · native server tools · hidden builtins suppressed"
             )
-            request_timeout = max(float(timeout) * 6.0, 3600.0)
-            post_task = asyncio.create_task(
-                asyncio.to_thread(
-                    http.json_request,
-                    f"{base_url}/api/chat/completions",
-                    method="POST",
-                    token=token,
-                    json_body=body,
-                    timeout=request_timeout,
-                    endpoint="POST /api/chat/completions (sessionless server tools)",
+            async def post_sessionless_chat() -> Any:
+                headers = {
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                }
+                request_timeout = aiohttp.ClientTimeout(
+                    total=None,
+                    sock_connect=min(float(timeout), 60.0),
+                    sock_read=None,
                 )
-            )
+                async with http_session.post(
+                    f"{base_url}/api/chat/completions",
+                    headers=headers,
+                    json=body,
+                    timeout=request_timeout,
+                ) as response:
+                    raw = await response.text()
+                    if response.status >= 400:
+                        detail: Any = raw
+                        try:
+                            parsed = json.loads(raw)
+                            if isinstance(parsed, dict):
+                                detail = (
+                                    parsed.get("detail")
+                                    or parsed.get("message")
+                                    or parsed.get("error")
+                                    or parsed
+                                )
+                            else:
+                                detail = parsed
+                        except Exception:
+                            pass
+                        raise APIError(
+                            "Open WebUI sessionless chat request failed "
+                            f"({response.status}): {detail}"
+                        )
+                    if not raw.strip():
+                        return None
+                    try:
+                        return json.loads(raw)
+                    except Exception:
+                        return raw
+
+            post_task = asyncio.create_task(post_sessionless_chat())
 
             started_at = time.monotonic()
             heartbeat_seconds = 15.0
@@ -616,6 +649,7 @@ async def run_chat_with_tools_with_files(
                     state["error"] = (
                         f"timed out after {timeout}s without an Open WebUI event"
                     )
+                    post_task.cancel()
                     break
                 try:
                     await asyncio.wait_for(
@@ -637,6 +671,9 @@ async def run_chat_with_tools_with_files(
 
             try:
                 await post_task
+            except asyncio.CancelledError:
+                if not state["error"]:
+                    state["error"] = "sessionless Open WebUI request cancelled"
             except Exception as exc:
                 if not state["error"]:
                     state["error"] = (
