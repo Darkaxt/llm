@@ -589,3 +589,28 @@ def test_chat_retry_replays_failed_turn_without_retransforming(tmp_path, monkeyp
     assert len(attempts) == 2
     assert attempts[1]["retry_of_turn_id"] == attempts[0]["turn_id"]
     assert any(record["type"] == "turn_error" for record in records)
+
+
+
+def test_run_chat_ctrl_c_closes_inflight_provider_stream(monkeypatch):
+    prompts = iter(["first prompt", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    closed = []
+
+    class FakeResponse:
+        def stream_events(self):
+            try:
+                yield object()
+            finally:
+                closed.append(True)
+
+    def interrupt_stream(events, **kwargs):
+        next(iter(events))
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(llm.cli, "display_stream_events", interrupt_stream)
+    llm.cli._run_chat("mock", lambda *args: FakeResponse())
+    assert closed == [True]

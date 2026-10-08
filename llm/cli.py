@@ -386,30 +386,39 @@ def _run_chat(
             response = prompt_callback(prompt, fragments, attachments)
 
             def journaled_events():
-                for event in response.stream_events():
-                    if conversation is not None and export_jsonl:
-                        append_chat_journal_record(
-                            conversation.id,
-                            {
-                                "type": "assistant_stream",
-                                "turn_id": turn_id,
-                                "event_type": event.type,
-                                "chunk": event.chunk,
-                                "part_index": event.part_index,
-                                "tool_call_id": event.tool_call_id,
-                                "tool_name": event.tool_name,
-                                "server_executed": event.server_executed,
-                                "redacted": event.redacted,
-                                "provider_metadata": event.provider_metadata,
-                                "message_index": event.message_index,
-                            },
-                        )
-                    yield event
+                stream = response.stream_events()
+                try:
+                    for event in stream:
+                        if conversation is not None and export_jsonl:
+                            append_chat_journal_record(
+                                conversation.id,
+                                {
+                                    "type": "assistant_stream",
+                                    "turn_id": turn_id,
+                                    "event_type": event.type,
+                                    "chunk": event.chunk,
+                                    "part_index": event.part_index,
+                                    "tool_call_id": event.tool_call_id,
+                                    "tool_name": event.tool_name,
+                                    "server_executed": event.server_executed,
+                                    "redacted": event.redacted,
+                                    "provider_metadata": event.provider_metadata,
+                                    "message_index": event.message_index,
+                                },
+                            )
+                        yield event
+                finally:
+                    # Closing the source generator propagates cancellation to
+                    # an in-flight provider worker (including remote MCP tasks).
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
 
-            display_stream_events(
-                journaled_events(),
-                show_reasoning=show_reasoning,
-            )
+            events_iterator = journaled_events()
+            try:
+                display_stream_events(events_iterator, show_reasoning=show_reasoning)
+            finally:
+                events_iterator.close()
         except KeyboardInterrupt:
             last_failed = (prompt, list(fragments), list(attachments), turn_id)
             if conversation is not None and export_jsonl:

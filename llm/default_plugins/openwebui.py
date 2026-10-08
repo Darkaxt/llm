@@ -2701,6 +2701,8 @@ class OpenWebUIModel(llm.Model):
         )
 
         events: queue.Queue[tuple[str, Any]] = queue.Queue()
+        cancel_requested = threading.Event()
+        worker_finished = threading.Event()
         tool_activity: list[str] = []
         remote_execution: dict[str, Any] = {}
 
@@ -2767,6 +2769,7 @@ class OpenWebUIModel(llm.Model):
                                 and prompt.options.openwebui_mcp_transport
                                 == "sessionless_native"
                             ),
+                            stop_requested=cancel_requested,
                             on_text=on_text,
                             on_reasoning=on_reasoning,
                             on_tool=on_tool,
@@ -2807,6 +2810,8 @@ class OpenWebUIModel(llm.Model):
                     }
                 )
                 events.put(("error", exc))
+            finally:
+                worker_finished.set()
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
@@ -2879,6 +2884,8 @@ class OpenWebUIModel(llm.Model):
                     }
                     break
         finally:
+            if not worker_finished.is_set():
+                cancel_requested.set()
             status_bar.clear()
 
 

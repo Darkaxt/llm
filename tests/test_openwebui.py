@@ -1534,3 +1534,77 @@ def test_sessionless_recovery_grace_validation(monkeypatch):
         openwebui_socket._sessionless_recovery_grace()
     monkeypatch.setenv("LLM_OPENWEBUI_RECOVERY_GRACE", "15")
     assert openwebui_socket._sessionless_recovery_grace() == 15.0
+
+
+
+def test_meaningful_progress_timeout_not_reset_by_socket_keepalives():
+    state = {
+        "phase": "initial model",
+        "last_event_at": 400.0,
+        "last_progress_at": 0.0,
+    }
+    reason = openwebui_socket._stalled_request_error(
+        state, 400.0, event_timeout=600.0, progress_timeout=300.0
+    )
+    assert "no model/tool progress for 400s" in reason
+    assert "initial model" in reason
+    state["last_progress_at"] = 350.0
+    assert openwebui_socket._stalled_request_error(
+        state, 400.0, event_timeout=600.0, progress_timeout=300.0
+    ) is None
+
+
+def test_meaningful_progress_timeout_config(monkeypatch):
+    monkeypatch.delenv("LLM_OPENWEBUI_PROGRESS_TIMEOUT", raising=False)
+    assert openwebui_socket._meaningful_progress_timeout() == 300.0
+    monkeypatch.setenv("LLM_OPENWEBUI_PROGRESS_TIMEOUT", "120")
+    assert openwebui_socket._meaningful_progress_timeout() == 120.0
+    for invalid in ("0", "-1", "nan", "inf", "oops"):
+        monkeypatch.setenv("LLM_OPENWEBUI_PROGRESS_TIMEOUT", invalid)
+        with pytest.raises(Exception, match="LLM_OPENWEBUI_PROGRESS_TIMEOUT"):
+            openwebui_socket._meaningful_progress_timeout()
+
+
+def test_cancel_remote_background_chat_tasks_uses_user_scoped_endpoint():
+    import asyncio
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return Response()
+
+    async def scenario():
+        session = Session()
+        statuses = []
+        result = await openwebui_socket._stop_remote_chat_tasks(
+            session,
+            base_url="https://example.test/",
+            token="test-jwt",
+            chat_id="temporary:session-1",
+            on_status=statuses.append,
+        )
+        assert result is True
+        assert session.calls == [
+            (
+                "https://example.test/api/tasks/chat/temporary%3Asession-1/stop",
+                {
+                    "headers": {"Authorization": "Bearer test-jwt"},
+                    "timeout": 15,
+                },
+            )
+        ]
+        assert "cancellation requested" in statuses[0]
+
+    asyncio.run(scenario())

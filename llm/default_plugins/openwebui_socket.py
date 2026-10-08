@@ -41,11 +41,13 @@ import contextlib
 import json
 import math
 import os
+import threading
 import time
 import uuid
 from asyncio import TimeoutError as _AsyncTimeoutError
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 from openwebui_sdk import http
 from openwebui_sdk.errors import APIError, ConfigError
@@ -101,6 +103,73 @@ async def _recover_sessionless_completion(
             "be running. Use !retry in chat to explicitly resend the failed "
             "turn (read-only tools only)."
         )
+
+
+def _meaningful_progress_timeout() -> float:
+    """Timeout for real model/tool activity, independent of socket heartbeats."""
+    value = os.environ.get("LLM_OPENWEBUI_PROGRESS_TIMEOUT", "300")
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise ConfigError(
+            "LLM_OPENWEBUI_PROGRESS_TIMEOUT must be a number of seconds"
+        ) from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ConfigError(
+            "LLM_OPENWEBUI_PROGRESS_TIMEOUT must be positive and finite"
+        )
+    return seconds
+
+
+def _stalled_request_error(
+    state: dict[str, Any],
+    now: float,
+    *,
+    event_timeout: float,
+    progress_timeout: float,
+) -> str | None:
+    """Socket keepalives cannot extend the deadline for useful work."""
+    no_progress = now - float(state["last_progress_at"])
+    if no_progress >= progress_timeout:
+        return (
+            f"Open WebUI stalled: no model/tool progress for {int(no_progress)}s "
+            f"during {state['phase']} (limit {progress_timeout:g}s). "
+            "Set LLM_OPENWEBUI_PROGRESS_TIMEOUT to adjust the limit."
+        )
+    no_event = now - float(state["last_event_at"])
+    if no_event >= event_timeout:
+        return f"timed out after {event_timeout:g}s without an Open WebUI event"
+    return None
+
+
+async def _stop_remote_chat_tasks(
+    session: Any,
+    *,
+    base_url: str,
+    token: str,
+    chat_id: str,
+    on_status: Callable[[str], None],
+) -> bool:
+    """Cancel only the caller's chat tasks via Open WebUI's user-scoped API."""
+    endpoint = (
+        f"{base_url.rstrip('/')}/api/tasks/chat/{quote(chat_id, safe='')}/stop"
+    )
+    try:
+        async with session.post(
+            endpoint,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        ) as response:
+            if response.status >= 400:
+                on_status(
+                    f"could not stop remote chat tasks (HTTP {response.status})"
+                )
+                return False
+            on_status("remote chat task cancellation requested")
+            return True
+    except Exception as exc:
+        on_status(f"could not stop remote chat tasks: {exc}")
+        return False
 
 
 def _need_socketio() -> Any:
@@ -286,6 +355,7 @@ async def run_chat_with_tools_with_files(
     on_reasoning: Callable[[str], None] | None = None,
     chat_id: str | None = None,
     sessionless_server_tools: bool = False,
+    stop_requested: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run a tool-enabled chat over the Socket.IO path.
 
@@ -346,9 +416,11 @@ async def run_chat_with_tools_with_files(
             delta = answer[len(state["answer"]):]
             if delta:
                 out_text(delta)
+                state["last_progress_at"] = time.monotonic()
             state["answer"] = answer
         elif len(answer) > len(state["answer"]):
             state["answer"] = answer
+            state["last_progress_at"] = time.monotonic()
 
     def _sync_structured_output(output: Any) -> None:
         answer = _structured_output_text(output)
@@ -362,10 +434,12 @@ async def run_chat_with_tools_with_files(
                 if i > 0:
                     out_reasoning("\n\n")
                 out_reasoning(block)
+                state["last_progress_at"] = time.monotonic()
             elif block.startswith(prev_blocks[i]):
                 delta = block[len(prev_blocks[i]):]
                 if delta:
                     out_reasoning(delta)
+                    state["last_progress_at"] = time.monotonic()
         state["reasoning_blocks"] = current_blocks
 
         current_events = _structured_tool_events(output)
@@ -375,6 +449,7 @@ async def run_chat_with_tools_with_files(
             done_now = bool(ev.get("done"))
             done_before = state["tool_done"].get(key)
             if done_before is None or done_before != done_now:
+                state["last_progress_at"] = time.monotonic()
                 suffix = " done" if done_now else " ..."
                 out_tool(f"↳ {ev['name']}{suffix}")
                 if done_now:
@@ -405,13 +480,7 @@ async def run_chat_with_tools_with_files(
         event = payload.get("data") or {}
         etype = event.get("type")
         data = event.get("data") or {}
-        if etype in ("chat:message:delta", "message", "chat:message", "replace"):
-            if data.get("content"):
-                state["last_progress_at"] = time.monotonic()
-        elif etype == "chat:completion" and (
-            data.get("content") or data.get("output") or data.get("done")
-        ):
-            state["last_progress_at"] = time.monotonic()
+        # Socket.IO status/heartbeat/duplicate snapshot events are not progress.
 
         if etype == "status":
             action = data.get("action") or data.get("description")
@@ -441,6 +510,7 @@ async def run_chat_with_tools_with_files(
             if fragment:
                 out_text(str(fragment))
                 state["answer"] += str(fragment)
+                state["last_progress_at"] = time.monotonic()
             return
 
         if etype in ("chat:message", "replace"):
@@ -487,10 +557,12 @@ async def run_chat_with_tools_with_files(
                     if i > 0:
                         out_reasoning("\n\n")
                     out_reasoning(block)
+                    state["last_progress_at"] = time.monotonic()
                 elif block.startswith(prev_blocks[i]):
                     delta = block[len(prev_blocks[i]):]
                     if delta:
                         out_reasoning(delta)
+                        state["last_progress_at"] = time.monotonic()
             state["reasoning_blocks"] = current_blocks
 
             current_tool_events = extract_tool_events(content)
@@ -500,6 +572,7 @@ async def run_chat_with_tools_with_files(
                 done_now = bool(ev.get("done"))
                 done_before = state["tool_done"].get(name)
                 if done_before is None or done_before != done_now:
+                    state["last_progress_at"] = time.monotonic()
                     out_tool(format_tool_line(ev))
                     if done_now:
                         state["phase"] = "model continuation"
@@ -697,27 +770,43 @@ async def run_chat_with_tools_with_files(
             post_task = asyncio.create_task(post_sessionless_chat())
 
             started_at = time.monotonic()
+            state["last_progress_at"] = started_at
+            state["last_event_at"] = started_at
             heartbeat_seconds = 15.0
+            last_heartbeat = started_at
+            progress_limit = _meaningful_progress_timeout()
             while not done.is_set() and not post_task.done():
                 now = time.monotonic()
-                idle = now - state["last_event_at"]
-                remaining_idle = timeout - idle
-                if remaining_idle <= 0:
-                    state["error"] = (
-                        f"timed out after {timeout}s without an Open WebUI event"
-                    )
+                if stop_requested is not None and stop_requested.is_set():
+                    state["error"] = "Chat request cancelled by user"
                     post_task.cancel()
                     break
+                problem = _stalled_request_error(
+                    state, now, event_timeout=timeout, progress_timeout=progress_limit
+                )
+                if problem:
+                    state["error"] = problem
+                    post_task.cancel()
+                    break
+                remaining_idle = timeout - (now - state["last_event_at"])
+                remaining_progress = progress_limit - (
+                    now - state["last_progress_at"]
+                )
+                wait_for = min(
+                    1.0,
+                    remaining_idle,
+                    remaining_progress,
+                )
                 try:
-                    await asyncio.wait_for(
-                        done.wait(),
-                        timeout=min(heartbeat_seconds, remaining_idle),
-                    )
+                    await asyncio.wait_for(done.wait(), timeout=wait_for)
                 except _AsyncTimeoutError:
                     now = time.monotonic()
+                    if now - last_heartbeat < heartbeat_seconds:
+                        continue
                     elapsed = now - started_at
                     idle = now - state["last_event_at"]
                     phase_elapsed = now - state["phase_started_at"]
+                    last_heartbeat = now
                     with contextlib.suppress(Exception):
                         await sio.emit("heartbeat", {})
                     out_status(
@@ -782,6 +871,8 @@ async def run_chat_with_tools_with_files(
             out_status(
                 "request accepted" + (f" ({'; '.join(details)})" if details else "")
             )
+            state["last_progress_at"] = time.monotonic()
+            state["last_event_at"] = state["last_progress_at"]
 
         # ---- wait for completion, with visible idle heartbeat ----
         #
@@ -791,25 +882,39 @@ async def run_chat_with_tools_with_files(
         # real event prevents active investigations being killed at 600s.
         started_at = time.monotonic()
         heartbeat_seconds = 15.0
+        last_heartbeat = started_at
+        progress_limit = _meaningful_progress_timeout()
         while not sessionless_server_tools and not done.is_set():
             now = time.monotonic()
-            idle = now - state["last_event_at"]
-            remaining_idle = timeout - idle
-            if remaining_idle <= 0:
-                state["error"] = (
-                    f"timed out after {timeout}s without an Open WebUI event"
+            if stop_requested is not None and stop_requested.is_set():
+                state["error"] = "Chat request cancelled by user"
+            else:
+                state["error"] = _stalled_request_error(
+                    state, now, event_timeout=timeout, progress_timeout=progress_limit
                 )
+            if state["error"]:
+                if remote_task_ids:
+                    await _stop_remote_chat_tasks(
+                        http_session,
+                        base_url=base_url,
+                        token=token,
+                        chat_id=remote_chat_id or chat_id,
+                        on_status=out_status,
+                    )
                 break
+            remaining_idle = timeout - (now - state["last_event_at"])
+            remaining_progress = progress_limit - (now - state["last_progress_at"])
+            wait_for = min(1.0, remaining_idle, remaining_progress)
             try:
-                await asyncio.wait_for(
-                    done.wait(),
-                    timeout=min(heartbeat_seconds, remaining_idle),
-                )
+                await asyncio.wait_for(done.wait(), timeout=wait_for)
             except _AsyncTimeoutError:
                 now = time.monotonic()
+                if now - last_heartbeat < heartbeat_seconds:
+                    continue
                 elapsed = now - started_at
                 idle = now - state["last_event_at"]
                 phase_elapsed = now - state["phase_started_at"]
+                last_heartbeat = now
                 # Keep the socket/session alive exactly as the browser does.
                 with contextlib.suppress(Exception):
                     await sio.emit("heartbeat", {})
@@ -817,7 +922,7 @@ async def run_chat_with_tools_with_files(
                     f"waiting for {state['phase']} "
                     f"({int(phase_elapsed)}s phase, {int(elapsed)}s total, "
                     f"{int(idle)}s since last event, "
-                        f"{int(now - state['last_progress_at'])}s since progress)"
+                    f"{int(now - state['last_progress_at'])}s since progress)"
                 )
     finally:
         with contextlib.suppress(Exception):
