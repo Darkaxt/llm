@@ -412,6 +412,53 @@ def _enabled_knowledge_items(
     return items
 
 
+def _apply_knowledge_scope_instruction(
+    messages: list[dict[str, Any]],
+    knowledge_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Scope persistent Knowledge by instruction without triggering forced RAG.
+
+    Passing a collection in top-level files makes Open WebUI run its automatic
+    file/RAG pipeline before the model. Large reusable KBs are better accessed
+    through Open WebUI's built-in Knowledge tools (list/search/grep/view) on
+    demand. With no attached collection, those global Knowledge tools are
+    injected by Open WebUI; this instruction tells the model exactly which
+    persistent KB(s) the CLI enabled.
+    """
+    if not knowledge_items:
+        return messages
+
+    lines = [
+        "Open WebUI persistent Knowledge enabled for this CLI chat:",
+    ]
+    for item in knowledge_items:
+        name = str(item.get("name") or item.get("id") or "knowledge")
+        knowledge_id = str(item.get("id") or "")
+        lines.append(f"- {name} (knowledge_id={knowledge_id})")
+
+    lines.extend(
+        [
+            "",
+            "These are persistent Open WebUI Knowledge Bases, not chat attachments.",
+            "Use the built-in Knowledge tools to inspect them on demand.",
+            "When the user names a file, identifier, UUID, or path, prefer exact "
+            "Knowledge lookup/grep/view over semantic guessing.",
+            "Do not claim the Knowledge Base is empty merely because it is not "
+            "present in the chat files list.",
+        ]
+    )
+    instruction = "\n".join(lines)
+
+    scoped = [dict(message) for message in messages]
+    if scoped and scoped[0].get("role") == "system":
+        existing = str(scoped[0].get("content") or "")
+        scoped[0]["content"] = (
+            existing + "\n\n" + instruction if existing else instruction
+        )
+    else:
+        scoped.insert(0, {"role": "system", "content": instruction})
+    return scoped
+
 def _enabled_tool_ids(config: dict[str, Any]) -> list[str]:
     raw = config.get("enabled_tool_ids", [])
     if not isinstance(raw, list):
@@ -2183,25 +2230,17 @@ class OpenWebUIModel(llm.Model):
             )
             knowledge_items = _enabled_knowledge_items(config, client)
             if knowledge_items:
-                existing = {
-                    (str(item.get("type") or ""), str(item.get("id") or ""))
-                    for item in attached_files
-                    if isinstance(item, dict)
-                }
-                for item in knowledge_items:
-                    key = (
-                        str(item.get("type") or ""),
-                        str(item.get("id") or ""),
-                    )
-                    if key not in existing:
-                        attached_files.append(item)
-                        existing.add(key)
+                messages = _apply_knowledge_scope_instruction(
+                    messages,
+                    knowledge_items,
+                )
                 prepare_status(
-                    "knowledge · "
+                    "knowledge scope · "
                     + " · ".join(
                         str(item.get("name") or item.get("id"))
                         for item in knowledge_items
                     )
+                    + " · tool-only"
                 )
         except Exception:
             status_bar.clear()
@@ -2209,10 +2248,13 @@ class OpenWebUIModel(llm.Model):
 
         try:
             model_item = _get_model_item(client, self.remote_model_id)
-            tool_ids = client.resolve_tools(
-                self.remote_model_id,
-                extra_tool_ids=_enabled_tool_ids(config),
-                no_tools=not prompt.options.openwebui_tools,
+            # CLI tool selection is authoritative. Do not merge model-attached
+            # defaults from info.meta.toolIds: tool clear / tool disable must
+            # actually remove those tools for CLI chats.
+            tool_ids = (
+                _enabled_tool_ids(config)
+                if prompt.options.openwebui_tools
+                else []
             )
         except (APIError, AuthError) as exc:
             raise llm.ModelError(str(exc)) from exc
@@ -2227,6 +2269,13 @@ class OpenWebUIModel(llm.Model):
                     _journal_file_reference(item)
                     for item in attached_files
                     if isinstance(item, dict)
+                ],
+                "knowledge_scope": [
+                    {
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                    }
+                    for item in knowledge_items
                 ],
                 "options": {
                     "temperature": prompt.options.temperature,
