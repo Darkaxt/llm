@@ -13,6 +13,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import sys
 import threading
@@ -412,52 +413,373 @@ def _enabled_knowledge_items(
     return items
 
 
-def _apply_knowledge_scope_instruction(
-    messages: list[dict[str, Any]],
-    knowledge_items: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Scope persistent Knowledge by instruction without triggering forced RAG.
+_UUID_RE = re.compile(
+    r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+)
+_SPLUNK_MACRO_RE = re.compile(r"\x60([A-Za-z0-9_.:-]+)(?:\([^)]*\))?\x60")
 
-    Passing a collection in top-level files makes Open WebUI run its automatic
-    file/RAG pipeline before the model. Large reusable KBs are better accessed
-    through Open WebUI's built-in Knowledge tools (list/search/grep/view) on
-    demand. With no attached collection, those global Knowledge tools are
-    injected by Open WebUI; this instruction tells the model exactly which
-    persistent KB(s) the CLI enabled.
+
+def _knowledge_search_files(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+    query: str,
+    *,
+    include_content: bool = False,
+) -> list[dict[str, Any]]:
+    payload = _owui_http_json(
+        client,
+        "GET",
+        f"/api/v1/knowledge/{knowledge_id}/files",
+        params={
+            "query": query,
+            "include_content": "true" if include_content else "false",
+            "page": 1,
+        },
+        timeout=max(float(client.timeout), 120.0),
+    )
+    if not isinstance(payload, dict):
+        raise llm.ModelError(
+            f"Open WebUI returned an invalid file search for knowledge {knowledge_id}"
+        )
+    items = payload.get("items") or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _knowledge_exact_file(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+    filename: str,
+) -> dict[str, Any] | None:
+    matches = _knowledge_search_files(client, knowledge_id, filename)
+    exact = [
+        item
+        for item in matches
+        if str(item.get("filename") or "").casefold() == filename.casefold()
+    ]
+    if not exact:
+        return None
+    if len(exact) > 1:
+        ids = ", ".join(str(item.get("id") or "?") for item in exact[:5])
+        raise llm.ModelError(
+            f"Knowledge base contains multiple files named {filename!r}: {ids}"
+        )
+    return exact[0]
+
+
+def _knowledge_file_text(
+    client: OpenWebUIClient,
+    file_id: str,
+) -> str:
+    payload = _owui_http_json(
+        client,
+        "GET",
+        f"/api/v1/files/{file_id}/data/content",
+        timeout=max(float(client.timeout), 120.0),
+    )
+    if not isinstance(payload, dict):
+        raise llm.ModelError(
+            f"Open WebUI returned invalid content for knowledge file {file_id}"
+        )
+    return str(payload.get("content") or "")
+
+
+def _json_contains_needles(value: Any, needles: set[str]) -> bool:
+    if isinstance(value, dict):
+        return any(
+            _json_contains_needles(key, needles)
+            or _json_contains_needles(item, needles)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_json_contains_needles(item, needles) for item in value)
+    text = str(value)
+    return any(needle in text for needle in needles)
+
+
+def _json_matching_fragments(
+    value: Any,
+    needles: set[str],
+    *,
+    max_matches: int = 20,
+) -> list[Any]:
+    matches: list[Any] = []
+
+    def visit(node: Any) -> None:
+        if len(matches) >= max_matches:
+            return
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if len(matches) >= max_matches:
+                    return
+                if _json_contains_needles(key, needles) or _json_contains_needles(
+                    child, needles
+                ):
+                    matches.append({key: child})
+                elif isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                if len(matches) >= max_matches:
+                    return
+                if _json_contains_needles(child, needles):
+                    matches.append(child)
+                elif isinstance(child, (dict, list)):
+                    visit(child)
+
+    if _json_contains_needles(value, needles):
+        if isinstance(value, dict):
+            visit(value)
+        elif isinstance(value, list):
+            visit(value)
+        else:
+            matches.append(value)
+    return matches[:max_matches]
+
+
+def _extract_macro_subset(macros: Any, macro_names: set[str]) -> Any:
+    if not macro_names:
+        return {}
+
+    wanted = {name.casefold() for name in macro_names}
+    selected: dict[str, Any] = {}
+
+    def visit(node: Any, path: str = "") -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_text = str(key)
+                full_path = f"{path}.{key_text}" if path else key_text
+                if key_text.casefold() in wanted:
+                    selected[full_path] = value
+                    continue
+                if isinstance(value, dict):
+                    name = value.get("name")
+                    if isinstance(name, str) and name.casefold() in wanted:
+                        selected[full_path] = value
+                        continue
+                visit(value, full_path)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                if isinstance(value, dict):
+                    name = value.get("name")
+                    if isinstance(name, str) and name.casefold() in wanted:
+                        selected[f"{path}[{index}]"] = value
+                        continue
+                visit(value, f"{path}[{index}]")
+
+    visit(macros)
+    return selected
+
+
+def _conversation_text(messages: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            chunks.append(content)
+        elif content is not None:
+            chunks.append(json.dumps(content, ensure_ascii=False, default=str))
+    return "\n".join(chunks)
+
+
+def _resolve_knowledge_context(
+    client: OpenWebUIClient,
+    knowledge_items: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    *,
+    on_status: Callable[[str], None] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Resolve a compact deterministic context from persistent Knowledge.
+
+    This avoids Open WebUI's automatic collection RAG and avoids exposing its
+    whole builtin-tool catalogue to providers with strict/limited native tool
+    handling. It intentionally extracts only authoritative workflow files and
+    exact identifier-bearing TIDE evidence.
     """
     if not knowledge_items:
-        return messages
+        return messages, {}
 
-    lines = [
-        "Open WebUI persistent Knowledge enabled for this CLI chat:",
-    ]
-    for item in knowledge_items:
-        name = str(item.get("name") or item.get("id") or "knowledge")
-        knowledge_id = str(item.get("id") or "")
-        lines.append(f"- {name} (knowledge_id={knowledge_id})")
+    conversation_text = _conversation_text(messages)
+    uuids = set(_UUID_RE.findall(conversation_text))
+    context_sections: list[str] = []
+    resolution_meta: dict[str, Any] = {
+        "knowledge_bases": [],
+        "uuids": sorted(uuids),
+        "files": [],
+    }
 
-    lines.extend(
-        [
-            "",
-            "These are persistent Open WebUI Knowledge Bases, not chat attachments.",
-            "Use the built-in Knowledge tools to inspect them on demand.",
-            "When the user names a file, identifier, UUID, or path, prefer exact "
-            "Knowledge lookup/grep/view over semantic guessing.",
-            "Do not claim the Knowledge Base is empty merely because it is not "
-            "present in the chat files list.",
+    for knowledge in knowledge_items:
+        knowledge_id = str(knowledge.get("id") or "")
+        knowledge_name = str(knowledge.get("name") or knowledge_id)
+        if not knowledge_id:
+            continue
+        resolution_meta["knowledge_bases"].append(
+            {"id": knowledge_id, "name": knowledge_name}
+        )
+
+        if on_status is not None:
+            on_status(f"knowledge resolve · {knowledge_name}")
+
+        fetched: dict[str, tuple[str, str]] = {}
+        for filename in (
+            "SKILL.md",
+            "SPEC.md",
+            "rule-index.json",
+            "splunk-rules.jsonl",
+            "macros.json",
+        ):
+            item = _knowledge_exact_file(client, knowledge_id, filename)
+            if item is None:
+                continue
+            file_id = str(item.get("id") or "")
+            if not file_id:
+                continue
+            text = _knowledge_file_text(client, file_id)
+            fetched[filename] = (file_id, text)
+            resolution_meta["files"].append(
+                {
+                    "knowledge_id": knowledge_id,
+                    "id": file_id,
+                    "filename": filename,
+                    "chars": len(text),
+                }
+            )
+
+        section_lines = [
+            f'<persistent_knowledge name="{knowledge_name}" id="{knowledge_id}">'
         ]
-    )
-    instruction = "\n".join(lines)
 
+        for filename in ("SKILL.md", "SPEC.md"):
+            if filename in fetched:
+                section_lines.extend(
+                    [
+                        f'<file name="{filename}">',
+                        fetched[filename][1],
+                        "</file>",
+                    ]
+                )
+
+        rule_fragments: list[Any] = []
+        if uuids and "rule-index.json" in fetched:
+            raw_index = fetched["rule-index.json"][1]
+            try:
+                parsed_index = json.loads(raw_index)
+                rule_fragments = _json_matching_fragments(parsed_index, uuids)
+            except Exception:
+                matching_lines = [
+                    line
+                    for line in raw_index.splitlines()
+                    if any(uuid_value in line for uuid_value in uuids)
+                ][:20]
+                rule_fragments = matching_lines
+            if rule_fragments:
+                section_lines.extend(
+                    [
+                        '<exact_evidence source="rule-index.json">',
+                        json.dumps(
+                            rule_fragments,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        ),
+                        "</exact_evidence>",
+                    ]
+                )
+
+        rule_records: list[Any] = []
+        if uuids and "splunk-rules.jsonl" in fetched:
+            for line in fetched["splunk-rules.jsonl"][1].splitlines():
+                if not any(uuid_value in line for uuid_value in uuids):
+                    continue
+                try:
+                    rule_records.append(json.loads(line))
+                except Exception:
+                    rule_records.append(line)
+                if len(rule_records) >= 10:
+                    break
+            if rule_records:
+                section_lines.extend(
+                    [
+                        '<exact_evidence source="splunk-rules.jsonl">',
+                        json.dumps(
+                            rule_records,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        ),
+                        "</exact_evidence>",
+                    ]
+                )
+
+        macro_names: set[str] = set()
+        evidence_text = json.dumps(
+            [rule_fragments, rule_records],
+            ensure_ascii=False,
+            default=str,
+        )
+        macro_names.update(_SPLUNK_MACRO_RE.findall(evidence_text))
+
+        if "macros.json" in fetched and macro_names:
+            raw_macros = fetched["macros.json"][1]
+            try:
+                parsed_macros = json.loads(raw_macros)
+                macro_subset = _extract_macro_subset(parsed_macros, macro_names)
+            except Exception:
+                macro_subset = {
+                    name: [
+                        line
+                        for line in raw_macros.splitlines()
+                        if name in line
+                    ][:10]
+                    for name in sorted(macro_names)
+                }
+            if macro_subset:
+                section_lines.extend(
+                    [
+                        '<exact_evidence source="macros.json">',
+                        json.dumps(
+                            macro_subset,
+                            ensure_ascii=False,
+                            indent=2,
+                            default=str,
+                        ),
+                        "</exact_evidence>",
+                    ]
+                )
+
+        section_lines.extend(
+            [
+                "<instructions>",
+                "The material above was resolved deterministically from the "
+                "persistent Open WebUI Knowledge Base before this model call.",
+                "Treat SKILL.md and SPEC.md as authoritative when present.",
+                "Exact evidence blocks contain only records matching identifiers "
+                "from the conversation. Do not assume omitted KB records are absent.",
+                "</instructions>",
+                "</persistent_knowledge>",
+            ]
+        )
+        context_sections.append("\n".join(section_lines))
+
+    if not context_sections:
+        return messages, resolution_meta
+
+    resolved_context = "\n\n".join(context_sections)
     scoped = [dict(message) for message in messages]
     if scoped and scoped[0].get("role") == "system":
         existing = str(scoped[0].get("content") or "")
         scoped[0]["content"] = (
-            existing + "\n\n" + instruction if existing else instruction
+            existing + "\n\n" + resolved_context
+            if existing
+            else resolved_context
         )
     else:
-        scoped.insert(0, {"role": "system", "content": instruction})
-    return scoped
+        scoped.insert(0, {"role": "system", "content": resolved_context})
+
+    resolution_meta["context_chars"] = len(resolved_context)
+    resolution_meta["macro_names"] = sorted(macro_names) if 'macro_names' in locals() else []
+    return scoped, resolution_meta
+
 
 def _enabled_tool_ids(config: dict[str, Any]) -> list[str]:
     raw = config.get("enabled_tool_ids", [])
@@ -2229,18 +2551,20 @@ class OpenWebUIModel(llm.Model):
                 interactive_status=status_bar.enabled,
             )
             knowledge_items = _enabled_knowledge_items(config, client)
+            knowledge_resolution: dict[str, Any] = {}
             if knowledge_items:
-                messages = _apply_knowledge_scope_instruction(
-                    messages,
+                messages, knowledge_resolution = _resolve_knowledge_context(
+                    client,
                     knowledge_items,
+                    messages,
+                    on_status=prepare_status,
                 )
                 prepare_status(
-                    "knowledge scope · "
+                    "knowledge resolved · "
                     + " · ".join(
                         str(item.get("name") or item.get("id"))
                         for item in knowledge_items
                     )
-                    + " · tool-only"
                 )
         except Exception:
             status_bar.clear()
@@ -2277,6 +2601,7 @@ class OpenWebUIModel(llm.Model):
                     }
                     for item in knowledge_items
                 ],
+                "knowledge_resolution": knowledge_resolution,
                 "options": {
                     "temperature": prompt.options.temperature,
                     "openwebui_attachment_context": (
@@ -2347,7 +2672,12 @@ class OpenWebUIModel(llm.Model):
                                     {"temperature": prompt.options.temperature}
                                     if prompt.options.temperature is not None
                                     else {}
-                                )
+                                ),
+                                **(
+                                    {"function_calling": "legacy"}
+                                    if knowledge_items
+                                    else {}
+                                ),
                             },
                             timeout=client.timeout,
                             on_text=on_text,
