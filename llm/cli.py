@@ -37,6 +37,7 @@ from llm import (
     Conversation,
     Fragment,
     KeyModel,
+    ModelError,
     Response,
     ServerSideTool,
     Template,
@@ -410,7 +411,7 @@ def _run_chat(
                 )
             click.echo("\nCancelled current response.", err=True)
             continue
-        except llm.ModelError as exc:
+        except ModelError as exc:
             if conversation is not None and export_jsonl:
                 append_chat_journal_record(
                     conversation.id,
