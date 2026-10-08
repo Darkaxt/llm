@@ -1055,9 +1055,11 @@ def _sync_knowledge_folder(
         client,
         knowledge_id,
     )
-    reused = 0
-    uploaded_count = 0
 
+    # Resolve every target directory before workers start. Directory creation
+    # itself is serialized to avoid parent/child races; uploads and server-side
+    # extraction/embedding are then bounded-concurrent.
+    work_items: list[tuple[int, dict[str, Any], str | None]] = []
     for ordinal, entry in enumerate(files_to_upload, start=1):
         directory_id = (
             directory_ids.get(entry["path"])
@@ -1071,30 +1073,135 @@ def _sync_knowledge_folder(
                 entry["path"],
                 directory_ids,
             )
+        work_items.append((ordinal, entry, directory_id))
 
-        if _resume_knowledge_file(
-            client,
-            knowledge_id=knowledge_id,
-            entry=entry,
-            directory_id=directory_id,
-            candidates_by_hash=candidates_by_hash,
-            on_status=on_status,
-            interactive_status=interactive_status,
-        ):
-            reused += 1
-            continue
+    if not work_items:
+        return {
+            "added": len(added),
+            "modified": len(modified),
+            "deleted": len(deleted),
+            "unmodified": int(diff.get("unmodified_count") or 0),
+            "uploaded": 0,
+            "reused": 0,
+        }
 
-        _upload_knowledge_sync_file(
-            client,
-            knowledge_id=knowledge_id,
-            entry=entry,
-            directory_id=directory_id,
-            ordinal=ordinal,
-            total=len(files_to_upload),
-            on_status=on_status,
-            interactive_status=interactive_status,
+    concurrency = min(_knowledge_sync_concurrency(), len(work_items))
+    progress_lock = threading.Lock()
+    completed_count = 0
+    reused = 0
+    uploaded_count = 0
+    active: dict[str, str] = {}
+
+    def display_path(entry: dict[str, Any]) -> str:
+        return (
+            f"{entry['path']}/{entry['filename']}"
+            if entry["path"]
+            else str(entry["filename"])
         )
-        uploaded_count += 1
+
+    def emit_progress(latest: str | None = None) -> None:
+        if on_status is None:
+            return
+        with progress_lock:
+            active_count = len(active)
+            done = completed_count
+            suffix = f" · {latest}" if latest else ""
+            message = (
+                f"knowledge sync · {done}/{len(work_items)} complete · "
+                f"{active_count} in flight · concurrency {concurrency}{suffix}"
+            )
+        on_status(message)
+
+    def process_item(
+        ordinal: int,
+        entry: dict[str, Any],
+        directory_id: str | None,
+    ) -> str:
+        nonlocal completed_count, reused, uploaded_count
+        path_label = display_path(entry)
+
+        with progress_lock:
+            active[path_label] = "starting"
+        emit_progress(path_label)
+
+        def worker_status(message: str) -> None:
+            # Preserve only the latest per-file state; expose aggregate sync
+            # progress instead of allowing concurrent workers to fight over
+            # the single terminal status line.
+            with progress_lock:
+                active[path_label] = message
+            emit_progress(path_label)
+
+        try:
+            if _resume_knowledge_file(
+                client,
+                knowledge_id=knowledge_id,
+                entry=entry,
+                directory_id=directory_id,
+                candidates_by_hash=candidates_by_hash,
+                on_status=worker_status,
+                interactive_status=False,
+            ):
+                outcome = "resumed"
+            else:
+                _upload_knowledge_sync_file(
+                    client,
+                    knowledge_id=knowledge_id,
+                    entry=entry,
+                    directory_id=directory_id,
+                    ordinal=ordinal,
+                    total=len(work_items),
+                    on_status=worker_status,
+                    interactive_status=False,
+                )
+                outcome = "uploaded"
+
+            with progress_lock:
+                if outcome == "resumed":
+                    reused += 1
+                else:
+                    uploaded_count += 1
+                completed_count += 1
+                active.pop(path_label, None)
+            emit_progress(f"{path_label} · {outcome}")
+            return outcome
+        except Exception:
+            with progress_lock:
+                active.pop(path_label, None)
+            emit_progress(f"{path_label} · failed")
+            raise
+
+    if on_status is not None:
+        on_status(
+            f"knowledge sync · starting {len(work_items)} files · "
+            f"concurrency {concurrency}"
+        )
+
+    futures = []
+    with ThreadPoolExecutor(
+        max_workers=concurrency,
+        thread_name_prefix="owui-kb",
+    ) as executor:
+        for ordinal, entry, directory_id in work_items:
+            futures.append(
+                executor.submit(
+                    process_item,
+                    ordinal,
+                    entry,
+                    directory_id,
+                )
+            )
+
+        try:
+            for future in as_completed(futures):
+                future.result()
+        except Exception:
+            # Stop work that has not started yet. Running requests are allowed
+            # to unwind normally so httpx/background processing is not left in
+            # an indeterminate local state.
+            for future in futures:
+                future.cancel()
+            raise
 
     return {
         "added": len(added),
