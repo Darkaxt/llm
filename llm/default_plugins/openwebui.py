@@ -1091,6 +1091,57 @@ def _sync_knowledge_folder(
         if path and directory_id
     }
 
+    wanted = {
+        (str(item.get("path") or ""), str(item.get("filename") or ""))
+        for item in [*added, *modified]
+        if isinstance(item, dict)
+    }
+    files_to_upload = [
+        entry
+        for entry in manifest
+        if (entry["path"], entry["filename"]) in wanted
+    ]
+
+    # Detect an interrupted population before making any further server-side
+    # changes. A file that sync/diff says is missing but that already has a
+    # prior upload record for this KB is an inconsistent/orphaned state.
+    if detect_interrupted and files_to_upload:
+        candidates_by_hash = _knowledge_file_candidates(
+            client,
+            knowledge_id,
+        )
+        interrupted: list[str] = []
+        for entry in files_to_upload:
+            matching = []
+            for candidate in candidates_by_hash.get(str(entry["checksum"]), []):
+                meta = candidate.get("meta") or {}
+                meta_name = meta.get("name") if isinstance(meta, dict) else None
+                candidate_name = str(
+                    meta_name or candidate.get("filename") or ""
+                )
+                if candidate_name == str(entry["filename"]):
+                    matching.append(candidate)
+            if matching:
+                display = (
+                    f"{entry['path']}/{entry['filename']}"
+                    if entry["path"]
+                    else str(entry["filename"])
+                )
+                interrupted.append(display)
+
+        if interrupted:
+            preview = ", ".join(interrupted[:5])
+            if len(interrupted) > 5:
+                preview += f", … (+{len(interrupted) - 5} more)"
+            raise click.ClickException(
+                "Interrupted knowledge population detected: "
+                f"{len(interrupted)} file(s) are missing from the KB but matching "
+                "prior Open WebUI uploads already exist. No KB changes were made. "
+                "Run: llm openwebui knowledge rebuild "
+                f"\"{knowledge.get('name') or knowledge_id}\". "
+                f"Examples: {preview}"
+            )
+
     stale_ids = [
         str(item.get("file_id"))
         for item in deleted
@@ -1128,31 +1179,7 @@ def _sync_knowledge_folder(
             directory_ids,
         )
 
-    wanted = {
-        (str(item.get("path") or ""), str(item.get("filename") or ""))
-        for item in [*added, *modified]
-        if isinstance(item, dict)
-    }
-    files_to_upload = [
-        entry
-        for entry in manifest
-        if (entry["path"], entry["filename"]) in wanted
-    ]
-
-    candidates_by_hash = (
-        _knowledge_file_candidates(client, knowledge_id)
-        if detect_interrupted
-        else {}
-    )
-
-    # Resolve target directories and detect interrupted-population leftovers.
-    # Normal sync is intentionally conservative: if Open WebUI already has an
-    # unlinked upload matching a file that sync/diff says is missing, do not
-    # enter a slow repair/re-embedding path automatically. Fail fast and direct
-    # the user to the explicit rebuild workflow instead.
     work_items: list[tuple[int, dict[str, Any], str | None]] = []
-    interrupted: list[str] = []
-
     for ordinal, entry in enumerate(files_to_upload, start=1):
         directory_id = (
             directory_ids.get(entry["path"])
@@ -1166,39 +1193,7 @@ def _sync_knowledge_folder(
                 entry["path"],
                 directory_ids,
             )
-
-        candidate = (
-            _select_resume_candidate(
-                entry,
-                directory_id,
-                candidates_by_hash,
-            )
-            if detect_interrupted
-            else None
-        )
-        if candidate is not None:
-            display = (
-                f"{entry['path']}/{entry['filename']}"
-                if entry["path"]
-                else str(entry["filename"])
-            )
-            interrupted.append(display)
-            continue
-
         work_items.append((ordinal, entry, directory_id))
-
-    if interrupted:
-        preview = ", ".join(interrupted[:5])
-        if len(interrupted) > 5:
-            preview += f", … (+{len(interrupted) - 5} more)"
-        raise click.ClickException(
-            "Interrupted knowledge population detected: "
-            f"{len(interrupted)} file(s) are missing from the KB but matching "
-            "prior Open WebUI uploads already exist. Refusing slow/ambiguous "
-            "automatic recovery. Run: llm openwebui knowledge rebuild "
-            f"\"{knowledge.get('name') or knowledge_id}\". "
-            f"Examples: {preview}"
-        )
 
     if not work_items:
         return {
