@@ -204,11 +204,9 @@ def _build_browser_chat_body(
             "content": last_user_content,
             "timestamp": int(time.time()),
         },
-        "tool_ids": tool_ids or None,
+        "tool_ids": tool_ids,
         "tool_servers": [],
-        "files": files or None,
-        "filter_ids": None,
-        "skill_ids": None,
+        "files": files or [],
         "features": {
             "image_generation": False,
             "code_interpreter": False,
