@@ -278,8 +278,6 @@ def _structured_tool_events(output: Any) -> list[dict[str, Any]]:
     return events
 
 
-
-
 def _reconcile_answer_snapshot(
     answer: str,
     state: dict[str, Any],

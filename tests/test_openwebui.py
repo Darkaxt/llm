@@ -1798,7 +1798,6 @@ def test_tide_v3_exact_path_no_global_basename_collision(
     )
 
 
-
 def _openwebui_stream_test_state():
     return {
         "answer": "",
@@ -1817,14 +1816,15 @@ def test_openwebui_response_completion_streams_tokens_before_final_snapshot():
     state = _openwebui_stream_test_state()
     chunks = []
     statuses = []
-    callback = lambda data: openwebui_socket._consume_response_completion(
-        data,
-        state,
-        on_text=chunks.append,
-        on_reasoning=lambda value: None,
-        on_tool=lambda value: None,
-        on_status=statuses.append,
-    )
+    def callback(data):
+        return openwebui_socket._consume_response_completion(
+            data,
+            state,
+            on_text=chunks.append,
+            on_reasoning=lambda value: None,
+            on_tool=lambda value: None,
+            on_status=statuses.append,
+        )
     assert callback({
         "type": "response.output_text.delta",
         "item_id": "msg_1",
@@ -1855,14 +1855,15 @@ def test_openwebui_response_completion_streams_tokens_before_final_snapshot():
 def test_openwebui_response_completion_streams_reasoning_in_order():
     state = _openwebui_stream_test_state()
     chunks = []
-    callback = lambda data: openwebui_socket._consume_response_completion(
-        data,
-        state,
-        on_text=lambda value: None,
-        on_reasoning=chunks.append,
-        on_tool=lambda value: None,
-        on_status=lambda value: None,
-    )
+    def callback(data):
+        return openwebui_socket._consume_response_completion(
+            data,
+            state,
+            on_text=lambda value: None,
+            on_reasoning=chunks.append,
+            on_tool=lambda value: None,
+            on_status=lambda value: None,
+        )
     for fragment in ("Check ", "the logs"):
         assert callback({
             "type": "response.reasoning_text.delta",
@@ -1890,14 +1891,15 @@ def test_openwebui_response_completion_tool_start_and_result_are_live():
     state = _openwebui_stream_test_state()
     activity = []
     statuses = []
-    callback = lambda data: openwebui_socket._consume_response_completion(
-        data,
-        state,
-        on_text=lambda value: None,
-        on_reasoning=lambda value: None,
-        on_tool=activity.append,
-        on_status=statuses.append,
-    )
+    def callback(data):
+        return openwebui_socket._consume_response_completion(
+            data,
+            state,
+            on_text=lambda value: None,
+            on_reasoning=lambda value: None,
+            on_tool=activity.append,
+            on_status=statuses.append,
+        )
     item = {
         "type": "function_call",
         "call_id": "call_1",
