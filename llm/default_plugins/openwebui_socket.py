@@ -530,7 +530,12 @@ def _build_browser_chat_body(
     message_id: str,
     user_message_id: str,
 ) -> dict[str, Any]:
-    """Build the current Open WebUI browser-compatible chat request payload."""
+    """Build an Open WebUI 0.11.3 compatible Socket.IO chat payload.
+
+    The website's new-chat request omits chat_id and messages so the server
+    persists history itself; the CLI deliberately supplies a temporary chat_id
+    and explicit messages so its pre-resolved local KB context is preserved.
+    """
     last_user_content = ""
     for message in reversed(messages):
         if message.get("role") == "user":
@@ -544,11 +549,20 @@ def _build_browser_chat_body(
     body = {
         "model": model,
         "model_item": model_item or {"id": model},
+        # The browser's new-chat request leaves messages absent and lets the
+        # server build conversation history. We retain the explicit messages
+        # here because the CLI injects the pre-resolved TIDE KB context and
+        # manages its own local conversation state. This is deliberate.
         "messages": messages,
         "stream": True,
         "params": dict(params or {}),
+        # v0.11.3 browser sends message_ids for model fan-out. Keep id as
+        # backward-compatible fallback for older Open WebUI deployments.
         "chat_id": chat_id,
         "id": message_id,
+        "message_ids": [
+            {"model_id": model, "message_id": message_id, "modelIdx": 0}
+        ],
         "parent_id": None,
         "user_message": {
             "id": user_message_id,
@@ -557,6 +571,7 @@ def _build_browser_chat_body(
             "role": "user",
             "content": last_user_content,
             "timestamp": int(time.time()),
+            "models": [model],
         },
         "tool_ids": tool_ids,
         "tool_servers": [],

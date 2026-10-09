@@ -761,7 +761,7 @@ def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
     "transport, sessionless, function_calling",
     [
         ("background_legacy", False, "legacy"),
-        ("background_native", False, "native"),
+        ("background_native", False, None),
     ],
 )
 def test_enabled_knowledge_is_prefetched_without_forced_rag(
@@ -793,7 +793,7 @@ def test_enabled_knowledge_is_prefetched_without_forced_rag(
         lambda client, model_id: {
             "id": model_id,
             "name": "GLM",
-            "info": {"meta": {"capabilities": {"builtin_tools": False}}},
+            "info": {"meta": {"capabilities": {"builtin_tools": True}}},
         },
     )
     monkeypatch.setattr(
@@ -865,6 +865,7 @@ def test_enabled_knowledge_is_prefetched_without_forced_rag(
     assert calls[0]["files"] == []
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert calls[0]["params"].get("function_calling") == function_calling
+    assert calls[0]["params"]["tool_approval_mode"] == "full"
     assert calls[0]["sessionless_server_tools"] is sessionless
     assert calls[0]["messages"][0]["role"] == "system"
     assert "resolved TIDE" in calls[0]["messages"][0]["content"]
@@ -1305,6 +1306,12 @@ def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
 
     assert body["model_item"] == model_item
     assert body["files"] == [collection]
+    assert body["message_ids"] == [
+        {"model_id": "deepseek-v41-flash", "message_id": "assistant-1", "modelIdx": 0}
+    ]
+    # Explicit system context is a deliberate difference from browser-new-chat
+    # requests: the CLI's TIDE knowledge has already been resolved locally.
+    assert body["messages"][0] == {"role": "system", "content": "system"}
     assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert body["params"] == {"temperature": 0.2}
     assert body["parent_id"] is None
@@ -1318,6 +1325,7 @@ def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
         "role": "user",
         "content": "investigate",
         "timestamp": 1234,
+        "models": ["deepseek-v41-flash"],
     }
 
 
@@ -1340,6 +1348,7 @@ def test_browser_chat_body_can_omit_session_id_for_server_tools(monkeypatch):
 
     assert "session_id" not in body
     assert body["chat_id"] == "temporary:listener-socket"
+    assert body["message_ids"][0]["model_id"] == "deepseek-v41-flash"
     assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert body["params"] == {}
 
@@ -2223,25 +2232,29 @@ def test_explicit_mcp_search_requires_server_executed_evidence(
         assert result.response_json["tool_calls"] == tool_calls
 
 
-def test_native_mcp_transport_requires_server_disabled_builtins():
-    model = {"id": "glm-5.3", "info": {"meta": {"capabilities": {}}}}
-    with pytest.raises(llm.ModelError, match="builtin_tools=false"):
-        openwebui._require_isolated_native_mcp(model)
-    model["info"]["meta"]["capabilities"]["builtin_tools"] = True
-    with pytest.raises(llm.ModelError, match="builtin_tools=false"):
-        openwebui._require_isolated_native_mcp(model)
-    model["info"]["meta"]["capabilities"]["builtin_tools"] = False
-    openwebui._require_isolated_native_mcp(model)
+@pytest.mark.parametrize(
+    "capabilities, setting",
+    [
+        ({}, None),
+        ({"builtin_tools": True}, True),
+        ({"builtin_tools": False}, False),
+        ({"builtin_tools": "true"}, None),
+    ],
+)
+def test_server_builtin_tool_setting_is_read_only(capabilities, setting):
+    model = {"id": "glm-5.3", "info": {"meta": {"capabilities": capabilities}}}
+    assert openwebui._server_builtin_tools_setting(model) is setting
+    assert model["info"]["meta"]["capabilities"] == capabilities
 
 
-def test_native_mcp_transport_refuses_direct_model_metadata_override():
-    model = {
-        "id": "glm-5.3",
-        "direct": True,
-        "info": {"meta": {"capabilities": {"builtin_tools": False}}},
-    }
-    with pytest.raises(llm.ModelError, match="builtin_tools=false"):
-        openwebui._require_isolated_native_mcp(model)
+def test_server_builtin_tool_setting_accepts_missing_or_malformed_metadata():
+    for model in (
+        {"id": "glm-5.3"},
+        {"id": "glm-5.3", "info": None},
+        {"id": "glm-5.3", "info": "unexpected"},
+        {"id": "glm-5.3", "info": {"meta": None}},
+    ):
+        assert openwebui._server_builtin_tools_setting(model) is None
 
 
 @pytest.mark.usefixtures("supported_openwebui_server")
@@ -2284,17 +2297,17 @@ def test_sessionless_native_rejected_before_tool_submission(monkeypatch):
         list(model.execute(prompt, True, SimpleNamespace(response_json=None), None))
 
 
-def test_default_openwebui_mcp_transport_is_safe_legacy():
+def test_default_openwebui_mcp_transport_uses_browser_native_loop():
     model = openwebui.OpenWebUIModel("glm-5.3")
-    assert model.Options().openwebui_mcp_transport == "background_legacy"
+    assert model.Options().openwebui_mcp_transport == "background_native"
 
 
 @pytest.mark.parametrize(
-    "builtin_tools, expected_ready",
-    [(True, False), (None, False), (False, True)],
+    "builtin_tools",
+    [True, None, False],
 )
 def test_openwebui_doctor_reports_native_mcp_readiness(
-    monkeypatch, builtin_tools, expected_ready
+    monkeypatch, builtin_tools
 ):
     from click.testing import CliRunner
 
@@ -2323,12 +2336,14 @@ def test_openwebui_doctor_reports_native_mcp_readiness(
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload["iterative_mcp_ready"] is expected_ready
+    assert payload["iterative_mcp_ready"] is True
     assert payload["server_builtin_tools"] is builtin_tools
     assert payload["selected_tool_ids"] == ["server:mcp:splunk-mcp"]
-    assert payload["recommended_transport"] == (
-        "background_native" if expected_ready else "background_legacy (one-shot)"
-    )
+    assert payload["recommended_transport"] == "background_native"
+    assert payload["native_mcp_isolated"] is (builtin_tools is False)
+    assert payload["server_added_builtins_possible"] is (builtin_tools is not False)
+    assert payload["action"] is None
+    assert "browser" in payload["note"].lower()
 
 
 
@@ -2383,3 +2398,38 @@ def test_native_openwebui_sequential_mcp_results_are_both_captured():
     ]
     assert counts == [2, 3]
     assert len([item for item in activity if " done" in item]) == 2
+
+
+def test_capture_browser_native_mcp_contract_without_server_model_edits():
+    # Captured from the corporate website's new-chat POST (schema only).
+    # Browser sends session_id, message_ids, tool_ids, and no
+    # params.function_calling override. Native is the server default.
+    model_item = {
+        "id": "glm-5.3",
+        "info": {"meta": {"capabilities": {"builtin_tools": True}}},
+    }
+    body = openwebui_socket._build_browser_chat_body(
+        model="glm-5.3",
+        model_item=model_item,
+        messages=[
+            {"role": "system", "content": "Resolved TIDE evidence"},
+            {"role": "user", "content": "Investigate this notable"},
+        ],
+        tool_ids=["server:mcp:splunk-mcp"],
+        files=[],
+        params={"tool_approval_mode": "full"},
+        chat_id="temporary:socket-session",
+        session_id="socket-session",
+        message_id="assistant-message",
+        user_message_id="user-message",
+    )
+
+    assert body["session_id"] == "socket-session"
+    assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert body["params"] == {"tool_approval_mode": "full"}
+    assert body["message_ids"] == [
+        {"model_id": "glm-5.3", "message_id": "assistant-message", "modelIdx": 0}
+    ]
+    assert body["user_message"]["models"] == ["glm-5.3"]
+    assert body["model_item"]["info"]["meta"]["capabilities"]["builtin_tools"] is True
+    assert body["messages"][0]["role"] == "system"

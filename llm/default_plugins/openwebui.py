@@ -232,31 +232,22 @@ def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
     ]
 
 
-def _require_isolated_native_mcp(model_item: dict[str, Any]) -> None:
-    """Only enable iterative MCP when Open WebUI will not inject builtins.
+def _server_builtin_tools_setting(model_item: dict[str, Any]) -> bool | None:
+    """Read the server model's capability; unknown means OWUI's enabled default.
 
-    Open WebUI 0.11.3 injects hidden builtins for Socket.IO native calling
-    unless the *server-side* model's meta.capabilities.builtin_tools is False.
-    A client-supplied model_item cannot override that server-side capability.
-    We therefore refuse native mode unless /api/models explicitly advertises
-    builtin_tools=False. Do not silently turn on additional tools.
+    Browser-equivalent native calling sends a Socket.IO session_id. Open WebUI
+    decides whether to inject additional builtins from its own model metadata;
+    the caller cannot suppress those tools by changing model_item in the POST.
     """
-    meta = (model_item.get("info") or {}).get("meta") or {}
-    capabilities = meta.get("capabilities") or {}
-    if (
-        not isinstance(capabilities, dict)
-        or capabilities.get("builtin_tools") is not False
-        or model_item.get("direct") is True
-    ):
-        raise llm.ModelError(
-            "Iterative Open WebUI MCP requires the server-side model setting "
-            "'info.meta.capabilities.builtin_tools=false'. "
-            "In Open WebUI, create/configure an accessible model with "
-            "Built-in Tools disabled, refresh the CLI model catalogue, "
-            "and select -o openwebui_mcp_transport background_native. "
-            "The current model has builtin tools enabled or unspecified; "
-            "refusing to silently expose them alongside Splunk MCP."
-        )
+    info = model_item.get("info")
+    meta = info.get("meta") if isinstance(info, dict) else None
+    capabilities = meta.get("capabilities") if isinstance(meta, dict) else None
+    value = (
+        capabilities.get("builtin_tools")
+        if isinstance(capabilities, dict)
+        else None
+    )
+    return value if isinstance(value, bool) else None
 
 
 def _get_model_item(
@@ -2921,7 +2912,7 @@ class OpenWebUIModel(llm.Model):
         openwebui_tools: bool = True
         openwebui_mcp_transport: Literal[
             "sessionless_native", "background_legacy", "background_native"
-        ] = "background_legacy"
+        ] = "background_native"
         openwebui_attachment_context: Literal["auto", "full", "rag"] = "auto"
 
     def __init__(self, remote_model_id: str, display_name: str | None = None):
@@ -3040,12 +3031,10 @@ class OpenWebUIModel(llm.Model):
                         "sessionless_native cannot run Open WebUI's iterative "
                         "server-side MCP tool loop: without session_id the server "
                         "returns HTTP streaming but does not execute tool calls. "
-                        "Use background_native with Built-in Tools disabled in "
-                        "the server model, or background_legacy for a one-shot "
-                        "server-side tool prepass."
+                        "Use background_native for the browser-equivalent "
+                        "iterative tool loop, or background_legacy for a "
+                        "one-shot server-side tool prepass."
                     )
-                if transport == "background_native":
-                    _require_isolated_native_mcp(model_item)
         except (APIError, AuthError) as exc:
             raise llm.ModelError(str(exc)) from exc
 
@@ -3076,6 +3065,14 @@ class OpenWebUIModel(llm.Model):
                     "openwebui_tools": prompt.options.openwebui_tools,
                     "sessionless_server_tools": False,
                     "openwebui_mcp_transport": prompt.options.openwebui_mcp_transport,
+                    "native_tool_scope": (
+                        "selected MCP tools + server-enabled builtins"
+                        if tool_ids
+                        and prompt.options.openwebui_mcp_transport == "background_native"
+                        else "selected tools (legacy prepass)"
+                        if tool_ids
+                        else "none"
+                    ),
                 },
                 "server": {
                     "version": server_version,
@@ -3100,6 +3097,11 @@ class OpenWebUIModel(llm.Model):
             prepare_status(
                 "legacy MCP prepass: tools run before the answer; "
                 "the model cannot request additional searches during generation"
+            )
+        elif tool_ids and prompt.options.openwebui_mcp_transport == "background_native":
+            prepare_status(
+                "native MCP: browser-equivalent iterative calls; "
+                "Open WebUI may also provide server-enabled builtin tools"
             )
 
         def on_text(fragment: str) -> None:
@@ -3159,11 +3161,12 @@ class OpenWebUIModel(llm.Model):
                                     if prompt.options.temperature is not None
                                     else {}
                                 ),
-                                "function_calling": (
-                                    "native"
+                                "tool_approval_mode": "full",
+                                **(
+                                    {"function_calling": "legacy"}
                                     if prompt.options.openwebui_mcp_transport
-                                    == "background_native"
-                                    else "legacy"
+                                    == "background_legacy"
+                                    else {}
                                 ),
                             },
                             timeout=client.timeout,
@@ -3447,7 +3450,7 @@ def register_commands(cli):
         help="Open WebUI model ID to test for iterative MCP readiness",
     )
     def doctor(model_id: str):
-        """Check whether the server can run isolated, iterative MCP calls."""
+        """Check browser-native MCP readiness and report server builtin scope."""
         config = _load_config()
         if not config:
             raise click.ClickException("Open WebUI is not configured")
@@ -3456,37 +3459,35 @@ def register_commands(cli):
             model_item = _get_model_item(client, model_id)
         except (APIError, AuthError, llm.ModelError) as exc:
             raise click.ClickException(str(exc)) from exc
-        info = model_item.get("info") or {}
-        meta = info.get("meta") or {}
-        capabilities = meta.get("capabilities") or {}
-        is_disabled = (
-            isinstance(capabilities, dict)
-            and capabilities.get("builtin_tools") is False
-            and model_item.get("direct") is not True
-        )
+        builtin_setting = _server_builtin_tools_setting(model_item)
         tool_ids = _enabled_tool_ids(config)
+        selected_mcp = [
+            item for item in tool_ids if item.startswith("server:mcp:")
+        ]
+        ready = bool(selected_mcp)
         output = {
             "model": model_id,
             "selected_tool_ids": tool_ids,
-            "server_builtin_tools": (
-                capabilities.get("builtin_tools")
-                if isinstance(capabilities, dict)
-                else None
-            ),
-            "native_mcp_isolated": is_disabled,
-            "iterative_mcp_ready": is_disabled and bool(tool_ids),
+            "server_builtin_tools": builtin_setting,
+            "native_mcp_isolated": builtin_setting is False,
+            "iterative_mcp_ready": ready,
+            "wire_protocol": "socket.io + native/default function calling",
+            "live_execution_verified": False,
             "recommended_transport": (
-                "background_native"
-                if is_disabled and tool_ids
-                else "background_legacy (one-shot)"
+                "background_native" if ready else None
+            ),
+            "server_added_builtins_possible": builtin_setting is not False,
+            "note": (
+                "Native mode uses the same server-side tool loop as the browser. "
+                "The CLI selects only the configured MCP integrations, but "
+                "Open WebUI may also inject its enabled builtin tools."
+                if builtin_setting is not False else
+                "Native mode uses the browser tool loop with no additional "
+                "server builtins advertised by this model."
             ),
             "action": (
-                "Disable Built-in Tools in the Open WebUI model configuration "
-                "and run this command again. Changes must be server-side."
-                if not is_disabled
-                else "Enable a selected MCP tool in the CLI."
-                if not tool_ids
-                else None
+                None if ready else
+                "Select an MCP server using llm openwebui tool enable."
             ),
         }
         click.echo(json.dumps(output, indent=2, ensure_ascii=False))
