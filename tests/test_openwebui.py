@@ -2289,7 +2289,6 @@ def test_default_openwebui_mcp_transport_is_safe_legacy():
     assert model.Options().openwebui_mcp_transport == "background_legacy"
 
 
-
 @pytest.mark.parametrize(
     "builtin_tools, expected_ready",
     [(True, False), (None, False), (False, True)],
@@ -2330,3 +2329,57 @@ def test_openwebui_doctor_reports_native_mcp_readiness(
     assert payload["recommended_transport"] == (
         "background_native" if expected_ready else "background_legacy (one-shot)"
     )
+
+
+
+def test_native_openwebui_sequential_mcp_results_are_both_captured():
+    state = _openwebui_stream_test_state()
+    activity = []
+
+    def receive(payload):
+        return openwebui_socket._consume_response_completion(
+            payload,
+            state,
+            on_text=lambda value: None,
+            on_reasoning=lambda value: None,
+            on_tool=activity.append,
+            on_status=lambda value: None,
+        )
+
+    for index, (call_id, count) in enumerate(
+        (("call-guardduty", 2), ("call-cloudtrail", 3)), start=1
+    ):
+        assert receive(
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": {
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": "splunk-mcp_splunk_run_query",
+                },
+            }
+        )
+        assert receive(
+            {
+                "type": "response.output_item.done",
+                "output_index": index,
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": {"results": [{"count": count}]},
+                },
+            }
+        )
+
+    assert state["tool_done"] == {
+        "call-guardduty": True,
+        "call-cloudtrail": True,
+    }
+    assert len(state["tool_results"]) == 2
+    counts = [
+        item["result"]["results"][0]["count"]
+        for item in state["tool_results"]
+    ]
+    assert counts == [2, 3]
+    assert len([item for item in activity if " done" in item]) == 2

@@ -232,7 +232,6 @@ def _model_cache(client: OpenWebUIClient) -> list[dict[str, str]]:
     ]
 
 
-
 def _require_isolated_native_mcp(model_item: dict[str, Any]) -> None:
     """Only enable iterative MCP when Open WebUI will not inject builtins.
 
@@ -3438,7 +3437,6 @@ def register_commands(cli):
         except (APIError, AuthError) as exc:
             raise click.ClickException(str(exc)) from exc
         click.echo(f"Cached {len(config['models'])} Open WebUI model(s).")
-
 
     @openwebui_group.command(name="doctor")
     @click.option(
