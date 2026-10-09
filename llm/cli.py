@@ -11,6 +11,7 @@ import shutil
 import sqlite3
 import sys
 import textwrap
+import time
 import warnings
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -36,6 +37,7 @@ from llm import (
     Conversation,
     Fragment,
     KeyModel,
+    ModelError,
     Response,
     ServerSideTool,
     Template,
@@ -63,6 +65,10 @@ from llm import (
     user_dir,
 )
 from llm.models import ChainResponse, _BaseChainResponse, _BaseConversation
+
+from .chat_journal import append_record as append_chat_journal_record
+from .chat_journal import ensure_session as ensure_chat_journal_session
+from .chat_journal import journal_path as chat_journal_path
 
 from .logs import (
     LogStore,
@@ -104,33 +110,175 @@ def display_stream_events(events, *, show_reasoning=True):
     """Consume a sync iterator of StreamEvents and write them.
 
     Text events go to stdout. Reasoning events go to stderr in dim style.
-    A newline is written to stderr at each reasoning→text transition so
-    the assistant text starts on a fresh visual line.
+    Transitions in either direction always start on a fresh terminal line so
+    visible reasoning cannot run into answer prose (or vice versa).
     """
-    was_reasoning = False
+    last_visible_type = None
     for event in events:
         if event.type == "text":
-            if was_reasoning and show_reasoning:
+            if last_visible_type == "reasoning" and show_reasoning:
                 click.echo("", err=True)
-                was_reasoning = False
             click.echo(event.chunk, nl=False)
+            last_visible_type = "text"
         elif event.type == "reasoning" and show_reasoning:
-            was_reasoning = True
+            if last_visible_type == "text":
+                click.echo("", err=True)
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
+            last_visible_type = "reasoning"
 
 
 async def display_async_stream_events(events, *, show_reasoning=True):
     """Async counterpart of display_stream_events."""
-    was_reasoning = False
+    last_visible_type = None
     async for event in events:
         if event.type == "text":
-            if was_reasoning and show_reasoning:
+            if last_visible_type == "reasoning" and show_reasoning:
                 click.echo("", err=True)
-                was_reasoning = False
             click.echo(event.chunk, nl=False)
+            last_visible_type = "text"
         elif event.type == "reasoning" and show_reasoning:
-            was_reasoning = True
+            if last_visible_type == "text":
+                click.echo("", err=True)
             click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
+            last_visible_type = "reasoning"
+
+
+def _build_chat_prompt_session():
+    """Create the interactive multiline chat composer for real terminals."""
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.input.vt100_parser import _IS_PREFIX_OF_LONGER_MATCH_CACHE
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+
+    # prompt_toolkit currently normalizes xterm Shift+Enter to plain Enter.
+    # Re-map the common extended terminal encodings to an otherwise-unused
+    # key so Shift+Enter can remain distinct when the terminal provides it.
+    ANSI_SEQUENCES["\x1b[27;2;13~"] = Keys.F24  # xterm modifyOtherKeys
+    ANSI_SEQUENCES["\x1b[13;2u"] = Keys.F24  # Kitty / CSI-u
+    _IS_PREFIX_OF_LONGER_MATCH_CACHE.clear()
+
+    bindings = KeyBindings()
+
+    @bindings.add("enter", eager=True)
+    def _send(event):
+        event.app.exit(result=event.current_buffer.text)
+
+    @bindings.add("c-j", eager=True)
+    def _newline_ctrl_j(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("f24", eager=True)
+    def _newline_shift_enter(event):
+        event.current_buffer.insert_text("\n")
+
+    @bindings.add("escape", "enter", eager=True)
+    def _newline_meta_enter(event):
+        event.current_buffer.insert_text("\n")
+
+    return PromptSession(
+        multiline=True,
+        key_bindings=bindings,
+        prompt_continuation=lambda width, line_number, is_soft_wrap: "  ",
+        enable_history_search=True,
+    )
+
+
+def _read_chat_prompt(session=None) -> str:
+    # Tests and piped/non-interactive callers keep the existing Click path.
+    if session is None:
+        return click.prompt("", prompt_suffix="> ")
+    return session.prompt("> ")
+
+
+def _chat_export_dir() -> pathlib.Path:
+    return chat_journal_path("_probe_").parent
+
+
+def _chat_export_path(conversation_id: str) -> pathlib.Path:
+    return chat_journal_path(conversation_id)
+
+
+def _serialize_chat_attachment(attachment: Attachment) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": attachment.type,
+        "path": attachment.path,
+        "url": attachment.url,
+    }
+    try:
+        payload["id"] = attachment.id()
+    except Exception:
+        pass
+    if attachment.content is not None:
+        payload["content_size"] = len(attachment.content)
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _serialize_chat_fragment(fragment: Fragment) -> dict[str, Any]:
+    payload = {
+        "source": getattr(fragment, "source", None),
+        "content": getattr(fragment, "content", None),
+    }
+    if payload["content"] is None:
+        payload["content"] = str(fragment)
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _write_conversation_jsonl(
+    db,
+    conversation: _BaseConversation,
+    *,
+    model_label: str,
+) -> pathlib.Path:
+    """Ensure the durable append-only JSONL journal exists."""
+    return ensure_chat_journal_session(
+        conversation.id,
+        model=model_label,
+        name=conversation.name,
+    )
+
+
+def _append_completed_turn_jsonl(
+    db,
+    conversation: _BaseConversation,
+    *,
+    model_label: str,
+    turn_id: str,
+    response: Any,
+) -> None:
+    rows = merged_log_rows(LogStore(db), thread_id=conversation.id)
+    row = rows[0] if rows else None
+    if row is not None:
+        attachments_by_id = annotate_log_rows(db, [row], expand=True)
+        row = dict(row)
+        row["attachments"] = [
+            {k: v for k, v in attachment.items() if k != "response_id"}
+            for attachment in attachments_by_id.get(row["id"], [])
+        ]
+
+    append_chat_journal_record(
+        conversation.id,
+        {
+            "type": "turn_completed",
+            "turn_id": turn_id,
+            "model": model_label,
+            "db_turn": row,
+            "provider_response_json": getattr(response, "response_json", None),
+        },
+    )
+
+
+
+def _chat_turn_headers_enabled() -> bool:
+    return bool(
+        getattr(sys.stdin, "isatty", lambda: False)()
+        and getattr(sys.stdout, "isatty", lambda: False)()
+    )
+
+
+def _print_chat_turn_header(label: str) -> None:
+    click.echo()
+    click.echo(click.style(f"── {label} ──", bold=True))
 
 
 def _run_chat(
@@ -143,12 +291,24 @@ def _run_chat(
     transform_prompt=None,
     after_response=None,
     show_reasoning=True,
+    conversation=None,
+    export_jsonl=True,
 ):
     """Run the terminal chat loop shared by managed and transient models."""
     click.echo(f"Chatting with {model_label}")
+    if conversation is not None:
+        click.echo(f"Conversation ID: {conversation.id}")
+        if db is not None and export_jsonl:
+            export_path = _write_conversation_jsonl(
+                db,
+                conversation,
+                model_label=model_label,
+            )
+            click.echo(f"Autosave JSONL: {export_path}")
     click.echo("Type 'exit' or 'quit' to exit")
-    click.echo("Type '!multi' to enter multiple lines, then '!end' to finish")
+    click.echo("Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)")
     click.echo("Type '!edit' to open your default editor and modify the prompt")
+    click.echo("Press Ctrl+C during generation to cancel the current response")
     if db is not None:
         click.echo(
             "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
@@ -156,66 +316,186 @@ def _run_chat(
 
     argument_fragments = list(initial_fragments or [])
     argument_attachments = list(initial_attachments or [])
-    in_multi = False
-    accumulated = []
-    accumulated_fragments = []
-    accumulated_attachments = []
-    end_token = "!end"
+    prompt_session = _build_chat_prompt_session() if sys.stdin.isatty() and sys.stdout.isatty() else None
+
+    turn_headers = _chat_turn_headers_enabled()
+    turn_counter = 0
+    last_failed = None
 
     while True:
-        prompt = click.prompt("", prompt_suffix="> " if not in_multi else "")
-        fragments = []
-        attachments = []
-        if argument_fragments:
-            fragments += argument_fragments
-            # Fragments from command options are added to the first message only.
-            argument_fragments = []
-        if argument_attachments:
-            attachments = argument_attachments
-            argument_attachments = []
-        if prompt.strip().startswith("!multi"):
-            in_multi = True
-            bits = prompt.strip().split()
-            if len(bits) > 1:
-                end_token = "!end {}".format(" ".join(bits[1:]))
+        if turn_headers:
+            _print_chat_turn_header("You")
+        prompt = _read_chat_prompt(prompt_session)
+        retry_of = None
+        if prompt.strip() in ("!retry", "!retry-force"):
+            if last_failed is None:
+                click.echo("No failed or cancelled turn to retry.", err=True)
+                continue
+            if (
+                prompt.strip() == "!retry"
+                and conversation is not None
+                and model_label.startswith("openwebui/")
+                and export_jsonl
+            ):
+                # Prevent silently replaying MCP searches already checkpointed.
+                from .openwebui_recovery import CheckpointError, load_recovery
+
+                try:
+                    saved = load_recovery(conversation.id)
+                except CheckpointError as exc:
+                    click.echo(
+                        "Open WebUI recovery evidence cannot be verified: "
+                        f"{exc}. Refusing to silently replay any remote tool "
+                        "calls. Use !retry-force only if you intentionally "
+                        "want to repeat the original request.",
+                        err=True,
+                    )
+                    continue
+                click.echo(
+                    f"{len(saved['checkpoints'])} completed MCP/tool result(s) "
+                    f"are checkpointed. Use 'llm openwebui resume "
+                    f"{conversation.id}' to continue without replaying them. "
+                    "Use !retry-force only to intentionally restart.",
+                    err=True,
+                )
+                continue
+            prompt, failed_fragments, failed_attachments, retry_of = last_failed
+            fragments = list(failed_fragments)
+            attachments = list(failed_attachments)
+        else:
+            fragments = []
+            attachments = []
+            if argument_fragments:
+                fragments += argument_fragments
+                # Fragments from command options apply to the first attempt only.
+                argument_fragments = []
+            if argument_attachments:
+                attachments = argument_attachments
+                argument_attachments = []
+            if prompt.strip() == "!edit":
+                edited_prompt = click.edit()
+                if edited_prompt is None:
+                    click.echo("Editor closed without saving.", err=True)
+                    continue
+                prompt = edited_prompt.strip()
+            if db is not None and prompt.strip().startswith("!fragment "):
+                prompt, fragments, attachments = process_fragments_in_chat(db, prompt)
+
+            if prompt.strip() in ("exit", "quit"):
+                break
+            if transform_prompt is not None:
+                prompt = transform_prompt(prompt)
+
+        turn_counter += 1
+        turn_id = f"{conversation.id if conversation is not None else 'transient'}:{turn_counter}:{time.time_ns()}"
+        if conversation is not None and export_jsonl:
+            record = {
+                "type": "user_message",
+                "turn_id": turn_id,
+                "model": model_label,
+                "prompt": prompt,
+                "fragments": [
+                    _serialize_chat_fragment(fragment)
+                    for fragment in fragments
+                ],
+                "attachments": [
+                    _serialize_chat_attachment(attachment)
+                    for attachment in attachments
+                ],
+            }
+            if retry_of is not None:
+                record["retry_of_turn_id"] = retry_of
+            append_chat_journal_record(conversation.id, record)
+
+        if turn_headers:
+            _print_chat_turn_header("Assistant")
+
+        try:
+            response = prompt_callback(prompt, fragments, attachments)
+
+            def journaled_events():
+                stream = response.stream_events()
+                try:
+                    for event in stream:
+                        if conversation is not None and export_jsonl:
+                            append_chat_journal_record(
+                                conversation.id,
+                                {
+                                    "type": "assistant_stream",
+                                    "turn_id": turn_id,
+                                    "event_type": event.type,
+                                    "chunk": event.chunk,
+                                    "part_index": event.part_index,
+                                    "tool_call_id": event.tool_call_id,
+                                    "tool_name": event.tool_name,
+                                    "server_executed": event.server_executed,
+                                    "redacted": event.redacted,
+                                    "provider_metadata": event.provider_metadata,
+                                    "message_index": event.message_index,
+                                },
+                            )
+                        yield event
+                finally:
+                    # Closing the source generator propagates cancellation to
+                    # an in-flight provider worker (including remote MCP tasks).
+                    close = getattr(stream, "close", None)
+                    if callable(close):
+                        close()
+
+            events_iterator = journaled_events()
+            try:
+                display_stream_events(events_iterator, show_reasoning=show_reasoning)
+            finally:
+                events_iterator.close()
+        except KeyboardInterrupt:
+            last_failed = (prompt, list(fragments), list(attachments), turn_id)
+            if conversation is not None and export_jsonl:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "type": "turn_cancelled",
+                        "turn_id": turn_id,
+                    },
+                )
+            click.echo("\nCancelled current response.", err=True)
             continue
-        if prompt.strip() == "!edit":
-            edited_prompt = click.edit()
-            if edited_prompt is None:
-                click.echo("Editor closed without saving.", err=True)
-                continue
-            prompt = edited_prompt.strip()
-        if db is not None and prompt.strip().startswith("!fragment "):
-            prompt, fragments, attachments = process_fragments_in_chat(db, prompt)
-
-        if in_multi:
-            if prompt.strip() == end_token:
-                prompt = "\n".join(accumulated)
-                fragments = accumulated_fragments
-                attachments = accumulated_attachments
-                in_multi = False
-                accumulated = []
-                accumulated_fragments = []
-                accumulated_attachments = []
-            else:
-                if prompt:
-                    accumulated.append(prompt)
-                accumulated_fragments += fragments
-                accumulated_attachments += attachments
-                continue
-
-        if prompt.strip() in ("exit", "quit"):
-            break
-        if transform_prompt is not None:
-            prompt = transform_prompt(prompt)
-
-        response = prompt_callback(prompt, fragments, attachments)
-        display_stream_events(
-            response.stream_events(),
-            show_reasoning=show_reasoning,
-        )
+        except ModelError as exc:
+            last_failed = (prompt, list(fragments), list(attachments), turn_id)
+            if conversation is not None and export_jsonl:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "type": "turn_error",
+                        "turn_id": turn_id,
+                        "error": str(exc),
+                        "error_class": type(exc).__name__,
+                    },
+                )
+            click.echo(f"\nModel error: {exc}", err=True)
+            continue
+        except Exception as exc:
+            if conversation is not None and export_jsonl:
+                append_chat_journal_record(
+                    conversation.id,
+                    {
+                        "type": "turn_error",
+                        "turn_id": turn_id,
+                        "error": str(exc),
+                        "error_class": type(exc).__name__,
+                    },
+                )
+            raise
         if after_response is not None:
             after_response(response)
+        last_failed = None
+        if conversation is not None and db is not None and export_jsonl:
+            _append_completed_turn_jsonl(
+                db,
+                conversation,
+                model_label=model_label,
+                turn_id=turn_id,
+                response=response,
+            )
         print()
 
 
@@ -1205,6 +1485,23 @@ def prompt(
     help="Continue the conversation with the given ID.",
 )
 @click.option(
+    "attachments",
+    "-a",
+    "--attachment",
+    type=AttachmentType(),
+    multiple=True,
+    help="Attachment path or URL or -",
+)
+@click.option(
+    "attachment_types",
+    "--at",
+    "--attachment-type",
+    type=(str, str),
+    multiple=True,
+    callback=attachment_types_callback,
+    help="Attachment with explicit mimetype, --at FILE MIME",
+)
+@click.option(
     "fragments",
     "-f",
     "--fragment",
@@ -1249,6 +1546,8 @@ def chat(
     model_id,
     _continue,
     conversation_id,
+    attachments,
+    attachment_types,
     fragments,
     system_fragments,
     template,
@@ -1299,6 +1598,9 @@ def chat(
             raise click.ClickException(str(ex))
         if model_id is None and template_obj.model:
             model_id = template_obj.model
+        attachments, attachment_types = _merge_template_attachments(
+            template_obj, attachments, attachment_types
+        )
         tools, python_tools = _merge_template_tools(template_obj, tools, python_tools)
 
     # Figure out which model we are using
@@ -1370,9 +1672,13 @@ def chat(
             if isinstance(fragment, Fragment)
         ]
         argument_attachments = [
-            attachment
-            for attachment in fragments_and_attachments
-            if isinstance(attachment, Attachment)
+            *attachments,
+            *attachment_types,
+            *[
+                attachment
+                for attachment in fragments_and_attachments
+                if isinstance(attachment, Attachment)
+            ],
         ]
         argument_system_fragments = resolve_fragments(db, system_fragments)
     except FragmentNotFound as ex:
@@ -1395,10 +1701,15 @@ def chat(
             **kwargs,
         )
 
-        # System prompt and system fragments only sent for the first message
+        # Do not consume the system prompt until a response completes.
+        # An initial transport error must leave it intact for !retry.
+        return response
+
+    def save_completed_chat_response(response):
+        nonlocal system, argument_system_fragments
+        response.log_to_db(db)
         system = None
         argument_system_fragments = []
-        return response
 
     _run_chat(
         model.model_id,
@@ -1407,8 +1718,9 @@ def chat(
         initial_fragments=argument_fragments,
         initial_attachments=argument_attachments,
         transform_prompt=transform_chat_prompt,
-        after_response=lambda response: response.log_to_db(db),
+        after_response=save_completed_chat_response,
         show_reasoning=not hide_reasoning,
+        conversation=conversation,
     )
 
 

@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import textwrap
+from types import SimpleNamespace
 from unittest.mock import ANY
 
 import pytest
@@ -9,6 +10,14 @@ from click.testing import CliRunner
 
 import llm.cli
 from llm.logs import LogStore, merged_log_rows
+
+
+def _strip_chat_session_banner(output):
+    return re.sub(
+        r"Conversation ID: [^\\n]+\\nAutosave JSONL: [^\\n]+\\n",
+        "",
+        output,
+    )
 
 
 def logged_rows(db):
@@ -43,11 +52,12 @@ def test_chat_basic(mock_model, logs_db):
         catch_exceptions=False,
     )
     assert result.exit_code == 0
-    assert result.output == (
+    assert _strip_chat_session_banner(result.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
-        "\nType '!multi' to enter multiple lines, then '!end' to finish"
+        "\nEnter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
         "\nType '!edit' to open your default editor and modify the prompt"
+        "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         "\n> Hi"
         "\none world"
@@ -92,11 +102,12 @@ def test_chat_basic(mock_model, logs_db):
         catch_exceptions=False,
     )
     assert result2.exit_code == 0
-    assert result2.output == (
+    assert _strip_chat_session_banner(result2.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
-        "\nType '!multi' to enter multiple lines, then '!end' to finish"
+        "\nEnter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
         "\nType '!edit' to open your default editor and modify the prompt"
+        "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         "\n> Continue"
         "\ncontinued"
@@ -128,11 +139,12 @@ def test_chat_system(mock_model, logs_db):
         input="Hi\nquit\n",
     )
     assert result.exit_code == 0
-    assert result.output == (
+    assert _strip_chat_session_banner(result.output) == (
         "Chatting with mock"
         "\nType 'exit' or 'quit' to exit"
-        "\nType '!multi' to enter multiple lines, then '!end' to finish"
+        "\nEnter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
         "\nType '!edit' to open your default editor and modify the prompt"
+        "\nPress Ctrl+C during generation to cancel the current response"
         "\nType '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         "\n> Hi"
         "\nI am mean"
@@ -301,12 +313,13 @@ def test_chat_tools(logs_db):
         catch_exceptions=False,
     )
     assert result.exit_code == 0
-    normalized_output = re.sub(r"tc_[0-9a-z]{26}", "tc_TCID", result.output)
+    normalized_output = re.sub(r"tc_[0-9a-z]{26}", "tc_TCID", _strip_chat_session_banner(result.output))
     assert normalized_output == (
         "Chatting with echo\n"
         "Type 'exit' or 'quit' to exit\n"
-        "Type '!multi' to enter multiple lines, then '!end' to finish\n"
+        "Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)\n"
         "Type '!edit' to open your default editor and modify the prompt\n"
+        "Press Ctrl+C during generation to cancel the current response\n"
         "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments\n"
         '> {"prompt": "Convert hello to uppercase", "tool_calls": [{"name": "upper", '
         '"arguments": {"text": "hello"}}]}\n'
@@ -356,3 +369,337 @@ def test_chat_fragments(tmpdir):
     ).output
     assert '"prompt": "one' in output
     assert '"prompt": "two"' in output
+
+
+
+def test_run_chat_ctrl_c_cancels_current_response(monkeypatch, capsys):
+    prompts = iter(["hello", "quit"])
+    monkeypatch.setattr(
+        llm.cli.click,
+        "prompt",
+        lambda *args, **kwargs: next(prompts),
+    )
+
+    class FakeResponse:
+        def stream_events(self):
+            return iter(())
+
+    monkeypatch.setattr(
+        llm.cli,
+        "display_stream_events",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    after = []
+    llm.cli._run_chat(
+        "mock",
+        lambda prompt, fragments, attachments: FakeResponse(),
+        after_response=lambda response: after.append(response),
+    )
+
+    captured = capsys.readouterr()
+    assert "Cancelled current response." in captured.err
+    assert after == []
+
+
+
+@pytest.mark.xfail(sys.platform == "win32", reason="Expected to fail on Windows")
+def test_chat_autosaves_jsonl(mock_model, logs_db, user_path):
+    runner = CliRunner()
+    mock_model.enqueue(["saved answer"])
+    result = runner.invoke(
+        llm.cli.cli,
+        ["chat", "-m", "mock"],
+        input="saved prompt\nquit\n",
+        catch_exceptions=False,
+    )
+    assert result.exit_code == 0
+
+    match = re.search(r"Conversation ID: ([^\n]+)", result.output)
+    assert match is not None
+    conversation_id = match.group(1).strip()
+
+    export_path = user_path / "conversations" / f"{conversation_id}.jsonl"
+    assert export_path.exists()
+
+    records = [
+        json.loads(line)
+        for line in export_path.read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    assert records[0]["type"] == "conversation"
+    assert records[0]["conversation_id"] == conversation_id
+    assert records[0]["model"] == "mock"
+
+    user_messages = [
+        record for record in records if record["type"] == "user_message"
+    ]
+    assert len(user_messages) == 1
+    assert user_messages[0]["conversation_id"] == conversation_id
+    assert user_messages[0]["prompt"] == "saved prompt"
+
+    streamed = [
+        record
+        for record in records
+        if record["type"] == "assistant_stream"
+        and record["event_type"] == "text"
+    ]
+    assert "".join(record["chunk"] for record in streamed) == "saved answer"
+
+    completed = [
+        record for record in records if record["type"] == "turn_completed"
+    ]
+    assert len(completed) == 1
+    assert completed[0]["db_turn"]["prompt"] == "saved prompt"
+    assert completed[0]["db_turn"]["response"] == "saved answer"
+
+
+
+def test_read_chat_prompt_noninteractive_uses_click(monkeypatch):
+    monkeypatch.setattr(
+        llm.cli.click,
+        "prompt",
+        lambda *args, **kwargs: "hello",
+    )
+    assert llm.cli._read_chat_prompt(None) == "hello"
+
+
+
+def test_chat_prompt_session_shift_enter_sequences(monkeypatch):
+    from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
+    from prompt_toolkit.keys import Keys
+
+    # Verify the key configuration without constructing a real Windows console.
+    monkeypatch.setattr("prompt_toolkit.PromptSession", lambda **kwargs: kwargs)
+    session_options = llm.cli._build_chat_prompt_session()
+
+    assert session_options["multiline"] is True
+    assert session_options["key_bindings"] is not None
+    assert ANSI_SEQUENCES["\x1b[27;2;13~"] == Keys.F24
+    assert ANSI_SEQUENCES["\x1b[13;2u"] == Keys.F24
+
+
+
+def test_chat_turn_headers_only_for_interactive_tty(monkeypatch):
+    class FakeTTY:
+        def __init__(self, value):
+            self.value = value
+
+        def isatty(self):
+            return self.value
+
+    monkeypatch.setattr(llm.cli.sys, "stdin", FakeTTY(True))
+    monkeypatch.setattr(llm.cli.sys, "stdout", FakeTTY(True))
+    assert llm.cli._chat_turn_headers_enabled() is True
+
+    monkeypatch.setattr(llm.cli.sys, "stdout", FakeTTY(False))
+    assert llm.cli._chat_turn_headers_enabled() is False
+
+
+
+def test_chat_journal_keeps_prompt_on_model_error(tmp_path, monkeypatch):
+    from llm.chat_journal import ensure_session
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-error", name=None)
+    ensure_session(conversation.id, model="mock")
+
+    prompts = iter(["important prompt", "quit"])
+    monkeypatch.setattr(
+        llm.cli,
+        "_read_chat_prompt",
+        lambda session=None: next(prompts),
+    )
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    def fail(prompt, fragments, attachments):
+        raise llm.ModelError("backend failed")
+
+    llm.cli._run_chat(
+        "mock",
+        fail,
+        db=None,
+        conversation=conversation,
+        export_jsonl=True,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "conv-error.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    assert any(
+        record["type"] == "user_message"
+        and record["prompt"] == "important prompt"
+        for record in records
+    )
+    assert any(
+        record["type"] == "turn_error"
+        and record["error"] == "backend failed"
+        for record in records
+    )
+
+
+
+def test_chat_retry_replays_failed_turn_without_retransforming(tmp_path, monkeypatch):
+    from llm.chat_journal import ensure_session
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-retry", name=None)
+    ensure_session(conversation.id, model="mock")
+    prompts = iter(["important investigation", "!retry", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    received = []
+    transforms = []
+    completed = []
+
+    def transform(prompt):
+        transforms.append(prompt)
+        return prompt + " [prepared]"
+
+    class FakeResponse:
+        def stream_events(self):
+            return iter(())
+
+    def invoke(prompt, fragments, attachments):
+        received.append(prompt)
+        if len(received) == 1:
+            raise llm.ModelError("temporary network failure")
+        return FakeResponse()
+
+    llm.cli._run_chat(
+        "mock",
+        invoke,
+        conversation=conversation,
+        transform_prompt=transform,
+        after_response=completed.append,
+    )
+    assert received == [
+        "important investigation [prepared]",
+        "important investigation [prepared]",
+    ]
+    assert transforms == ["important investigation"]
+    assert len(completed) == 1
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "conv-retry.jsonl").read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    attempts = [record for record in records if record["type"] == "user_message"]
+    assert len(attempts) == 2
+    assert attempts[1]["retry_of_turn_id"] == attempts[0]["turn_id"]
+    assert any(record["type"] == "turn_error" for record in records)
+
+
+
+def test_run_chat_ctrl_c_closes_inflight_provider_stream(monkeypatch):
+    prompts = iter(["first prompt", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    closed = []
+
+    class FakeResponse:
+        def stream_events(self):
+            try:
+                yield object()
+            finally:
+                closed.append(True)
+
+    def interrupt_stream(events, **kwargs):
+        next(iter(events))
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(llm.cli, "display_stream_events", interrupt_stream)
+    llm.cli._run_chat("mock", lambda *args: FakeResponse())
+    assert closed == [True]
+
+
+
+def test_chat_retry_does_not_repeat_checkpointed_openwebui_mcp(
+    tmp_path, monkeypatch, capsys
+):
+    from llm.chat_journal import ensure_session
+    from llm import openwebui_recovery
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-mcp-retry", name=None)
+    ensure_session(conversation.id, model="openwebui/glm-5.3")
+
+    prompts = iter(["incident", "!retry", "!retry-force", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+    monkeypatch.setattr(
+        openwebui_recovery,
+        "load_recovery",
+        lambda cid: {"checkpoints": [{"call_id": "call-q1"}]},
+    )
+    attempts = []
+    class EmptyResponse:
+        def stream_events(self):
+            return iter(())
+
+    def invoke(prompt, fragments, attachments):
+        attempts.append(prompt)
+        if len(attempts) == 1:
+            raise llm.ModelError("upstream 300s timeout")
+        return EmptyResponse()
+
+    llm.cli._run_chat(
+        "openwebui/glm-5.3",
+        invoke,
+        conversation=conversation,
+        export_jsonl=True,
+    )
+    # !retry was blocked by a valid tool checkpoint; !retry-force deliberately
+    # sent the same request again.
+    assert attempts == ["incident", "incident"]
+    output = capsys.readouterr().err
+    assert "llm openwebui resume conv-mcp-retry" in output
+    assert "!retry-force" in output
+
+
+
+def test_chat_retry_cannot_silently_replay_corrupt_native_checkpoints(
+    tmp_path, monkeypatch, capsys
+):
+    from llm.chat_journal import ensure_session
+    from llm import openwebui_recovery
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-bad-mcp", name=None)
+    ensure_session(conversation.id, model="openwebui/glm-5.3")
+    prompts = iter(["incident", "!retry", "!retry-force", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    def fail_checkpoint_read(cid):
+        raise openwebui_recovery.CheckpointError("Checkpoint checksum mismatch")
+
+    monkeypatch.setattr(openwebui_recovery, "load_recovery", fail_checkpoint_read)
+    attempted = []
+
+    class EmptyResponse:
+        def stream_events(self):
+            return iter(())
+
+    def invoke(prompt, fragments, attachments):
+        attempted.append(prompt)
+        if len(attempted) == 1:
+            raise llm.ModelError("server disconnected")
+        return EmptyResponse()
+
+    llm.cli._run_chat(
+        "openwebui/glm-5.3", invoke,
+        conversation=conversation, export_jsonl=True,
+    )
+    assert attempted == ["incident", "incident"]
+    assert "checksum mismatch" in capsys.readouterr().err
