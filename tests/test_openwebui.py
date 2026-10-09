@@ -1796,3 +1796,277 @@ def test_tide_v3_exact_path_no_global_basename_collision(
         req.get("directory_id") == "rule" and req.get("query") == "query.spl"
         for req in server.requests
     )
+
+
+
+def _openwebui_stream_test_state():
+    return {
+        "answer": "",
+        "reasoning_blocks": [],
+        "tool_done": {},
+        "tool_results": [],
+        "phase": "initial model",
+        "phase_started_at": 0.0,
+        "last_progress_at": 0.0,
+        "stream_started": False,
+        "stream_delta_count": 0,
+    }
+
+
+def test_openwebui_response_completion_streams_tokens_before_final_snapshot():
+    state = _openwebui_stream_test_state()
+    chunks = []
+    statuses = []
+    callback = lambda data: openwebui_socket._consume_response_completion(
+        data,
+        state,
+        on_text=chunks.append,
+        on_reasoning=lambda value: None,
+        on_tool=lambda value: None,
+        on_status=statuses.append,
+    )
+    assert callback({
+        "type": "response.output_text.delta",
+        "item_id": "msg_1",
+        "output_index": 0,
+        "delta": "Hello",
+    })
+    assert chunks == ["Hello"]
+    assert state["answer"] == "Hello"
+    assert callback({
+        "type": "response.output_text.delta",
+        "item_id": "msg_1",
+        "output_index": 0,
+        "delta": " world",
+    })
+    assert chunks == ["Hello", " world"]
+    assert state["stream_delta_count"] == 2
+    assert statuses == ["live model token stream started"]
+
+    # Periodic/final chat:completion snapshots are authoritative but must not
+    # repeat tokens that the real-time stream already displayed.
+    openwebui_socket._reconcile_answer_snapshot("Hello world", state, chunks.append)
+    assert chunks == ["Hello", " world"]
+    openwebui_socket._reconcile_answer_snapshot("Hello world!", state, chunks.append)
+    assert chunks == ["Hello", " world", "!"]
+    assert state["answer"] == "Hello world!"
+
+
+def test_openwebui_response_completion_streams_reasoning_in_order():
+    state = _openwebui_stream_test_state()
+    chunks = []
+    callback = lambda data: openwebui_socket._consume_response_completion(
+        data,
+        state,
+        on_text=lambda value: None,
+        on_reasoning=chunks.append,
+        on_tool=lambda value: None,
+        on_status=lambda value: None,
+    )
+    for fragment in ("Check ", "the logs"):
+        assert callback({
+            "type": "response.reasoning_text.delta",
+            "item_id": "reasoning_1",
+            "output_index": 0,
+            "delta": fragment,
+        })
+    assert chunks == ["Check ", "the logs"]
+    assert state["reasoning_blocks"] == ["Check the logs"]
+    assert state["phase"] == "model reasoning"
+    assert state["stream_started"] is True
+
+    # Native Responses API reasoning summary messages use their own delta type.
+    assert callback({
+        "type": "response.reasoning_summary_text.delta",
+        "item_id": "reasoning_2",
+        "output_index": 1,
+        "delta": "Next step",
+    })
+    assert chunks[-2:] == ["\n\n", "Next step"]
+    assert state["reasoning_blocks"] == ["Check the logs", "Next step"]
+
+
+def test_openwebui_response_completion_tool_start_and_result_are_live():
+    state = _openwebui_stream_test_state()
+    activity = []
+    statuses = []
+    callback = lambda data: openwebui_socket._consume_response_completion(
+        data,
+        state,
+        on_text=lambda value: None,
+        on_reasoning=lambda value: None,
+        on_tool=activity.append,
+        on_status=statuses.append,
+    )
+    item = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "splunk_search",
+    }
+    assert callback({
+        "type": "response.output_item.added",
+        "output_index": 1,
+        "item": item,
+    })
+    assert state["tool_done"]["call_1"] is False
+    assert activity == ["↳ splunk_search ..."]
+    assert callback({
+        "type": "response.function_call_arguments.delta",
+        "item_id": "call_1",
+        "delta": '{"search": "index=aws"}',
+    })
+    assert state["phase"] == "preparing tool call"
+    assert callback({
+        "type": "response.output_item.done",
+        "output_index": 1,
+        "item": item,
+    })
+    assert state["tool_done"]["call_1"] is False
+    assert state["phase"] == "tool execution"
+    assert callback({
+        "type": "response.output_item.done",
+        "output_index": 2,
+        "item": {
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "1 event found",
+        },
+    })
+    assert activity == ["↳ splunk_search ...", "↳ splunk_search done"]
+    assert state["tool_results"] == [
+        {"name": "splunk_search", "result": "1 event found"}
+    ]
+    assert state["phase"] == "model continuation"
+    assert statuses == ["tool result received; waiting for model continuation"]
+
+
+def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
+    import asyncio
+
+    events = []
+    payloads = [
+        {
+            "type": "response:completion",
+            "data": {
+                "type": "response.reasoning_text.delta",
+                "item_id": "reasoning_1",
+                "output_index": 0,
+                "delta": "Thinking",
+            },
+        },
+        {
+            "type": "response:completion",
+            "data": {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "delta": "Hello",
+            },
+        },
+        {
+            "type": "chat:completion",
+            "data": {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "output_index": 1,
+                "delta": " world",
+            },
+        },
+        {
+            "type": "chat:completion",
+            "data": {
+                "done": True,
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Thinking"}],
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hello world"}],
+                    },
+                ],
+            },
+        },
+    ]
+
+    class FakeHTTPClientSession:
+        def __init__(self, **kwargs):
+            assert kwargs["trust_env"] is True
+
+        async def close(self):
+            pass
+
+    class FakeSocket:
+        def __init__(self, http_session):
+            self.handlers = {}
+
+        def on(self, event, handler):
+            self.handlers[event] = handler
+
+        async def connect(self, url, **kwargs):
+            pass
+
+        def get_sid(self, namespace):
+            return "socket-1"
+
+        async def call(self, method, payload, timeout):
+            assert method == "user-join"
+
+            async def push_stream():
+                for event in payloads:
+                    await asyncio.sleep(0)
+                    await self.handlers["events"]({
+                        "chat_id": "temporary:socket-1",
+                        "data": event,
+                    })
+            asyncio.create_task(push_stream())
+            return {"id": "test-user"}
+
+        async def emit(self, event, payload):
+            pass
+
+        async def disconnect(self):
+            pass
+
+    monkeypatch.setattr(
+        openwebui_socket,
+        "_need_socketio",
+        lambda: SimpleNamespace(AsyncClient=FakeSocket),
+    )
+    monkeypatch.setattr("aiohttp.ClientSession", FakeHTTPClientSession)
+    monkeypatch.setattr(
+        openwebui_socket.http,
+        "json_request",
+        lambda *args, **kwargs: {
+            "status": True,
+            "task_ids": ["task-1"],
+            "chat_id": "temporary:socket-1",
+        },
+    )
+
+    async def run():
+        return await openwebui_socket.run_chat_with_tools_with_files(
+            base_url="https://example.test",
+            token="test-jwt",
+            model="glm-5.3",
+            messages=[{"role": "user", "content": "Hello"}],
+            tool_ids=["server:mcp:splunk-mcp"],
+            timeout=10,
+            on_text=lambda value: events.append(("text", value)),
+            on_reasoning=lambda value: events.append(("reasoning", value)),
+            on_status=lambda value: events.append(("status", value)),
+        )
+
+    result = asyncio.run(run())
+    assert result["answer"] == "Hello world"
+    assert result["reasoning"] == "Thinking"
+    assert result["remote_task_ids"] == ["task-1"]
+    assert [value for kind, value in events if kind == "text"] == [
+        "Hello", " world"
+    ]
+    assert [value for kind, value in events if kind == "reasoning"] == [
+        "Thinking"
+    ]
+    assert ("status", "live model token stream started") in events

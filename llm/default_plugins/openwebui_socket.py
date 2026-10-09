@@ -278,6 +278,134 @@ def _structured_tool_events(output: Any) -> list[dict[str, Any]]:
     return events
 
 
+
+
+def _reconcile_answer_snapshot(
+    answer: str,
+    state: dict[str, Any],
+    on_text: Callable[[str], None],
+) -> None:
+    """Append only genuinely new text from an authoritative full snapshot."""
+    previous = state["answer"]
+    if answer.startswith(previous):
+        suffix = answer[len(previous):]
+        if suffix:
+            on_text(suffix)
+            state["last_progress_at"] = time.monotonic()
+        state["answer"] = answer
+    elif len(answer) > len(previous):
+        # A revised/normalized server snapshot cannot safely rewrite terminal
+        # output that has already streamed. Store its canonical final value
+        # without printing a duplicate or garbled suffix.
+        state["answer"] = answer
+        state["last_progress_at"] = time.monotonic()
+
+
+def _consume_response_completion(
+    data: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    on_text: Callable[[str], None],
+    on_reasoning: Callable[[str], None],
+    on_tool: Callable[[str], None],
+    on_status: Callable[[str], None],
+) -> bool:
+    """Forward live Open WebUI Responses events without waiting for snapshots.
+
+    Open WebUI 0.11.x converts Chat Completions and Responses API streams to
+    Socket.IO response:completion. chat:completion carries reconciliation
+    snapshots and final messages, not per-token updates.
+    """
+    kind = str(data.get("type") or "")
+    is_answer = kind == "response.output_text.delta"
+    is_reasoning = kind in {
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
+    }
+    if is_answer or is_reasoning:
+        delta = data.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return False
+        if not state.get("stream_started"):
+            state["stream_started"] = True
+            on_status("live model token stream started")
+        if is_answer:
+            on_text(delta)
+            state["answer"] += delta
+            phase = "model streaming"
+        else:
+            # Update the same reasoning state read by final-snapshot handling,
+            # preventing the final full reasoning from being shown twice.
+            key = (data.get("item_id"), data.get("output_index"), kind)
+            keys = state.setdefault("reasoning_stream_keys", [])
+            blocks = state["reasoning_blocks"]
+            if key not in keys:
+                keys.append(key)
+                if blocks:
+                    on_reasoning("\n\n")
+                blocks.append("")
+            blocks[keys.index(key)] += delta
+            on_reasoning(delta)
+            phase = "model reasoning"
+        if state.get("phase") != phase:
+            state["phase"] = phase
+            state["phase_started_at"] = time.monotonic()
+        state["last_progress_at"] = time.monotonic()
+        state["stream_delta_count"] = state.get("stream_delta_count", 0) + 1
+        return True
+
+    if kind in {"response.output_item.added", "response.output_item.done"}:
+        item = data.get("item")
+        if not isinstance(item, dict):
+            return False
+        item_type = item.get("type")
+        if item_type == "function_call":
+            name = str(item.get("name") or "")
+            call_id = str(
+                item.get("call_id") or item.get("id")
+                or f"output:{data.get('output_index')}"
+            )
+            if name and call_id not in state["tool_done"]:
+                state["tool_done"][call_id] = False
+                state.setdefault("tool_names", {})[call_id] = name
+                on_tool(f"↳ {name} ...")
+                state["last_progress_at"] = time.monotonic()
+            # Finishing an argument item is not tool execution completing.
+            if kind.endswith(".done"):
+                state["phase"] = "tool execution"
+                state["phase_started_at"] = time.monotonic()
+            return True
+        if item_type == "function_call_output":
+            call_id = str(item.get("call_id") or "")
+            if call_id and not state["tool_done"].get(call_id):
+                name = state.get("tool_names", {}).get(call_id, "tool")
+                state["tool_done"][call_id] = True
+                state["tool_results"].append(
+                    {"name": name, "result": item.get("output")}
+                )
+                on_tool(f"↳ {name} done")
+                on_status("tool result received; waiting for model continuation")
+                state["phase"] = "model continuation"
+                state["phase_started_at"] = time.monotonic()
+                state["last_progress_at"] = time.monotonic()
+            return True
+        return False
+
+    if kind in {
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+    }:
+        # Do not leak complete tool arguments to the terminal status area.
+        # Generating tool arguments still counts as meaningful progress.
+        state["last_progress_at"] = time.monotonic()
+        if state.get("phase") != "preparing tool call":
+            state["phase"] = "preparing tool call"
+            state["phase_started_at"] = time.monotonic()
+        return True
+
+    return False
+
+
 def _build_browser_chat_body(
     *,
     model: str,
@@ -404,21 +532,15 @@ async def run_chat_with_tools_with_files(
         "last_progress_at": time.monotonic(),
         "phase": "initial model",
         "phase_started_at": time.monotonic(),
+        "stream_started": False,
+        "stream_delta_count": 0,
     }
     done = asyncio.Event()
     remote_task_ids: list[str] = []
     remote_chat_id: str | None = None
 
     def _emit_answer_snapshot(answer: str) -> None:
-        if answer.startswith(state["answer"]):
-            delta = answer[len(state["answer"]):]
-            if delta:
-                out_text(delta)
-                state["last_progress_at"] = time.monotonic()
-            state["answer"] = answer
-        elif len(answer) > len(state["answer"]):
-            state["answer"] = answer
-            state["last_progress_at"] = time.monotonic()
+        _reconcile_answer_snapshot(answer, state, out_text)
 
     def _sync_structured_output(output: Any) -> None:
         answer = _structured_output_text(output)
@@ -517,11 +639,21 @@ async def run_chat_with_tools_with_files(
                 _emit_answer_snapshot(content)
             return
 
-        if etype == "response:completion":
-            # These are provider-native Responses API stream events. Current
-            # Open WebUI also emits periodic/final chat:completion snapshots,
-            # which are authoritative and easier to consume here.
-            return
+        if etype in ("response:completion", "chat:completion"):
+            # Open WebUI emits live token and argument deltas here.
+            # Some backends wrap Responses events in chat:completion.
+            if isinstance(data, dict) and str(data.get("type") or "").startswith("response."):
+                _consume_response_completion(
+                    data,
+                    state,
+                    on_text=out_text,
+                    on_reasoning=out_reasoning,
+                    on_tool=out_tool,
+                    on_status=out_status,
+                )
+                return
+            if etype == "response:completion":
+                return
 
         if etype != "chat:completion":
             return
@@ -600,6 +732,11 @@ async def run_chat_with_tools_with_files(
             state["raw_content"] = content
 
         if data.get("done"):
+            if not state["stream_started"] and state["answer"]:
+                out_status(
+                    "final answer received without intermediate token deltas; "
+                    "check upstream streaming support"
+                )
             done.set()
 
     async def _on_events(payload, cb=None):  # type: ignore[no-untyped-def]
