@@ -327,9 +327,37 @@ def _run_chat(
             _print_chat_turn_header("You")
         prompt = _read_chat_prompt(prompt_session)
         retry_of = None
-        if prompt.strip() == "!retry":
+        if prompt.strip() in ("!retry", "!retry-force"):
             if last_failed is None:
                 click.echo("No failed or cancelled turn to retry.", err=True)
+                continue
+            if (
+                prompt.strip() == "!retry"
+                and conversation is not None
+                and model_label.startswith("openwebui/")
+                and export_jsonl
+            ):
+                # Prevent silently replaying MCP searches already checkpointed.
+                from .openwebui_recovery import CheckpointError, load_recovery
+
+                try:
+                    saved = load_recovery(conversation.id)
+                except CheckpointError as exc:
+                    click.echo(
+                        "Open WebUI recovery evidence cannot be verified: "
+                        f"{exc}. Refusing to silently replay any remote tool "
+                        "calls. Use !retry-force only if you intentionally "
+                        "want to repeat the original request.",
+                        err=True,
+                    )
+                    continue
+                click.echo(
+                    f"{len(saved['checkpoints'])} completed MCP/tool result(s) "
+                    f"are checkpointed. Use 'llm openwebui resume "
+                    f"{conversation.id}' to continue without replaying them. "
+                    "Use !retry-force only to intentionally restart.",
+                    err=True,
+                )
                 continue
             prompt, failed_fragments, failed_attachments, retry_of = last_failed
             fragments = list(failed_fragments)

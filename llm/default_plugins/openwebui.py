@@ -21,6 +21,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Literal
 from urllib.parse import quote, urlparse
@@ -28,7 +29,16 @@ from urllib.parse import quote, urlparse
 import click
 import httpx2
 import llm
-from llm.chat_journal import append_record as append_chat_journal_record
+from llm.chat_journal import (
+    append_record as append_chat_journal_record,
+    ensure_session as ensure_chat_journal_session,
+)
+from llm.openwebui_recovery import (
+    CheckpointError,
+    build_resume_messages,
+    load_recovery,
+    save_tool_checkpoint,
+)
 from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
 from llm.parts import AttachmentPart, ReasoningPart, StreamEvent, TextPart, ToolResultPart
 from openwebui_sdk import ChatResult, OpenWebUIClient
@@ -2962,7 +2972,9 @@ class OpenWebUIModel(llm.Model):
             else f"transient:{time.time_ns()}"
         )
 
-        def journal_provider(record: dict[str, Any]) -> None:
+        def journal_provider(
+            record: dict[str, Any], *, durable: bool = False
+        ) -> None:
             if conversation is not None:
                 append_chat_journal_record(
                     conversation.id,
@@ -2971,6 +2983,7 @@ class OpenWebUIModel(llm.Model):
                         "provider_run_id": provider_run_id,
                         **record,
                     },
+                    durable=durable,
                 )
 
         def prepare_status(line: str) -> None:
@@ -3121,11 +3134,17 @@ class OpenWebUIModel(llm.Model):
             events.put(("tool", line))
 
         def on_source(record: dict[str, Any]) -> None:
-            # Native tool calls appear in structured output. Legacy Open WebUI
-            # MCP tools instead return their evidence in chat:completion.sources
-            # before the first model token; without this the JSONL cannot
-            # verify whether the model actually searched Splunk.
+            # Legacy tool evidence is sourced before answer generation.
             journal_provider({"type": "provider_tool_source", **record})
+
+        def on_checkpoint(checkpoint: dict[str, Any]) -> None:
+            # This callback runs synchronously in the Socket.IO event handler.
+            # It must finish writing the complete native tool result before
+            # accepting any more model/tool events. Never only journal a status.
+            if conversation is not None:
+                save_tool_checkpoint(
+                    conversation.id, provider_run_id, checkpoint
+                )
 
         def on_status(line: str) -> None:
             status_activity.append(line)
@@ -3177,6 +3196,7 @@ class OpenWebUIModel(llm.Model):
                             on_tool=on_tool,
                             on_status=on_status,
                             on_source=on_source,
+                            on_checkpoint=on_checkpoint,
                         )
                     )
                     remote_execution.update(
@@ -3184,6 +3204,7 @@ class OpenWebUIModel(llm.Model):
                             "remote_chat_id": data.get("remote_chat_id"),
                             "remote_task_ids": data.get("remote_task_ids", []),
                             "server_tool_sources": data.get("server_tool_sources", []),
+                            "native_checkpoint_count": data.get("native_checkpoint_count", 0),
                             "verified_mcp_tool_results": sum(
                                 1 for source in data.get("server_tool_sources", [])
                                 if source.get("is_mcp") and source.get("server_executed")
@@ -3491,6 +3512,219 @@ def register_commands(cli):
             ),
         }
         click.echo(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+    @openwebui_group.command(name="resume")
+    @click.argument("conversation_id")
+    @click.option(
+        "--provider-run-id",
+        help="Select an earlier failed provider run from this journal",
+    )
+    @click.option(
+        "--allow-new-searches",
+        is_flag=True,
+        help="Permit additional MCP calls; duplicate queries cannot be prevented remotely",
+    )
+    @click.option(
+        "--assume-stopped",
+        is_flag=True,
+        help="Recover a process-killed run without a provider_error (only if the task is stopped)",
+    )
+    @click.option("--dry-run", is_flag=True, help="Verify checkpoints; do not contact the model")
+    def resume(
+        conversation_id: str,
+        provider_run_id: str | None,
+        allow_new_searches: bool,
+        assume_stopped: bool,
+        dry_run: bool,
+    ):
+        """Start a new continuation from complete, verified local tool checkpoints.
+
+        This does NOT reconnect to a failed server task. Evidence-only recovery
+        is the default: no MCP tools or other server builtins are available.
+        """
+        try:
+            recovery = load_recovery(
+                conversation_id,
+                provider_run_id=provider_run_id,
+                require_error=not assume_stopped,
+            )
+            messages = build_resume_messages(
+                recovery, allow_new_searches=allow_new_searches
+            )
+        except CheckpointError as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        origin = recovery["request"]
+        original_ids = origin.get("tool_ids") or []
+        summary = {
+            "source_conversation": conversation_id,
+            "source_provider_run": recovery["provider_run_id"],
+            "model": origin["model"],
+            "checkpointed_calls": len(recovery["checkpoints"]),
+            "tool_names": [item["name"] for item in recovery["checkpoints"]],
+            "mode": "new-searches-allowed" if allow_new_searches else "evidence-only",
+            "remote_task_resumed": False,
+        }
+        if dry_run:
+            click.echo(json.dumps(summary, indent=2, ensure_ascii=False))
+            return
+
+        config = _load_config()
+        if not config:
+            raise click.ClickException(
+                "Open WebUI is not configured; run llm openwebui login first"
+            )
+        client = _client(config)
+        try:
+            model_item = _get_model_item(client, origin["model"])
+        except (APIError, AuthError, llm.ModelError) as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        # Never widen the previous request's explicit MCP scope. In particular,
+        # do not reactivate unrelated user-visible tools after reconnecting.
+        selected = set(_enabled_tool_ids(config))
+        tool_ids = [
+            item for item in original_ids
+            if isinstance(item, str)
+            and item.startswith("server:mcp:")
+            and item in selected
+        ] if allow_new_searches else []
+        if allow_new_searches and not tool_ids:
+            raise click.ClickException(
+                "No MCP server remains enabled from the original request"
+            )
+        if tool_ids:
+            try:
+                _guard_server_mcp_version(client, tool_ids)
+            except llm.ModelError as exc:
+                raise click.ClickException(str(exc)) from exc
+
+        encoded_size = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+        if encoded_size > 4 * 1024 * 1024:
+            raise click.ClickException(
+                f"Resume history is {encoded_size} bytes, beyond the 4 MiB "
+                "safe request limit; refusing to silently truncate evidence"
+            )
+
+        new_id = str(uuid.uuid4())
+        run_id = f"{new_id}:{time.time_ns()}"
+        ensure_chat_journal_session(
+            new_id, model=f"openwebui/{origin['model']}",
+            name=f"Recovery of {conversation_id}",
+        )
+        def journal(entry: dict[str, Any], *, durable: bool = False) -> None:
+            append_chat_journal_record(
+                new_id,
+                {"provider": "openwebui", "provider_run_id": run_id, **entry},
+                durable=durable,
+            )
+
+        journal({
+            "type": "provider_request",
+            "model": origin["model"],
+            "messages": messages,
+            "tool_ids": tool_ids,
+            "recovery": summary,
+        }, durable=True)
+        append_chat_journal_record(conversation_id, {
+            "type": "recovery_started",
+            "source_provider_run_id": recovery["provider_run_id"],
+            "recovery_conversation_id": new_id,
+            "allow_new_searches": allow_new_searches,
+        }, durable=True)
+
+        click.echo(
+            f"Recovery conversation: {new_id} "
+            f"({len(recovery['checkpoints'])} preserved tool calls)"
+        )
+        click.echo(
+            "Evidence-only: no tools will be executed."
+            if not allow_new_searches
+            else "Native MCP enabled for new calls; duplicate searches remain "
+                 "possible if requested again by the model."
+        )
+        status_bar = _OpenWebUIStatusBar()
+
+        def on_text(chunk: str) -> None:
+            status_bar.clear()
+            click.echo(chunk, nl=False)
+            journal({"type": "assistant_stream", "event_type": "text", "chunk": chunk})
+
+        def on_reasoning(chunk: str) -> None:
+            status_bar.clear()
+            click.echo(click.style(chunk, dim=True), nl=False, err=True)
+            journal({"type": "assistant_stream", "event_type": "reasoning", "chunk": chunk})
+
+        def on_tool(line: str) -> None:
+            journal({"type": "provider_tool", "tool": line})
+            status_bar.update(line, kind="tool")
+
+        def on_status(line: str) -> None:
+            journal({"type": "provider_status", "status": line})
+            status_bar.update(line)
+
+        def on_checkpoint(item: dict[str, Any]) -> None:
+            save_tool_checkpoint(new_id, run_id, item)
+
+        def on_source(source: dict[str, Any]) -> None:
+            journal({"type": "provider_tool_source", **source})
+
+        try:
+            # Use the same Socket.IO native loop as interactive chat. For
+            # evidence-only mode, legacy with NO tool_ids prevents Open WebUI
+            # from injecting its builtin tools. No tool prepass can run.
+            result = __import__("asyncio").run(
+                run_chat_with_tools_with_files(
+                    base_url=client.base_url,
+                    token=client.token or "",
+                    model=origin["model"],
+                    model_item=model_item,
+                    messages=messages,
+                    tool_ids=tool_ids,
+                    files=[],
+                    params=(
+                        {"tool_approval_mode": "full"}
+                        if allow_new_searches
+                        else {"function_calling": "legacy", "tool_approval_mode": "full"}
+                    ),
+                    timeout=client.timeout,
+                    on_text=on_text,
+                    on_reasoning=on_reasoning,
+                    on_tool=on_tool,
+                    on_status=on_status,
+                    on_checkpoint=on_checkpoint,
+                    on_source=on_source,
+                )
+            )
+            status_bar.clear()
+            journal({
+                "type": "recovery_completed",
+                "native_checkpoint_count": result.get("native_checkpoint_count", 0),
+                "remote_chat_id": result.get("remote_chat_id"),
+                "answer": result.get("answer"),
+            }, durable=True)
+            append_chat_journal_record(conversation_id, {
+                "type": "recovery_completed",
+                "recovery_conversation_id": new_id,
+            }, durable=True)
+            click.echo()
+            click.echo(f"Completed recovery; local journal: {new_id}.jsonl")
+        except (APIError, AuthError, CheckpointError, KeyboardInterrupt) as exc:
+            status_bar.clear()
+            journal({
+                "type": "provider_error",
+                "error": str(exc),
+                "error_class": type(exc).__name__,
+            }, durable=True)
+            append_chat_journal_record(conversation_id, {
+                "type": "recovery_failed",
+                "recovery_conversation_id": new_id,
+                "error": str(exc),
+            }, durable=True)
+            if isinstance(exc, KeyboardInterrupt):
+                raise click.Abort() from exc
+            raise click.ClickException(str(exc)) from exc
 
     @openwebui_group.command(name="models")
     def models():

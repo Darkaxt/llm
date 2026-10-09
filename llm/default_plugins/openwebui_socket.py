@@ -412,6 +412,95 @@ def _reconcile_answer_snapshot(
         state["last_progress_at"] = time.monotonic()
 
 
+
+def _record_native_tool_item(
+    item: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    """Join native tool-call and tool-result items by call ID.
+
+    The server emits both event-level items and cumulative chat:completion
+    snapshots. Only emit a complete call+result pair, and only once.
+    """
+    kind = item.get("type")
+    call_id = str(item.get("call_id") or item.get("id") or "")
+    if not call_id:
+        return
+    if kind == "function_call":
+        old = state.setdefault("native_call_items", {}).get(call_id) or {}
+        # An output_item.added snapshot can contain empty arguments even
+        # after argument deltas have populated the same call ID. Never erase
+        # a complete argument string with an empty/stale placeholder.
+        fields = {
+            key: value for key, value in item.items()
+            if value is not None and (value != "" or not old.get(key))
+        }
+        state["native_call_items"][call_id] = {**old, **fields}
+    elif kind == "function_call_output" and "output" in item:
+        state.setdefault("native_result_items", {})[call_id] = item
+    else:
+        return
+    _emit_native_checkpoint_if_ready(state, call_id, on_checkpoint)
+
+
+def _emit_native_checkpoint_if_ready(
+    state: dict[str, Any],
+    call_id: str,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    if on_checkpoint is None:
+        return
+    emitted = state.setdefault("native_checkpoint_ids", set())
+    if call_id in emitted:
+        return
+    call = state.get("native_call_items", {}).get(call_id)
+    result = state.get("native_result_items", {}).get(call_id)
+    if not isinstance(call, dict) or not isinstance(result, dict):
+        return
+    name = call.get("name")
+    arguments = call.get("arguments")
+    if not isinstance(name, str) or not name:
+        return
+    if not isinstance(arguments, (dict, str)) or not arguments:
+        # Wait for response.function_call_arguments.done or a full snapshot.
+        return
+    # A partial argument string must never become a "complete" checkpoint.
+    try:
+        decoded = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(decoded, dict):
+        return
+    checkpoint = {
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "output": result["output"],
+    }
+    # Callback must finish its disk write before we mark this call recorded.
+    on_checkpoint(checkpoint)
+    emitted.add(call_id)
+
+
+def _capture_native_snapshot(
+    output: Any,
+    state: dict[str, Any],
+    on_checkpoint: Callable[[dict[str, Any]], None] | None,
+) -> None:
+    if not isinstance(output, list):
+        return
+    # Record all calls first, because snapshots may put outputs after calls
+    # from an earlier generation or contain a reordered prior_output segment.
+    for item in output:
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            _record_native_tool_item(item, state, on_checkpoint=on_checkpoint)
+    for item in output:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            _record_native_tool_item(item, state, on_checkpoint=on_checkpoint)
+
+
 def _consume_response_completion(
     data: dict[str, Any],
     state: dict[str, Any],
@@ -420,6 +509,7 @@ def _consume_response_completion(
     on_reasoning: Callable[[str], None],
     on_tool: Callable[[str], None],
     on_status: Callable[[str], None],
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
     """Forward live Open WebUI Responses events without waiting for snapshots.
 
@@ -470,6 +560,10 @@ def _consume_response_completion(
         if not isinstance(item, dict):
             return False
         item_type = item.get("type")
+        if item_type in {"function_call", "function_call_output"}:
+            _record_native_tool_item(
+                item, state, on_checkpoint=on_checkpoint
+            )
         if item_type == "function_call":
             name = str(item.get("name") or "")
             call_id = str(
@@ -506,6 +600,20 @@ def _consume_response_completion(
         "response.function_call_arguments.delta",
         "response.function_call_arguments.done",
     }:
+        call_id = str(data.get("item_id") or data.get("call_id") or "")
+        if call_id:
+            entry = state.setdefault("native_call_items", {}).setdefault(
+                call_id, {"type": "function_call", "call_id": call_id}
+            )
+            if kind.endswith(".done"):
+                arguments = data.get("arguments")
+                if isinstance(arguments, str):
+                    entry["arguments"] = arguments
+            elif isinstance(data.get("delta"), str):
+                entry["arguments"] = (
+                    str(entry.get("arguments") or "") + data["delta"]
+                )
+            _emit_native_checkpoint_if_ready(state, call_id, on_checkpoint)
         # Do not leak complete tool arguments to the terminal status area.
         # Generating tool arguments still counts as meaningful progress.
         state["last_progress_at"] = time.monotonic()
@@ -606,6 +714,7 @@ async def run_chat_with_tools_with_files(
     on_status: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
     on_source: Callable[[dict[str, Any]], None] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
     chat_id: str | None = None,
     sessionless_server_tools: bool = False,
     stop_requested: threading.Event | None = None,
@@ -620,17 +729,18 @@ async def run_chat_with_tools_with_files(
     socketio = _need_socketio()
     import aiohttp  # validated present by _need_socketio()
 
-    if not tool_ids and not chat_id:
-        raise ConfigError(
-            "run_chat_with_tools requires either tool_ids (tool execution) or "
-            "a chat_id (chat persistence via --save)"
-        )
+    # An evidence-only recovery deliberately has no tools and uses a temporary
+    # chat ID allocated after the Socket.IO handshake. Do not require a caller-
+    # supplied chat ID or enable tools just to get an answer.
+    if not isinstance(messages, list) or not messages:
+        raise ConfigError("Open WebUI chat requires a non-empty message history")
 
     out_text = on_text or (lambda _s: None)
     out_tool = on_tool or (lambda _s: None)
     out_status = on_status or (lambda _s: None)
     out_reasoning = on_reasoning or (lambda _s: None)
     out_source = on_source or (lambda _record: None)
+    out_checkpoint = on_checkpoint
 
     # python-socketio's aiohttp session defaults to trust_env=False, so it would
     # IGNORE HTTP_PROXY/HTTPS_PROXY and bypass the vault proxy that injects
@@ -672,6 +782,7 @@ async def run_chat_with_tools_with_files(
         _reconcile_answer_snapshot(answer, state, out_text)
 
     def _sync_structured_output(output: Any) -> None:
+        _capture_native_snapshot(output, state, out_checkpoint)
         answer = _structured_output_text(output)
         if answer:
             _emit_answer_snapshot(answer)
@@ -797,6 +908,7 @@ async def run_chat_with_tools_with_files(
                     on_reasoning=out_reasoning,
                     on_tool=out_tool,
                     on_status=out_status,
+                    on_checkpoint=out_checkpoint,
                 )
                 return
             if etype == "response:completion":
@@ -1238,4 +1350,5 @@ async def run_chat_with_tools_with_files(
         "remote_chat_id": remote_chat_id or chat_id,
         "remote_task_ids": remote_task_ids,
         "server_tool_sources": state["server_tool_sources"],
+        "native_checkpoint_count": len(state.get("native_checkpoint_ids", ())),
     }

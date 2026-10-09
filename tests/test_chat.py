@@ -619,3 +619,87 @@ def test_run_chat_ctrl_c_closes_inflight_provider_stream(monkeypatch):
     monkeypatch.setattr(llm.cli, "display_stream_events", interrupt_stream)
     llm.cli._run_chat("mock", lambda *args: FakeResponse())
     assert closed == [True]
+
+
+
+def test_chat_retry_does_not_repeat_checkpointed_openwebui_mcp(
+    tmp_path, monkeypatch, capsys
+):
+    from llm.chat_journal import ensure_session
+    from llm import openwebui_recovery
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-mcp-retry", name=None)
+    ensure_session(conversation.id, model="openwebui/glm-5.3")
+
+    prompts = iter(["incident", "!retry", "!retry-force", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+    monkeypatch.setattr(
+        openwebui_recovery,
+        "load_recovery",
+        lambda cid: {"checkpoints": [{"call_id": "call-q1"}]},
+    )
+    attempts = []
+    class EmptyResponse:
+        def stream_events(self):
+            return iter(())
+
+    def invoke(prompt, fragments, attachments):
+        attempts.append(prompt)
+        if len(attempts) == 1:
+            raise llm.ModelError("upstream 300s timeout")
+        return EmptyResponse()
+
+    llm.cli._run_chat(
+        "openwebui/glm-5.3",
+        invoke,
+        conversation=conversation,
+        export_jsonl=True,
+    )
+    # !retry was blocked by a valid tool checkpoint; !retry-force deliberately
+    # sent the same request again.
+    assert attempts == ["incident", "incident"]
+    output = capsys.readouterr().err
+    assert "llm openwebui resume conv-mcp-retry" in output
+    assert "!retry-force" in output
+
+
+
+def test_chat_retry_cannot_silently_replay_corrupt_native_checkpoints(
+    tmp_path, monkeypatch, capsys
+):
+    from llm.chat_journal import ensure_session
+    from llm import openwebui_recovery
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    conversation = SimpleNamespace(id="conv-bad-mcp", name=None)
+    ensure_session(conversation.id, model="openwebui/glm-5.3")
+    prompts = iter(["incident", "!retry", "!retry-force", "quit"])
+    monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda session=None: next(prompts))
+    monkeypatch.setattr(llm.cli, "_build_chat_prompt_session", lambda: None)
+    monkeypatch.setattr(llm.cli, "_chat_turn_headers_enabled", lambda: False)
+
+    def fail_checkpoint_read(cid):
+        raise openwebui_recovery.CheckpointError("Checkpoint checksum mismatch")
+
+    monkeypatch.setattr(openwebui_recovery, "load_recovery", fail_checkpoint_read)
+    attempted = []
+
+    class EmptyResponse:
+        def stream_events(self):
+            return iter(())
+
+    def invoke(prompt, fragments, attachments):
+        attempted.append(prompt)
+        if len(attempted) == 1:
+            raise llm.ModelError("server disconnected")
+        return EmptyResponse()
+
+    llm.cli._run_chat(
+        "openwebui/glm-5.3", invoke,
+        conversation=conversation, export_jsonl=True,
+    )
+    assert attempted == ["incident", "incident"]
+    assert "checksum mismatch" in capsys.readouterr().err

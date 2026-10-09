@@ -1998,6 +1998,29 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
             },
         },
         {
+            "type": "response:completion",
+            "data": {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-journal-1",
+                    "name": "splunk-mcp_splunk_run_query",
+                    "arguments": "{\"query\":\"index=digit_sec | stats count\"}",
+                },
+            },
+        },
+        {
+            "type": "response:completion",
+            "data": {
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call_output",
+                    "call_id": "call-journal-1",
+                    "output": {"results": [{"count": 2}]},
+                },
+            },
+        },
+        {
             "type": "chat:completion",
             "data": {
                 "done": True,
@@ -2084,6 +2107,7 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
             on_status=lambda value: events.append(("status", value)),
             on_source=lambda value: events.append(("source", value)),
             on_tool=lambda value: events.append(("tool", value)),
+            on_checkpoint=lambda value: events.append(("checkpoint", value)),
         )
 
     result = asyncio.run(run())
@@ -2097,6 +2121,12 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
         "Thinking"
     ]
     assert ("status", "live model token stream started") in events
+    saved = [item for kind, item in events if kind == "checkpoint"]
+    assert len(saved) == 1
+    assert saved[0]["call_id"] == "call-journal-1"
+    assert saved[0]["arguments"] == '{"query":"index=digit_sec | stats count"}'
+    assert saved[0]["output"] == {"results": [{"count": 2}]}
+    assert result["native_checkpoint_count"] == 1
     assert len(result["server_tool_sources"]) == 1
     provenance = result["server_tool_sources"][0]
     assert provenance["is_mcp"] is True
