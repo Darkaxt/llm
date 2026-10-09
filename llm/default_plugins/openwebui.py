@@ -7,6 +7,7 @@ model discovery, streaming, reasoning and the Socket.IO tool execution path.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import json
@@ -22,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import click
 import httpx2
@@ -549,6 +550,328 @@ def _knowledge_file_text(
     return str(payload.get("content") or "")
 
 
+
+_TIDE_BUNDLE_DIR = "ec-tide-splunk-investigation-kb"
+_TIDE_MACRO_FILE_RE = re.compile(
+    r"(?:ec-tide-splunk-investigation-kb/)?"
+    r"(macros/by-stanza/[A-Za-z0-9_.%()+-]+\.json)"
+)
+
+
+def _knowledge_find_nested_file(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+    path: str,
+    directory_cache: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """Resolve the exact file by traversing the 0.11.x Knowledge directory API.
+
+    Global filename search is ambiguous for v0.3: every MDR has files named
+    detection.json, query.spl and dependencies.json. The server exposes child
+    directories on GET /knowledge/{id}/files?directory_id=... independently
+    of file pagination, allowing deterministic path resolution.
+    """
+    parts = str(path).replace("\\", "/").split("/")
+    if not parts or any(not part or part in {".", ".."} for part in parts):
+        raise llm.ModelError(f"Unsafe or invalid Knowledge file path: {path!r}")
+
+    def list_children(directory_id: str) -> list[dict[str, Any]]:
+        if directory_id not in directory_cache:
+            result = _owui_http_json(
+                client,
+                "GET",
+                f"/api/v1/knowledge/{knowledge_id}/files",
+                params={"directory_id": directory_id, "page": 1},
+            )
+            if not isinstance(result, dict) or not isinstance(
+                result.get("directories"), list
+            ):
+                raise llm.ModelError(
+                    f"Open WebUI returned invalid Knowledge directories for {path!r}"
+                )
+            directory_cache[directory_id] = [
+                item for item in result["directories"] if isinstance(item, dict)
+            ]
+        return directory_cache[directory_id]
+
+    parent_id = ""
+    for segment in parts[:-1]:
+        matches = [
+            item for item in list_children(parent_id)
+            if str(item.get("name") or "").casefold() == segment.casefold()
+        ]
+        if not matches:
+            return None
+        if len(matches) != 1 or not matches[0].get("id"):
+            raise llm.ModelError(f"Ambiguous Knowledge directory in {path!r}")
+        parent_id = str(matches[0]["id"])
+
+    # Query inside a known directory, not globally. An exact name usually
+    # yields one row even in folders containing hundreds of macro JSON files.
+    filename = parts[-1]
+    found: list[dict[str, Any]] = []
+    page = 1
+    while page <= 10:
+        payload = _owui_http_json(
+            client,
+            "GET",
+            f"/api/v1/knowledge/{knowledge_id}/files",
+            params={"directory_id": parent_id, "query": filename, "page": page},
+        )
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("items"), list
+        ):
+            raise llm.ModelError(f"Invalid Knowledge file result for {path!r}")
+        found.extend(
+            item for item in payload["items"]
+            if isinstance(item, dict)
+            and str(item.get("filename") or "").casefold() == filename.casefold()
+        )
+        count = len(payload["items"])
+        total = payload.get("total")
+        if not count or (isinstance(total, int) and page * 30 >= total):
+            break
+        page += 1
+    if len(found) > 1:
+        raise llm.ModelError(f"Multiple Knowledge files match exact path {path!r}")
+    return found[0] if found else None
+
+
+def _knowledge_raw_text(client: OpenWebUIClient, file_id: str) -> str:
+    """Fallback for text files the Open WebUI parser did not index."""
+    try:
+        with httpx2.Client(
+            trust_env=True, timeout=max(float(client.timeout), 120.0)
+        ) as http:
+            result = http.get(
+                f"{client.base_url}/api/v1/files/{file_id}/content",
+                headers={"Authorization": f"Bearer {client.token}"},
+            )
+            result.raise_for_status()
+            if len(result.content) > 2 * 1024 * 1024:
+                raise llm.ModelError(
+                    f"Knowledge file {file_id} exceeds text retrieval limit"
+                )
+            return result.content.decode("utf-8-sig")
+    except llm.ModelError:
+        raise
+    except Exception as exc:
+        raise llm.ModelError(
+            f"Could not retrieve original content of Knowledge file {file_id}: {exc}"
+        ) from exc
+
+
+def _knowledge_tide_file(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+    path: str,
+    directory_cache: dict[str, list[dict[str, Any]]],
+) -> tuple[str, str, str] | None:
+    """Fetch one v0.3 text file, accepting bundled or flattened folder layout."""
+    normalized = str(path).replace("\\", "/").lstrip("/")
+    if normalized.startswith(f"{_TIDE_BUNDLE_DIR}/"):
+        normalized = normalized[len(_TIDE_BUNDLE_DIR) + 1 :]
+    for candidate in (f"{_TIDE_BUNDLE_DIR}/{normalized}", normalized):
+        item = _knowledge_find_nested_file(
+            client, knowledge_id, candidate, directory_cache
+        )
+        if item is None:
+            continue
+        file_id = str(item.get("id") or "")
+        if not file_id:
+            continue
+        content = _knowledge_file_text(client, file_id)
+        if not content:
+            content = _knowledge_raw_text(client, file_id)
+        return candidate, file_id, content
+    return None
+
+
+def _tide_v3_macro_pointers(data: Any) -> list[str]:
+    """Collect only dependencies marked 'resolve', never skip/lookup entries."""
+    paths: list[str] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            policy = str(value.get("resolution_policy") or "").casefold()
+            if policy in {"skip", "inspect_if_needed"}:
+                return
+            for item in value.values():
+                visit(item)
+        elif isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, str):
+            for match in _TIDE_MACRO_FILE_RE.finditer(value):
+                path = match.group(1)
+                if path not in paths:
+                    paths.append(path)
+
+    visit(data)
+    return paths
+
+
+def _tide_macro_suffix_request(text: str) -> str | None:
+    if not re.search(r"\bmacros?\b", text, re.IGNORECASE):
+        return None
+    match = re.search(
+        r"(?:ends?\s+(?:in|with)|ending\s+(?:in|with)|suffix\s*(?:of|is|=)?)"
+        r"\s*[\"'\`]?(_[A-Za-z0-9_]+)\b",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def _tide_macro_index_matches(
+    tsv: str, suffix: str
+) -> tuple[str, list[tuple[str, str]]]:
+    """Find exact stanza suffixes without forwarding the entire macro index."""
+    reader = csv.reader(io.StringIO(tsv), delimiter="\t")
+    header = next(reader, [])
+    if not header:
+        return "", []
+    names = [item.strip().casefold() for item in header]
+    column = next(
+        (i for i, col in enumerate(names) if col in {
+            "stanza", "macro", "name", "macro_name", "stanza_name"
+        }),
+        0,
+    )
+    selected = []
+    for values in reader:
+        if not values or len(values) <= column:
+            continue
+        stanza = values[column].strip()
+        short_name = re.sub(r"\(\d+\)$", "", stanza)
+        if short_name.casefold().endswith(suffix.casefold()):
+            selected.append((stanza, "\t".join(values)))
+    return "\t".join(header), selected
+
+
+def _tide_target_rule_uuids(
+    messages: list[dict[str, Any]],
+    fallback_uuids: set[str],
+) -> list[str]:
+    """Prefer the precise MDR_UUID over unrelated UUIDs in an aggregated notable."""
+    text = _conversation_text(messages)
+    match = re.search(
+        r"\bMDR_UUID\b\s*[:=]\s*[\"']?("
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        return [match.group(1)]
+    return sorted(fallback_uuids)[:4]
+
+
+def _resolve_tide_v3_evidence(
+    client: OpenWebUIClient,
+    knowledge_id: str,
+    messages: list[dict[str, Any]],
+    uuids: set[str],
+    resolution_meta: dict[str, Any],
+) -> list[str]:
+    """Resolve v0.3 TIDE microfiles by path, without giant aggregate sidecars."""
+    cache: dict[str, list[dict[str, Any]]] = {}
+    sections: list[str] = []
+    seen: set[str] = set()
+
+    def append_path(path: str, *, max_chars: int = 12000) -> str | None:
+        hit = _knowledge_tide_file(client, knowledge_id, path, cache)
+        if hit is None:
+            return None
+        actual_path, file_id, content = hit
+        if actual_path in seen:
+            return content
+        seen.add(actual_path)
+        resolution_meta["files"].append({
+            "knowledge_id": knowledge_id,
+            "id": file_id,
+            "path": actual_path,
+            "filename": actual_path.rsplit("/", 1)[-1],
+            "chars": len(content),
+        })
+        display = content if len(content) <= max_chars else (
+            content[:max_chars] + "\n[File excerpt truncated by CLI]"
+        )
+        sections.extend([f'<file path="{actual_path}">', display, "</file>"])
+        return content
+
+    for uuid_value in _tide_target_rule_uuids(messages, uuids):
+        root = f"rules/{uuid_value}"
+        detection = append_path(f"{root}/detection.json")
+        spl = append_path(f"{root}/query.spl")
+        dependencies = append_path(f"{root}/dependencies.json")
+        if not all((detection, spl, dependencies)):
+            sections.append(
+                f'<missing_evidence rule_uuid="{uuid_value}">'
+                "One or more direct-addressed TIDE files were unavailable."
+                "</missing_evidence>"
+            )
+        if dependencies:
+            try:
+                pointers = _tide_v3_macro_pointers(json.loads(dependencies))
+            except json.JSONDecodeError:
+                pointers = _tide_v3_macro_pointers(dependencies)
+            scanned: set[str] = set()
+            while pointers and len(scanned) < 16:
+                target = pointers.pop(0)
+                if target in scanned:
+                    continue
+                scanned.add(target)
+                nested = append_path(target, max_chars=4000)
+                if nested:
+                    try:
+                        more = _tide_v3_macro_pointers(json.loads(nested))
+                    except json.JSONDecodeError:
+                        more = []
+                    pointers.extend(path for path in more if path not in scanned)
+
+    suffix = _tide_macro_suffix_request(_conversation_text(messages))
+    if suffix:
+        catalog = _knowledge_tide_file(
+            client, knowledge_id, "macros/index.tsv", cache
+        )
+        if catalog is None:
+            sections.append(
+                '<missing_evidence path="macros/index.tsv">'
+                "The canonical macro catalogue was not accessible through the KB API."
+                "</missing_evidence>"
+            )
+        else:
+            actual, file_id, tsv = catalog
+            header, matching = _tide_macro_index_matches(tsv, suffix)
+            resolution_meta["files"].append({
+                "knowledge_id": knowledge_id,
+                "id": file_id,
+                "path": actual,
+                "filename": "index.tsv",
+                "chars": len(tsv),
+                "selected_rows": len(matching),
+            })
+            sections.extend([
+                f'<exact_evidence source="{actual}" suffix="{suffix}" '
+                f'total_matches="{len(matching)}">',
+                header,
+                *[line for _, line in matching[:150]],
+                "</exact_evidence>",
+            ])
+            for stanza, _ in matching[:24]:
+                append_path(
+                    f"macros/by-stanza/{quote(stanza, safe='')}.json",
+                    max_chars=1600,
+                )
+            if len(matching) > 24:
+                sections.append(
+                    f"{len(matching) - 24} macro details were not expanded; "
+                    "their exact names remain available in the filtered index."
+                )
+    return sections
+
+
 def _json_contains_needles(value: Any, needles: set[str]) -> bool:
     if isinstance(value, dict):
         return any(
@@ -693,6 +1016,12 @@ def _resolve_knowledge_context(
             "splunk-rules.jsonl",
             "macros.json",
         ):
+            if (
+                filename == "rule-index.json"
+                and "macros/by-stanza/" in fetched.get("SKILL.md", ("", ""))[1]
+            ):
+                # v0.3 uses direct-addressed microfiles, not legacy aggregates.
+                break
             item = _knowledge_exact_file(client, knowledge_id, filename)
             if item is None:
                 continue
@@ -714,15 +1043,40 @@ def _resolve_knowledge_context(
             f'<persistent_knowledge name="{knowledge_name}" id="{knowledge_id}">'
         ]
 
+        version3 = "macros/by-stanza/" in fetched.get("SKILL.md", ("", ""))[1]
+        catalog_only = bool(
+            version3 and not uuids
+            and _tide_macro_suffix_request(_conversation_text(messages))
+        )
         for filename in ("SKILL.md", "SPEC.md"):
             if filename in fetched:
+                file_text = fetched[filename][1]
+                if catalog_only and filename == "SKILL.md":
+                    # Preserve the original instructions relevant to macro
+                    # catalogues, but avoid 20 KB of unrelated investigation
+                    # stages for a lightweight model merely listing macros.
+                    intro_end = file_text.find("## Default route")
+                    macro_start = file_text.find("## Custom macros")
+                    macro_end = file_text.find("## Lookups", macro_start)
+                    if intro_end >= 0 and macro_start >= 0 and macro_end > macro_start:
+                        file_text = (
+                            file_text[:intro_end]
+                            + "\n[Other investigation steps omitted for this catalogue query]\n\n"
+                            + file_text[macro_start:macro_end]
+                        )
+                elif catalog_only and filename == "SPEC.md":
+                    cutoff = file_text.find("## Known limits")
+                    if cutoff > 0:
+                        file_text = file_text[:cutoff]
                 section_lines.extend(
-                    [
-                        f'<file name="{filename}">',
-                        fetched[filename][1],
-                        "</file>",
-                    ]
+                    [f'<file name="{filename}">', file_text, "</file>"]
                 )
+
+        if version3:
+            sections = _resolve_tide_v3_evidence(
+                client, knowledge_id, messages, uuids, resolution_meta
+            )
+            section_lines.extend(sections)
 
         rule_fragments: list[Any] = []
         if uuids and "rule-index.json" in fetched:
@@ -842,7 +1196,7 @@ def _resolve_knowledge_context(
         scoped.insert(0, {"role": "system", "content": resolved_context})
 
     resolution_meta["context_chars"] = len(resolved_context)
-    resolution_meta["macro_names"] = sorted(macro_names) if 'macro_names' in locals() else []
+    resolution_meta["macro_names"] = sorted(macro_names) if "macro_names" in locals() else []
     return scoped, resolution_meta
 
 
@@ -3196,6 +3550,28 @@ def register_commands(cli):
             f"{result['deleted']} deleted, {result['unmodified']} unchanged, "
             f"{result.get('reused', 0)} resumed."
         )
+
+    @knowledge_group.command(name="read")
+    @click.argument("selector")
+    @click.argument("path")
+    def knowledge_read(selector: str, path: str):
+        """Print one Knowledge text file by its exact nested relative path."""
+        config = _load_config()
+        if not config:
+            raise click.ClickException("Open WebUI is not configured")
+        client = _client(config)
+        try:
+            knowledge = _resolve_knowledge_selector(client, selector)
+            hit = _knowledge_tide_file(
+                client, str(knowledge["id"]), path, {}
+            )
+        except llm.ModelError as exc:
+            raise click.ClickException(str(exc)) from exc
+        if hit is None:
+            raise click.ClickException(
+                f"No Knowledge file matches exact path {path!r}"
+            )
+        click.echo(hit[2])
 
     @knowledge_group.command(name="rebuild")
     @click.argument("selector")

@@ -1612,3 +1612,187 @@ def test_cancel_remote_background_chat_tasks_uses_user_scoped_endpoint():
         assert "cancellation requested" in statuses[0]
 
     asyncio.run(scenario())
+
+
+
+@pytest.fixture
+def tide_v3_knowledge_server(monkeypatch):
+    """Simulate Open WebUI 0.11.3's directory-scoped Knowledge files API."""
+    uuid = "67e794d5-73b2-45e5-b570-ceb5e0bba352"
+    dirs = {
+        "": [{"id": "bundle", "name": "ec-tide-splunk-investigation-kb"}],
+        "bundle": [
+            {"id": "rules", "name": "rules"},
+            {"id": "macros", "name": "macros"},
+        ],
+        "rules": [{"id": "rule", "name": uuid}],
+        "rule": [],
+        "macros": [{"id": "by-stanza", "name": "by-stanza"}],
+        "by-stanza": [],
+    }
+    contents = {
+        "skill": (
+            "# Skill 0.3.0\nBundle has macros/by-stanza/ microfiles.\n"
+            "## Default route\nRule search.\n## Custom macros\n"
+            "Read only macros/index.tsv.\n## Lookups\nNever read lookups.\n"
+        ),
+        "spec": "# Specification\nOnly read the selected TIDE microfiles.\n",
+        "index": (
+            "stanza\trole_hints\n"
+            "aws_sso_log(1)\tsource\n"
+            "aws_cloudtrail_log\tsource\n"
+            "other_macro\tenrichment\n"
+        ),
+        "aws_sso_log": json.dumps({
+            "stanza": "aws_sso_log(1)",
+            "definition": "index=aws sourcetype=cloudtrail",
+            "role_hints": ["source"],
+        }),
+        "aws_cloudtrail_log": json.dumps({
+            "stanza": "aws_cloudtrail_log",
+            "definition": "index=aws sourcetype=aws:cloudtrail",
+            "role_hints": ["source"],
+        }),
+        "detection": '{"name": "CSOC integration for AWS GUARDDUTY"}',
+        "query": "index=aws sourcetype=aws:asl:guardduty",
+        "dependencies": json.dumps({
+            "dependencies": [
+                {
+                    "resolution_policy": "resolve",
+                    "file": "macros/by-stanza/aws_sso_log%281%29.json",
+                },
+                {
+                    "resolution_policy": "skip",
+                    "file": "macros/by-stanza/skipped_macro.json",
+                },
+            ]
+        }),
+    }
+    files = {
+        "macros": {"index.tsv": "index"},
+        "by-stanza": {
+            "aws_sso_log%281%29.json": "aws_sso_log",
+            "aws_cloudtrail_log.json": "aws_cloudtrail_log",
+        },
+        "rule": {
+            "detection.json": "detection",
+            "query.spl": "query",
+            "dependencies.json": "dependencies",
+        },
+    }
+    requests = []
+
+    def fake_json(client, method, endpoint, **kwargs):
+        assert method == "GET"
+        assert endpoint == "/api/v1/knowledge/kb-1/files"
+        params = kwargs["params"]
+        requests.append(params)
+        parent = params["directory_id"]
+        query = params.get("query")
+        if query is None:
+            return {"items": [], "directories": dirs.get(parent, []), "total": 0}
+        file_id = files.get(parent, {}).get(query)
+        return {
+            "items": [{"id": file_id, "filename": query}] if file_id else [],
+            "directories": dirs.get(parent, []),
+            "total": int(file_id is not None),
+        }
+
+    monkeypatch.setattr(openwebui, "_owui_http_json", fake_json)
+    monkeypatch.setattr(
+        openwebui,
+        "_knowledge_exact_file",
+        lambda client, knowledge_id, filename: (
+            {"id": filename.lower()[:-3], "filename": filename}
+            if filename in {"SKILL.md", "SPEC.md"}
+            else pytest.fail("v0.3 must not fetch obsolete aggregate files")
+        ),
+    )
+    # The above IDs map SKILL.md -> skill and SPEC.md -> spec.
+    monkeypatch.setattr(
+        openwebui, "_knowledge_file_text", lambda client, file_id: contents[file_id]
+    )
+    return SimpleNamespace(
+        client=SimpleNamespace(base_url="https://example.test", token="jwt", timeout=600),
+        requests=requests,
+        contents=contents,
+        uuid=uuid,
+    )
+
+
+def test_tide_v3_macro_suffix_enumeration_reads_nested_index_and_definitions(
+    tide_v3_knowledge_server,
+):
+    server = tide_v3_knowledge_server
+    messages, meta = openwebui._resolve_knowledge_context(
+        server.client,
+        [{"id": "kb-1", "name": "TIDE Splunk Investigation"}],
+        [{"role": "user", "content": (
+            "Enumerate macros whose name ends in _log and classify their categories"
+        )}],
+    )
+    context = messages[0]["content"]
+    assert 'suffix="_log"' in context
+    assert 'total_matches="2"' in context
+    assert "aws_sso_log(1)" in context
+    assert "aws_cloudtrail_log" in context
+    assert '"role_hints": ["source"]' in context
+    assert "other_macro" not in context
+    assert "macros/by-stanza/aws_sso_log%281%29.json" in context
+    assert any(item.get("selected_rows") == 2 for item in meta["files"])
+    assert len(context) < 12000
+    assert not any("rule-index.json" in str(req) for req in server.requests)
+
+
+def test_tide_v3_uuid_fetches_exact_rule_and_resolve_only_macros(
+    tide_v3_knowledge_server,
+):
+    server = tide_v3_knowledge_server
+    messages, meta = openwebui._resolve_knowledge_context(
+        server.client,
+        [{"id": "kb-1", "name": "TIDE Splunk Investigation"}],
+        [{"role": "user", "content": f"Investigate MDR_UUID={server.uuid}"}],
+    )
+    context = messages[0]["content"]
+    for path in (
+        f"rules/{server.uuid}/detection.json",
+        f"rules/{server.uuid}/query.spl",
+        f"rules/{server.uuid}/dependencies.json",
+        "macros/by-stanza/aws_sso_log%281%29.json",
+    ):
+        assert path in context
+    assert "index=aws sourcetype=aws:asl:guardduty" in context
+    assert "skipped_macro.json" not in [item.get("path") for item in meta["files"]]
+    assert "skipped_macro" not in context.split("<file path=")[-1]
+    assert not any(req.get("query") == "skipped_macro.json" for req in server.requests)
+
+
+def test_tide_v3_target_prefers_mdr_uuid_over_other_notable_ids():
+    selected = "67e794d5-73b2-45e5-b570-ceb5e0bba352"
+    unrelated = "1cf1610c-541c-499e-84ee-075dfaa2cdeb"
+    messages = [{
+        "role": "user",
+        "content": f'MDR_UUID="{selected}", MDR_detection_model="{unrelated}"',
+    }]
+    assert openwebui._tide_target_rule_uuids(
+        messages, {selected, unrelated}
+    ) == [selected]
+
+
+def test_tide_v3_exact_path_no_global_basename_collision(
+    tide_v3_knowledge_server,
+):
+    server = tide_v3_knowledge_server
+    cache = {}
+    result = openwebui._knowledge_tide_file(
+        server.client,
+        "kb-1",
+        f"rules/{server.uuid}/query.spl",
+        cache,
+    )
+    assert result is not None
+    assert result[2] == server.contents["query"]
+    assert any(
+        req.get("directory_id") == "rule" and req.get("query") == "query.spl"
+        for req in server.requests
+    )
