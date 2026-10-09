@@ -11,6 +11,14 @@ from llm.default_plugins import openwebui, openwebui_socket
 from llm.parts import AttachmentPart, Message, TextPart
 
 
+@pytest.fixture
+def supported_openwebui_server(monkeypatch):
+    """Mock the version endpoint; provider integration tests must stay offline."""
+    monkeypatch.setattr(
+        openwebui, "_server_config", lambda client: {"version": "0.11.3"}
+    )
+
+
 def test_prepare_openwebui_request_uses_full_chain():
     model = openwebui.OpenWebUIModel("glm")
     prompt = llm.Prompt(
@@ -140,15 +148,6 @@ def test_execute_streams_text_and_reasoning(monkeypatch):
             "info": {"meta": {"capabilities": {}}},
         },
     )
-    monkeypatch.setattr(
-        openwebui,
-        "_get_model_item",
-        lambda client, model_id: {
-            "id": model_id,
-            "name": "GLM",
-            "info": {"meta": {"capabilities": {}}},
-        },
-    )
 
     model = openwebui.OpenWebUIModel("glm-5.3")
     prompt = llm.Prompt("test", model)
@@ -160,6 +159,7 @@ def test_execute_streams_text_and_reasoning(monkeypatch):
     assert chunks[1:] == ["hello", " world"]
     assert response.response_json["remote_model"] == "glm-5.3"
     assert response.response_json["tool_activity"] == ["splunk_search"]
+    assert response.response_json["raw_content"] == ""
 
 
 def test_config_round_trip(tmp_path, monkeypatch):
@@ -298,6 +298,7 @@ def test_openwebui_chat_timeout_default_and_override(monkeypatch):
 
 
 
+@pytest.mark.usefixtures("supported_openwebui_server")
 def test_enabled_tool_ids_are_merged_into_runtime(monkeypatch):
     monkeypatch.setattr(
         openwebui,
@@ -397,6 +398,7 @@ def test_resolve_tool_selector_matches_mcp_name():
 
 
 
+@pytest.mark.usefixtures("supported_openwebui_server")
 def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
     monkeypatch.setattr(
         openwebui,
@@ -754,6 +756,7 @@ def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
     ]
 
 
+@pytest.mark.usefixtures("supported_openwebui_server")
 @pytest.mark.parametrize(
     "transport, sessionless, function_calling",
     [
@@ -1340,6 +1343,7 @@ def test_browser_chat_body_can_omit_session_id_for_server_tools(monkeypatch):
     assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert body["params"] == {}
 
+@pytest.mark.usefixtures("supported_openwebui_server")
 def test_cli_tool_selection_does_not_merge_model_default_tools(monkeypatch):
     monkeypatch.setattr(
         openwebui,

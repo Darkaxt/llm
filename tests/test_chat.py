@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import textwrap
+from types import SimpleNamespace
 from unittest.mock import ANY
 
 import pytest
@@ -464,12 +465,16 @@ def test_read_chat_prompt_noninteractive_uses_click(monkeypatch):
 
 
 
-def test_chat_prompt_session_shift_enter_sequences():
+def test_chat_prompt_session_shift_enter_sequences(monkeypatch):
     from prompt_toolkit.input.ansi_escape_sequences import ANSI_SEQUENCES
     from prompt_toolkit.keys import Keys
 
-    llm.cli._build_chat_prompt_session()
+    # Verify the key configuration without constructing a real Windows console.
+    monkeypatch.setattr("prompt_toolkit.PromptSession", lambda **kwargs: kwargs)
+    session_options = llm.cli._build_chat_prompt_session()
 
+    assert session_options["multiline"] is True
+    assert session_options["key_bindings"] is not None
     assert ANSI_SEQUENCES["\x1b[27;2;13~"] == Keys.F24
     assert ANSI_SEQUENCES["\x1b[13;2u"] == Keys.F24
 

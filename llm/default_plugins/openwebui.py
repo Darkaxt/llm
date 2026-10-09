@@ -2879,7 +2879,7 @@ class OpenWebUIModel(llm.Model):
                         "tool_calls": result.tool_calls,
                         "tool_activity": tool_activity,
                         "status_activity": status_activity,
-                        "raw_content": result.raw_content,
+                        "raw_content": getattr(result, "raw_content", ""),
                         **remote_execution,
                     }
                     break
