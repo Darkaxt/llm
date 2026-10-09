@@ -291,7 +291,7 @@ def test_attachment_context_full_is_explicit_override():
 
 def test_openwebui_chat_timeout_default_and_override(monkeypatch):
     monkeypatch.delenv("LLM_OPENWEBUI_CHAT_TIMEOUT", raising=False)
-    assert openwebui._chat_timeout() == 600
+    assert openwebui._chat_timeout() == 1200
 
     monkeypatch.setenv("LLM_OPENWEBUI_CHAT_TIMEOUT", "900")
     assert openwebui._chat_timeout() == 900
@@ -1560,7 +1560,7 @@ def test_meaningful_progress_timeout_not_reset_by_socket_keepalives():
 
 def test_meaningful_progress_timeout_config(monkeypatch):
     monkeypatch.delenv("LLM_OPENWEBUI_PROGRESS_TIMEOUT", raising=False)
-    assert openwebui_socket._meaningful_progress_timeout() == 300.0
+    assert openwebui_socket._meaningful_progress_timeout() == 1200.0
     monkeypatch.setenv("LLM_OPENWEBUI_PROGRESS_TIMEOUT", "120")
     assert openwebui_socket._meaningful_progress_timeout() == 120.0
     for invalid in ("0", "-1", "nan", "inf", "oops"):

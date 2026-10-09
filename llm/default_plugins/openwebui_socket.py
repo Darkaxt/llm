@@ -107,7 +107,7 @@ async def _recover_sessionless_completion(
 
 def _meaningful_progress_timeout() -> float:
     """Timeout for real model/tool activity, independent of socket heartbeats."""
-    value = os.environ.get("LLM_OPENWEBUI_PROGRESS_TIMEOUT", "300")
+    value = os.environ.get("LLM_OPENWEBUI_PROGRESS_TIMEOUT", "1200")
     try:
         seconds = float(value)
     except ValueError as exc:

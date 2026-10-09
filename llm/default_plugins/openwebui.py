@@ -132,7 +132,7 @@ def _save_config(config: dict[str, Any]) -> None:
 
 
 def _chat_timeout() -> int:
-    raw = os.environ.get("LLM_OPENWEBUI_CHAT_TIMEOUT", "600")
+    raw = os.environ.get("LLM_OPENWEBUI_CHAT_TIMEOUT", "1200")
     try:
         timeout = int(float(raw))
     except ValueError as exc:
