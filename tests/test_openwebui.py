@@ -760,8 +760,8 @@ def test_enabled_knowledge_items_match_browser_picker_shape(monkeypatch):
 @pytest.mark.parametrize(
     "transport, sessionless, function_calling",
     [
-        ("sessionless_native", True, None),
         ("background_legacy", False, "legacy"),
+        ("background_native", False, "native"),
     ],
 )
 def test_enabled_knowledge_is_prefetched_without_forced_rag(
@@ -793,7 +793,7 @@ def test_enabled_knowledge_is_prefetched_without_forced_rag(
         lambda client, model_id: {
             "id": model_id,
             "name": "GLM",
-            "info": {"meta": {"capabilities": {"builtin_tools": True}}},
+            "info": {"meta": {"capabilities": {"builtin_tools": False}}},
         },
     )
     monkeypatch.setattr(
@@ -2221,3 +2221,112 @@ def test_explicit_mcp_search_requires_server_executed_evidence(
         list(model.execute(llm.Prompt("Investigate", model), True, result, None))
         assert result.response_json["verified_mcp_tool_results"] == 0
         assert result.response_json["tool_calls"] == tool_calls
+
+
+def test_native_mcp_transport_requires_server_disabled_builtins():
+    model = {"id": "glm-5.3", "info": {"meta": {"capabilities": {}}}}
+    with pytest.raises(llm.ModelError, match="builtin_tools=false"):
+        openwebui._require_isolated_native_mcp(model)
+    model["info"]["meta"]["capabilities"]["builtin_tools"] = True
+    with pytest.raises(llm.ModelError, match="builtin_tools=false"):
+        openwebui._require_isolated_native_mcp(model)
+    model["info"]["meta"]["capabilities"]["builtin_tools"] = False
+    openwebui._require_isolated_native_mcp(model)
+
+
+def test_native_mcp_transport_refuses_direct_model_metadata_override():
+    model = {
+        "id": "glm-5.3",
+        "direct": True,
+        "info": {"meta": {"capabilities": {"builtin_tools": False}}},
+    }
+    with pytest.raises(llm.ModelError, match="builtin_tools=false"):
+        openwebui._require_isolated_native_mcp(model)
+
+
+@pytest.mark.usefixtures("supported_openwebui_server")
+def test_sessionless_native_rejected_before_tool_submission(monkeypatch):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {
+            "url": "https://example.test",
+            "token": "jwt",
+            "enabled_tool_ids": ["server:mcp:splunk-mcp"],
+        },
+    )
+
+    class FakeClient:
+        base_url = "https://example.test"
+        token = "jwt"
+        timeout = 1200
+
+    monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui, "_get_model_item", lambda client, model_id: {"id": model_id}
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_prepare_openwebui_request",
+        lambda *args, **kwargs: ([{"role": "user", "content": "investigate"}], []),
+    )
+    monkeypatch.setattr(openwebui, "_enabled_knowledge_items", lambda *args: [])
+    model = openwebui.OpenWebUIModel("glm-5.3")
+    prompt = llm.Prompt(
+        "investigate",
+        model,
+        options=model.Options(openwebui_mcp_transport="sessionless_native"),
+    )
+    with pytest.raises(
+        llm.ModelError,
+        match="cannot run Open WebUI's iterative",
+    ):
+        list(model.execute(prompt, True, SimpleNamespace(response_json=None), None))
+
+
+def test_default_openwebui_mcp_transport_is_safe_legacy():
+    model = openwebui.OpenWebUIModel("glm-5.3")
+    assert model.Options().openwebui_mcp_transport == "background_legacy"
+
+
+
+@pytest.mark.parametrize(
+    "builtin_tools, expected_ready",
+    [(True, False), (None, False), (False, True)],
+)
+def test_openwebui_doctor_reports_native_mcp_readiness(
+    monkeypatch, builtin_tools, expected_ready
+):
+    from click.testing import CliRunner
+
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {"enabled_tool_ids": ["server:mcp:splunk-mcp"]},
+    )
+    monkeypatch.setattr(openwebui, "_client", lambda config: object())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {
+            "id": model_id,
+            "info": {"meta": {"capabilities": {"builtin_tools": builtin_tools}}},
+        },
+    )
+
+    @click.group()
+    def app():
+        pass
+
+    openwebui.register_commands(app)
+    result = CliRunner().invoke(
+        app, ["openwebui", "doctor", "--model", "glm-5.3"]
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["iterative_mcp_ready"] is expected_ready
+    assert payload["server_builtin_tools"] is builtin_tools
+    assert payload["selected_tool_ids"] == ["server:mcp:splunk-mcp"]
+    assert payload["recommended_transport"] == (
+        "background_native" if expected_ready else "background_legacy (one-shot)"
+    )
