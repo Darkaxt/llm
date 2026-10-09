@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -278,6 +279,118 @@ def _structured_tool_events(output: Any) -> list[dict[str, Any]]:
     return events
 
 
+
+def _capture_server_tool_sources(
+    sources: Any,
+    state: dict[str, Any],
+    *,
+    tool_ids: list[str],
+    on_tool: Callable[[str], None],
+    on_source: Callable[[dict[str, Any]], None],
+) -> int:
+    """Record legacy tool execution evidence emitted by Open WebUI.
+
+    With function_calling=legacy, Open WebUI runs its preliminary tool-call
+    handler before starting the assistant model stream. It returns results in
+    chat:completion data.sources (tool_result=True), not in the native
+    function_call output items. Source IDs follow get_source_context()'s
+    ordered, unique metadata.source mapping.
+    """
+    if not isinstance(sources, list):
+        return 0
+    captured = 0
+    source_ids = state.setdefault("source_ids", {})
+    seen = state.setdefault("server_tool_source_keys", set())
+    server_ids = [
+        item[len("server:mcp:") :]
+        for item in tool_ids
+        if item.startswith("server:mcp:")
+    ]
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        origin = source.get("source")
+        origin = origin if isinstance(origin, dict) else {}
+        metadata = source.get("metadata")
+        metadata = metadata if isinstance(metadata, list) else []
+        # Assign IDs for *all* sources (including non-tools) to match the
+        # IDs the model receives from Open WebUI's get_source_context().
+        for meta in metadata:
+            if not isinstance(meta, dict):
+                continue
+            source_key = str(
+                meta.get("source") or origin.get("id") or "N/A"
+            )
+            if source_key not in source_ids:
+                source_ids[source_key] = len(source_ids) + 1
+        if source.get("tool_result") is not True:
+            continue
+
+        name = str(origin.get("name") or "")
+        if not name:
+            continue
+        tool_metadata = next(
+            (item for item in metadata if isinstance(item, dict)), {}
+        )
+        source_key = str(
+            tool_metadata.get("source") or origin.get("id") or "N/A"
+        )
+        citation_id = source_ids.setdefault(
+            source_key, len(source_ids) + 1
+        )
+        documents = source.get("document")
+        content = "\n".join(str(doc) for doc in documents) if isinstance(documents, list) else ""
+        params = tool_metadata.get("parameters")
+        params = params if isinstance(params, dict) else {}
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        dedup = (
+            name,
+            digest,
+            json.dumps(params, sort_keys=True, default=str),
+        )
+        if dedup in seen:
+            continue
+        seen.add(dedup)
+
+        is_mcp = any(
+            name == server_id or name.startswith(server_id + "_")
+            for server_id in server_ids
+        )
+        record: dict[str, Any] = {
+            "source_id": citation_id,
+            "tool": name,
+            "is_mcp": is_mcp,
+            "server_executed": True,
+            "parameters": params,
+            "result_chars": len(content),
+            "result_sha256": digest,
+            # Bounded evidence for post-incident audit without allowing a
+            # large Splunk result to bloat the local JSONL journal.
+            "result_excerpt": content[:32768],
+            "result_truncated": len(content) > 32768,
+        }
+        state.setdefault("server_tool_sources", []).append(record)
+        # Legacy calls have no native function_call event; expose their
+        # result in the same structured response as native tool calls.
+        state.setdefault("tool_results", []).append(
+            {
+                "name": name,
+                "result": content[:32768],
+                "server_executed": True,
+                "source_id": citation_id,
+            }
+        )
+        state["last_progress_at"] = time.monotonic()
+        on_source(record)
+        label = "MCP" if is_mcp else "tool"
+        on_tool(
+            f"↳ {label} {name} returned (source [{citation_id}], "
+            f"{len(content)} chars)"
+        )
+        captured += 1
+    return captured
+
+
 def _reconcile_answer_snapshot(
     answer: str,
     state: dict[str, Any],
@@ -477,6 +590,7 @@ async def run_chat_with_tools_with_files(
     on_tool: Callable[[str], None] | None = None,
     on_status: Callable[[str], None] | None = None,
     on_reasoning: Callable[[str], None] | None = None,
+    on_source: Callable[[dict[str, Any]], None] | None = None,
     chat_id: str | None = None,
     sessionless_server_tools: bool = False,
     stop_requested: threading.Event | None = None,
@@ -501,6 +615,7 @@ async def run_chat_with_tools_with_files(
     out_tool = on_tool or (lambda _s: None)
     out_status = on_status or (lambda _s: None)
     out_reasoning = on_reasoning or (lambda _s: None)
+    out_source = on_source or (lambda _record: None)
 
     # python-socketio's aiohttp session defaults to trust_env=False, so it would
     # IGNORE HTTP_PROXY/HTTPS_PROXY and bypass the vault proxy that injects
@@ -532,6 +647,7 @@ async def run_chat_with_tools_with_files(
         "phase_started_at": time.monotonic(),
         "stream_started": False,
         "stream_delta_count": 0,
+        "server_tool_sources": [],
     }
     done = asyncio.Event()
     remote_task_ids: list[str] = []
@@ -586,7 +702,15 @@ async def run_chat_with_tools_with_files(
                     }
                 )
         if new_results:
-            state["tool_results"] = new_results
+            existing = {
+                (str(item.get("name")), str(item.get("source_id", "")))
+                for item in state["tool_results"]
+            }
+            for result in new_results:
+                key = (str(result.get("name")), "")
+                if key not in existing:
+                    state["tool_results"].append(result)
+                    existing.add(key)
 
     def _handle_event(payload: dict[str, Any]) -> None:
         # Current Open WebUI emits on Socket.IO "events"; older releases used
@@ -599,6 +723,16 @@ async def run_chat_with_tools_with_files(
         etype = event.get("type")
         data = event.get("data") or {}
         # Socket.IO status/heartbeat/duplicate snapshot events are not progress.
+
+        if etype == "source":
+            _capture_server_tool_sources(
+                [data],
+                state,
+                tool_ids=tool_ids,
+                on_tool=out_tool,
+                on_source=out_source,
+            )
+            return
 
         if etype == "status":
             action = data.get("action") or data.get("description")
@@ -655,6 +789,20 @@ async def run_chat_with_tools_with_files(
 
         if etype != "chat:completion":
             return
+
+        if isinstance(data, dict) and "sources" in data:
+            # OWUI 0.11.x emits source evidence BEFORE streaming tokens.
+            # In legacy FC this is the only visible record of server-side
+            # MCP execution; final output.function_call may be empty.
+            count = _capture_server_tool_sources(
+                data["sources"],
+                state,
+                tool_ids=tool_ids,
+                on_tool=out_tool,
+                on_source=out_source,
+            )
+            if count:
+                out_status(f"{count} server-side tool result(s) verified")
 
         if isinstance(data, dict) and data.get("error"):
             err = data["error"]
@@ -1074,4 +1222,5 @@ async def run_chat_with_tools_with_files(
         "raw_content": state["raw_content"],
         "remote_chat_id": remote_chat_id or chat_id,
         "remote_task_ids": remote_task_ids,
+        "server_tool_sources": state["server_tool_sources"],
     }

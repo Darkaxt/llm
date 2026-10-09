@@ -1948,6 +1948,20 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
     events = []
     payloads = [
         {
+            "type": "chat:completion",
+            "data": {
+                "sources": [{
+                    "source": {"name": "splunk-mcp_search"},
+                    "document": ["{'event_count': 8, 'index': 'digit_sec'}"],
+                    "metadata": [{
+                        "source": "splunk-mcp_search",
+                        "parameters": {"query": "index=digit_sec | stats count"},
+                    }],
+                    "tool_result": True,
+                }],
+            },
+        },
+        {
             "type": "response:completion",
             "data": {
                 "type": "response.reasoning_text.delta",
@@ -2059,6 +2073,8 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
             on_text=lambda value: events.append(("text", value)),
             on_reasoning=lambda value: events.append(("reasoning", value)),
             on_status=lambda value: events.append(("status", value)),
+            on_source=lambda value: events.append(("source", value)),
+            on_tool=lambda value: events.append(("tool", value)),
         )
 
     result = asyncio.run(run())
@@ -2072,3 +2088,136 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
         "Thinking"
     ]
     assert ("status", "live model token stream started") in events
+    assert len(result["server_tool_sources"]) == 1
+    provenance = result["server_tool_sources"][0]
+    assert provenance["is_mcp"] is True
+    assert provenance["server_executed"] is True
+    assert provenance["source_id"] == 1
+    assert provenance["parameters"]["query"] == "index=digit_sec | stats count"
+    assert "event_count" in provenance["result_excerpt"]
+    assert ("source", provenance) in events
+    assert any(kind == "tool" and "splunk-mcp_search" in line for kind, line in events)
+
+
+
+def test_legacy_mcp_source_capture_matches_openwebui_numbered_source_ids():
+    state = _openwebui_stream_test_state()
+    state["last_progress_at"] = 0.0
+    captured = []
+    activity = []
+    sources = [
+        {
+            "source": {"id": "file-1", "name": "Knowledge file"},
+            "document": ["unrelated KB metadata"],
+            "metadata": [{"source": "file-1"}],
+        },
+        {
+            "source": {"name": "splunk-mcp_search"},
+            "document": ["{'event_count': 8, 'et': 1791286913.205}"],
+            "metadata": [{
+                "source": "splunk-mcp_search",
+                "parameters": {"query": "index=digit_sec | stats count"},
+            }],
+            "tool_result": True,
+        },
+    ]
+    args = {
+        "tool_ids": ["server:mcp:splunk-mcp"],
+        "on_tool": activity.append,
+        "on_source": captured.append,
+    }
+    assert openwebui_socket._capture_server_tool_sources(sources, state, **args) == 1
+    assert captured[0]["source_id"] == 2
+    assert captured[0]["is_mcp"] is True
+    assert captured[0]["server_executed"] is True
+    assert captured[0]["parameters"]["query"] == "index=digit_sec | stats count"
+    assert "1791286913.205" in captured[0]["result_excerpt"]
+    assert captured[0]["result_truncated"] is False
+    assert len(captured[0]["result_sha256"]) == 64
+    assert state["tool_results"][0]["source_id"] == 2
+    assert "splunk-mcp_search" in activity[0]
+    # Replayed source snapshots must not inflate the evidence count.
+    assert openwebui_socket._capture_server_tool_sources(sources, state, **args) == 0
+    assert len(captured) == 1
+    assert len(activity) == 1
+
+
+def test_legacy_mcp_source_capture_ignores_non_tool_citations():
+    state = _openwebui_stream_test_state()
+    captured = []
+    assert openwebui_socket._capture_server_tool_sources(
+        [{
+            "source": {"name": "KB excerpt"},
+            "metadata": [{"source": "kb-1"}],
+            "document": ["one fake source"],
+        }],
+        state,
+        tool_ids=["server:mcp:splunk-mcp"],
+        on_tool=lambda value: None,
+        on_source=captured.append,
+    ) == 0
+    assert captured == []
+    assert state["tool_results"] == []
+
+
+@pytest.mark.usefixtures("supported_openwebui_server")
+@pytest.mark.parametrize(
+    "tool_calls, expected_error",
+    [
+        ([], True),
+        ([{"name": "splunk-mcp_search", "result": "8 events"}], False),
+    ],
+)
+def test_explicit_mcp_search_requires_server_executed_evidence(
+    monkeypatch, tool_calls, expected_error
+):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {
+            "url": "https://example.test",
+            "token": "jwt",
+            "models": [],
+            "enabled_tool_ids": ["server:mcp:splunk-mcp"],
+        },
+    )
+
+    class FakeClient:
+        base_url = "https://example.test"
+        token = "jwt"
+        timeout = 1200
+
+    monkeypatch.setattr(openwebui, "_client", lambda config: FakeClient())
+    monkeypatch.setattr(
+        openwebui,
+        "_get_model_item",
+        lambda client, model_id: {"id": model_id, "name": "GLM"},
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_prepare_openwebui_request",
+        lambda prompt, client, **kwargs: (
+            [{"role": "user", "content": "Execute Splunk MCP searches for this notable"}],
+            [],
+        ),
+    )
+    async def fake_runner(**kwargs):
+        return {
+            "answer": "8 events",
+            "reasoning": None,
+            "tool_calls": tool_calls,
+            "raw_content": "8 events",
+            "server_tool_sources": [],
+            "remote_chat_id": "temporary:test",
+            "remote_task_ids": ["task"],
+        }
+    monkeypatch.setattr(openwebui, "run_chat_with_tools_with_files", fake_runner)
+    model = openwebui.OpenWebUIModel("glm-5.3")
+    result = SimpleNamespace(response_json=None)
+    if expected_error:
+        with pytest.raises(llm.ModelError, match="No server-executed MCP search"):
+            list(model.execute(llm.Prompt("Investigate", model), True, result, None))
+    else:
+        list(model.execute(llm.Prompt("Investigate", model), True, result, None))
+        assert result.response_json["verified_mcp_tool_results"] == 0
+        assert result.response_json["tool_calls"] == tool_calls

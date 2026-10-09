@@ -3076,6 +3076,13 @@ class OpenWebUIModel(llm.Model):
             )
             events.put(("tool", line))
 
+        def on_source(record: dict[str, Any]) -> None:
+            # Native tool calls appear in structured output. Legacy Open WebUI
+            # MCP tools instead return their evidence in chat:completion.sources
+            # before the first model token; without this the JSONL cannot
+            # verify whether the model actually searched Splunk.
+            journal_provider({"type": "provider_tool_source", **record})
+
         def on_status(line: str) -> None:
             status_activity.append(line)
             journal_provider(
@@ -3128,12 +3135,18 @@ class OpenWebUIModel(llm.Model):
                             on_reasoning=on_reasoning,
                             on_tool=on_tool,
                             on_status=on_status,
+                            on_source=on_source,
                         )
                     )
                     remote_execution.update(
                         {
                             "remote_chat_id": data.get("remote_chat_id"),
                             "remote_task_ids": data.get("remote_task_ids", []),
+                            "server_tool_sources": data.get("server_tool_sources", []),
+                            "verified_mcp_tool_results": sum(
+                                1 for source in data.get("server_tool_sources", [])
+                                if source.get("is_mcp") and source.get("server_executed")
+                            ),
                         }
                     )
                     result = ChatResult(
@@ -3225,6 +3238,54 @@ class OpenWebUIModel(llm.Model):
                 elif kind == "done":
                     status_bar.clear()
                     result = payload
+                    # A user explicitly requesting Splunk MCP searches should
+                    # never receive a successful, apparently evidence-backed
+                    # investigation when the transport captured no executed
+                    # tool results. Other chats (e.g. KB macro inventory) may
+                    # legitimately finish without any MCP call.
+                    user_text = "\n".join(
+                        str(message.get("content") or "")
+                        for message in messages if message.get("role") == "user"
+                    )
+                    expects_mcp = bool(
+                        re.search(r"\bMCP\b", user_text, re.IGNORECASE)
+                        and re.search(
+                            r"\b(search(?:es)?|execut(?:e|ed)|run|query|investigat\w*)\b",
+                            user_text,
+                            re.IGNORECASE,
+                        )
+                    )
+                    mcp_servers = [
+                        item[len("server:mcp:") :]
+                        for item in tool_ids if item.startswith("server:mcp:")
+                    ]
+                    observed = (
+                        remote_execution.get("verified_mcp_tool_results", 0) > 0
+                        or any(
+                            (
+                                str(call.get("name") or "") == server_id
+                                or str(call.get("name") or "").startswith(server_id + "_")
+                            )
+                            and call.get("result") is not None
+                            for call in (result.tool_calls or [])
+                            if isinstance(call, dict)
+                            for server_id in mcp_servers
+                        )
+                    )
+                    if tool_ids and expects_mcp and not observed:
+                        error = (
+                            "No server-executed MCP search result was observed "
+                            "for this investigation. The answer may contain "
+                            "unverified claims and must not be treated as "
+                            "live Splunk evidence. Check the provider_tool_source "
+                            "journal records or retry the investigation."
+                        )
+                        journal_provider({
+                            "type": "provider_error",
+                            "error": error,
+                            "error_class": "MCPVerificationError",
+                        })
+                        raise llm.ModelError(error)
                     response.response_json = {
                         "provider": "openwebui",
                         "provider_run_id": provider_run_id,
