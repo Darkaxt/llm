@@ -45,7 +45,7 @@ first implementation to those requirements without claiming migration completion
 |---|---|---|
 | 1. Preserve Open WebUI baseline | COMPLETE | PR #1 merged as `31b9bce`; regression/dependency, lint, formatting, type, documentation and packaging QA inspected |
 | 2. Profile and availability diagnostics | COMPLETE | A1-A4 verified with protocol/client-loop fixtures and affected regressions; A5 setup/report instructions delivered in issue #28 |
-| 3. Workplace availability validation | BLOCKED | Profile creation and authenticated model discovery verified; inference/stream/tool, local KB assessment and direct MCP artifacts remain required |
+| 3. Workplace availability validation | BLOCKED | Profile/discovery, selected-model inference/stream/tool continuation and local KB structure verified; independent Splunk MCP access remains unverified |
 | 4. Investigation integration and validation | NOT STARTED | R4-R7 depend on confirmed workplace model/MCP contracts |
 
 Stage 2 verification: APISIX profile, secret-safe error reporting, two TLS flag
@@ -61,7 +61,7 @@ First workplace artifact (issue comment `6124613360`): the checkout matches
 bare `python` commands failed on import of `sqlite_utils`, which the installation
 log confirms exists in that virtual environment. The profile/key/discovery commands
 never reached execution. Workplace instructions now select one explicit environment
-executable for every command. No production change is required for this mismatch;
+executable for every command. No production change is required for this mismatch.
 The following workplace artifact resolves those import and discovery checks.
 
 Second workplace artifact (issue comment `6124690308`, checkout `2020b30`):
@@ -75,13 +75,35 @@ exist; completeness and macro resolution remain unverified. No KB recreation or
 production-code fix is justified by this artifact. The next workplace commands
 use the same explicit executable for KB assessment and the first model report.
 
+Third workplace artifact (issue comment `6124772289`, implementation `2020b30`,
+Python 3.12.1): all five API probes pass for `deepseek-v4-flash`, including
+incremental text, streamed function arguments and synthetic tool-result
+continuation. The text stream has six text deltas, first text at approximately
+0.953 seconds and completion at 1.078 seconds. This verifies short synthetic
+requests, not the long investigation or recovery workflow. The other two models
+have discovery evidence only. Provider reasoning defaults are unchanged.
+
+The same artifact assesses the existing local TIDE folder as structurally
+`reusable`, with 455 rule triples, 360 macro files and no reported problems.
+Preserve and reuse this bundle; no recreation or upload is indicated. This
+assessment does not establish model-side KB context or semantic correctness of
+every rule. The APISIX provider currently assesses the folder but does not yet
+inject it into model prompts; that integration remains Stage 4 work.
+
+The user's project lead describes APISIX as a proxy. APISIX routes traffic to
+configured upstreams; this statement does not establish that the workplace model
+route exposes existing Open WebUI knowledge or MCP APIs. Preserve the old remote
+KB as well. Read-only Open WebUI knowledge/tool listings and confirmation of
+the approved direct MCP transport/authentication method are the next workplace
+evidence, without requesting URLs or credentials here.
+
 External blocker B1 (Stage 3, R3-R5): the development host cannot reach corporate
 services, has no corporate credentials or actual TIDE folder, and has no direct
-MCP transport/authentication contract. Discovery is now verified; resolution of
-the remaining criteria requires workplace inference/stream/tool and local-knowledge
-artifacts plus the approved MCP transport and
-authentication method. Until that evidence arrives, live model availability,
-incremental streaming/function calling, actual knowledge reuse and independent
-MCP access remain unverified. Stage 4 integration and the final investigation
-workflow cannot be considered complete. No required work is deferred outside
-these named stages.
+MCP transport/authentication contract. Workplace artifacts now verify discovery,
+short model/stream/tool behavior and local knowledge structure. R5 remains blocked
+on approved independent MCP access, transport and authentication metadata from
+the workplace. That evidence resolves the remaining Stage 3 blocker; existing
+Open WebUI tool visibility alone cannot satisfy independent MCP availability.
+Stage 4 KB-context/MCP integration and the final investigation/recovery workflow
+cannot be considered complete. No required work is deferred outside these named
+stages.
