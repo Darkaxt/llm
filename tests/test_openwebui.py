@@ -1,10 +1,10 @@
 import io
-import zipfile
 import json
-
-import pytest
-import click
+import zipfile
 from types import SimpleNamespace
+
+import click
+import pytest
 
 import llm
 from llm.default_plugins import openwebui, openwebui_socket
@@ -236,7 +236,6 @@ def test_wait_for_file_processing_surfaces_server_error(monkeypatch):
         raise AssertionError("expected file processing failure")
 
 
-
 def test_attachment_context_auto_uses_full_for_small_text_and_rag_for_zip():
     files = [
         {
@@ -288,14 +287,12 @@ def test_attachment_context_full_is_explicit_override():
     assert files[0]["context"] == "full"
 
 
-
 def test_openwebui_chat_timeout_default_and_override(monkeypatch):
     monkeypatch.delenv("LLM_OPENWEBUI_CHAT_TIMEOUT", raising=False)
     assert openwebui._chat_timeout() == 1200
 
     monkeypatch.setenv("LLM_OPENWEBUI_CHAT_TIMEOUT", "900")
     assert openwebui._chat_timeout() == 900
-
 
 
 @pytest.mark.usefixtures("supported_openwebui_server")
@@ -397,7 +394,6 @@ def test_resolve_tool_selector_matches_mcp_name():
     assert openwebui._tool_kind(tool.id) == "mcp"
 
 
-
 @pytest.mark.usefixtures("supported_openwebui_server")
 def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
     monkeypatch.setattr(
@@ -462,7 +458,6 @@ def test_tool_chat_without_attachments_uses_compat_runner(monkeypatch):
     assert calls[0]["model_item"]["info"]["meta"]["capabilities"] == {}
 
 
-
 def test_current_openwebui_structured_output_parsing():
     output = [
         {
@@ -473,13 +468,13 @@ def test_current_openwebui_structured_output_parsing():
             "type": "function_call",
             "call_id": "call-1",
             "name": "splunk-mcp_search",
-            "arguments": "{\"search\": \"index=_internal | head 1\"}",
+            "arguments": '{"search": "index=_internal | head 1"}',
             "status": "completed",
         },
         {
             "type": "function_call_output",
             "call_id": "call-1",
-            "output": [{"type": "output_text", "text": "{\"result\": 1}"}],
+            "output": [{"type": "output_text", "text": '{"result": 1}'}],
         },
         {
             "type": "message",
@@ -489,14 +484,13 @@ def test_current_openwebui_structured_output_parsing():
         {
             "type": "message",
             "role": "user",
-            "content": [{"type": "output_text", "text": "Summarize the returned event."}],
+            "content": [
+                {"type": "output_text", "text": "Summarize the returned event."}
+            ],
         },
     ]
 
-    assert (
-        openwebui_socket._structured_output_text(output)
-        == "The search succeeded."
-    )
+    assert openwebui_socket._structured_output_text(output) == "The search succeeded."
     assert openwebui_socket._structured_reasoning(output) == ["Need Splunk."]
 
     events = openwebui_socket._structured_tool_events(output)
@@ -504,12 +498,11 @@ def test_current_openwebui_structured_output_parsing():
         {
             "name": "splunk-mcp_search",
             "call_id": "call-1",
-            "arguments": "{\"search\": \"index=_internal | head 1\"}",
-            "result": "{\"result\": 1}",
+            "arguments": '{"search": "index=_internal | head 1"}',
+            "result": '{"result": 1}',
             "done": True,
         }
     ]
-
 
 
 def test_file_progress_can_be_routed_to_status_callback(monkeypatch):
@@ -526,9 +519,7 @@ def test_file_progress_can_be_routed_to_status_callback(monkeypatch):
         on_status=seen.append,
     )
 
-    assert seen == [
-        "attachments 3/3 · bundle.zip · processing · 01:00"
-    ]
+    assert seen == ["attachments 3/3 · bundle.zip · processing · 01:00"]
 
 
 def test_attachment_context_can_be_routed_to_status_callback():
@@ -558,10 +549,7 @@ def test_attachment_context_can_be_routed_to_status_callback():
 
     assert files[0]["context"] == "full"
     assert "context" not in files[1]
-    assert seen == [
-        "attachment context · SKILL.md=full · kb.zip=rag"
-    ]
-
+    assert seen == ["attachment context · SKILL.md=full · kb.zip=rag"]
 
 
 def test_zip_sidecar_extraction_prefers_machine_readable_bundle_files():
@@ -620,7 +608,6 @@ def test_zip_without_expected_sidecars_is_left_unchanged():
         )
         == []
     )
-
 
 
 def test_sidecar_member_selection_prefers_one_coherent_root():
@@ -699,7 +686,6 @@ def test_7z_sidecar_extraction():
         "macros.json",
     ]
     assert b"67e794d5-73b2-45e5-b570-ceb5e0bba352" in sidecars[0][1].content
-
 
 
 def test_local_knowledge_manifest_preserves_relative_paths(tmp_path):
@@ -886,9 +872,7 @@ def test_resolve_knowledge_context_extracts_exact_tide_evidence(monkeypatch):
                     "name": "CSOC integration for AWS GUARDDUTY",
                     "rule_file": "guardduty.yaml",
                 },
-                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": {
-                    "name": "unrelated"
-                },
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": {"name": "unrelated"},
             }
         ),
         "rules": "\n".join(
@@ -910,9 +894,7 @@ def test_resolve_knowledge_context_extracts_exact_tide_evidence(monkeypatch):
         ),
         "macros": json.dumps(
             {
-                "aws_cloudtrail": {
-                    "definition": "index=aws sourcetype=aws:cloudtrail"
-                },
+                "aws_cloudtrail": {"definition": "index=aws sourcetype=aws:cloudtrail"},
                 "unrelated_macro": {"definition": "index=other"},
             }
         ),
@@ -975,9 +957,7 @@ def test_resolve_knowledge_context_appends_existing_system_message(monkeypatch):
         openwebui,
         "_knowledge_exact_file",
         lambda client, knowledge_id, filename: (
-            {"id": "skill", "filename": "SKILL.md"}
-            if filename == "SKILL.md"
-            else None
+            {"id": "skill", "filename": "SKILL.md"} if filename == "SKILL.md" else None
         ),
     )
     monkeypatch.setattr(
@@ -1056,18 +1036,12 @@ def test_sync_knowledge_folder_uses_native_diff_and_relative_paths(
     )
 
     diff_body = requests[0][2]["json_body"]
-    assert {
-        (item["path"], item["filename"])
-        for item in diff_body["manifest"]
-    } == {
+    assert {(item["path"], item["filename"]) for item in diff_body["manifest"]} == {
         ("rules", "one.yaml"),
         ("", "macros.json"),
     }
     assert len(uploads) == 2
-    assert {
-        (item["entry"]["path"], item["entry"]["filename"])
-        for item in uploads
-    } == {
+    assert {(item["entry"]["path"], item["entry"]["filename"]) for item in uploads} == {
         ("rules", "one.yaml"),
         ("", "macros.json"),
     }
@@ -1097,10 +1071,7 @@ def test_local_knowledge_manifest_expands_zip_as_virtual_tree(tmp_path):
         )
 
     manifest = openwebui._local_knowledge_manifest(tmp_path)
-    virtual_paths = {
-        (item["path"], item["filename"])
-        for item in manifest
-    }
+    virtual_paths = {(item["path"], item["filename"]) for item in manifest}
 
     assert ("", "SKILL.md") in virtual_paths
     assert ("", "SPEC.md") in virtual_paths
@@ -1137,13 +1108,11 @@ def test_local_knowledge_manifest_expands_7z_as_virtual_tree(tmp_path):
         )
 
     manifest = openwebui._local_knowledge_manifest(tmp_path)
-    virtual_paths = {
-        (item["path"], item["filename"])
-        for item in manifest
-    }
+    virtual_paths = {(item["path"], item["filename"]) for item in manifest}
 
     assert ("bundle", "rule-index.json") in virtual_paths
     assert ("", "bundle.7z") not in virtual_paths
+
 
 def test_interrupted_knowledge_sync_fails_before_mutation(tmp_path, monkeypatch):
     (tmp_path / "rule-index.json").write_text("{}", encoding="utf-8")
@@ -1273,7 +1242,6 @@ def test_clean_rebuild_sync_bypasses_orphan_detection(tmp_path, monkeypatch):
     assert len(uploads) == 1
 
 
-
 def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
     monkeypatch.setattr(openwebui_socket.time, "time", lambda: 1234.0)
     model_item = {
@@ -1329,7 +1297,6 @@ def test_browser_chat_body_matches_current_openwebui_contract(monkeypatch):
     }
 
 
-
 def test_browser_chat_body_can_omit_session_id_for_server_tools(monkeypatch):
     monkeypatch.setattr(openwebui_socket.time, "time", lambda: 1234.0)
 
@@ -1351,6 +1318,7 @@ def test_browser_chat_body_can_omit_session_id_for_server_tools(monkeypatch):
     assert body["message_ids"][0]["model_id"] == "deepseek-v41-flash"
     assert body["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert body["params"] == {}
+
 
 @pytest.mark.usefixtures("supported_openwebui_server")
 def test_cli_tool_selection_does_not_merge_model_default_tools(monkeypatch):
@@ -1420,9 +1388,7 @@ def test_cli_tool_selection_does_not_merge_model_default_tools(monkeypatch):
 
     model = openwebui.OpenWebUIModel("deepseek-v41-flash")
     response = SimpleNamespace(response_json=None)
-    assert list(
-        model.execute(llm.Prompt("test", model), True, response, None)
-    ) == []
+    assert list(model.execute(llm.Prompt("test", model), True, response, None)) == []
 
     assert calls[0]["tool_ids"] == ["server:mcp:splunk-mcp"]
     assert "server:mcp:misp-prod" not in calls[0]["tool_ids"]
@@ -1494,7 +1460,6 @@ def test_server_mcp_guard_can_be_explicitly_overridden(monkeypatch):
     ) == ("0.9.1", False)
 
 
-
 def test_sessionless_http_drop_can_recover_completed_socket_event():
     import asyncio
 
@@ -1549,7 +1514,6 @@ def test_sessionless_recovery_grace_validation(monkeypatch):
     assert openwebui_socket._sessionless_recovery_grace() == 15.0
 
 
-
 def test_meaningful_progress_timeout_not_reset_by_socket_keepalives():
     state = {
         "phase": "initial model",
@@ -1562,9 +1526,12 @@ def test_meaningful_progress_timeout_not_reset_by_socket_keepalives():
     assert "no model/tool progress for 400s" in reason
     assert "initial model" in reason
     state["last_progress_at"] = 350.0
-    assert openwebui_socket._stalled_request_error(
-        state, 400.0, event_timeout=600.0, progress_timeout=300.0
-    ) is None
+    assert (
+        openwebui_socket._stalled_request_error(
+            state, 400.0, event_timeout=600.0, progress_timeout=300.0
+        )
+        is None
+    )
 
 
 def test_meaningful_progress_timeout_config(monkeypatch):
@@ -1623,7 +1590,6 @@ def test_cancel_remote_background_chat_tasks_uses_user_scoped_endpoint():
     asyncio.run(scenario())
 
 
-
 @pytest.fixture
 def tide_v3_knowledge_server(monkeypatch):
     """Simulate Open WebUI 0.11.3's directory-scoped Knowledge files API."""
@@ -1652,30 +1618,36 @@ def tide_v3_knowledge_server(monkeypatch):
             "aws_cloudtrail_log\tsource\n"
             "other_macro\tenrichment\n"
         ),
-        "aws_sso_log": json.dumps({
-            "stanza": "aws_sso_log(1)",
-            "definition": "index=aws sourcetype=cloudtrail",
-            "role_hints": ["source"],
-        }),
-        "aws_cloudtrail_log": json.dumps({
-            "stanza": "aws_cloudtrail_log",
-            "definition": "index=aws sourcetype=aws:cloudtrail",
-            "role_hints": ["source"],
-        }),
+        "aws_sso_log": json.dumps(
+            {
+                "stanza": "aws_sso_log(1)",
+                "definition": "index=aws sourcetype=cloudtrail",
+                "role_hints": ["source"],
+            }
+        ),
+        "aws_cloudtrail_log": json.dumps(
+            {
+                "stanza": "aws_cloudtrail_log",
+                "definition": "index=aws sourcetype=aws:cloudtrail",
+                "role_hints": ["source"],
+            }
+        ),
         "detection": '{"name": "CSOC integration for AWS GUARDDUTY"}',
         "query": "index=aws sourcetype=aws:asl:guardduty",
-        "dependencies": json.dumps({
-            "dependencies": [
-                {
-                    "resolution_policy": "resolve",
-                    "file": "macros/by-stanza/aws_sso_log%281%29.json",
-                },
-                {
-                    "resolution_policy": "skip",
-                    "file": "macros/by-stanza/skipped_macro.json",
-                },
-            ]
-        }),
+        "dependencies": json.dumps(
+            {
+                "dependencies": [
+                    {
+                        "resolution_policy": "resolve",
+                        "file": "macros/by-stanza/aws_sso_log%281%29.json",
+                    },
+                    {
+                        "resolution_policy": "skip",
+                        "file": "macros/by-stanza/skipped_macro.json",
+                    },
+                ]
+            }
+        ),
     }
     files = {
         "macros": {"index.tsv": "index"},
@@ -1722,7 +1694,9 @@ def tide_v3_knowledge_server(monkeypatch):
         openwebui, "_knowledge_file_text", lambda client, file_id: contents[file_id]
     )
     return SimpleNamespace(
-        client=SimpleNamespace(base_url="https://example.test", token="jwt", timeout=600),
+        client=SimpleNamespace(
+            base_url="https://example.test", token="jwt", timeout=600
+        ),
         requests=requests,
         contents=contents,
         uuid=uuid,
@@ -1736,9 +1710,14 @@ def test_tide_v3_macro_suffix_enumeration_reads_nested_index_and_definitions(
     messages, meta = openwebui._resolve_knowledge_context(
         server.client,
         [{"id": "kb-1", "name": "TIDE Splunk Investigation"}],
-        [{"role": "user", "content": (
-            "Enumerate macros whose name ends in _log and classify their categories"
-        )}],
+        [
+            {
+                "role": "user",
+                "content": (
+                    "Enumerate macros whose name ends in _log and classify their categories"
+                ),
+            }
+        ],
     )
     context = messages[0]["content"]
     assert 'suffix="_log"' in context
@@ -1779,13 +1758,15 @@ def test_tide_v3_uuid_fetches_exact_rule_and_resolve_only_macros(
 def test_tide_v3_target_prefers_mdr_uuid_over_other_notable_ids():
     selected = "67e794d5-73b2-45e5-b570-ceb5e0bba352"
     unrelated = "1cf1610c-541c-499e-84ee-075dfaa2cdeb"
-    messages = [{
-        "role": "user",
-        "content": f'MDR_UUID="{selected}", MDR_detection_model="{unrelated}"',
-    }]
-    assert openwebui._tide_target_rule_uuids(
-        messages, {selected, unrelated}
-    ) == [selected]
+    messages = [
+        {
+            "role": "user",
+            "content": f'MDR_UUID="{selected}", MDR_detection_model="{unrelated}"',
+        }
+    ]
+    assert openwebui._tide_target_rule_uuids(messages, {selected, unrelated}) == [
+        selected
+    ]
 
 
 def test_tide_v3_exact_path_no_global_basename_collision(
@@ -1825,6 +1806,7 @@ def test_openwebui_response_completion_streams_tokens_before_final_snapshot():
     state = _openwebui_stream_test_state()
     chunks = []
     statuses = []
+
     def callback(data):
         return openwebui_socket._consume_response_completion(
             data,
@@ -1834,20 +1816,25 @@ def test_openwebui_response_completion_streams_tokens_before_final_snapshot():
             on_tool=lambda value: None,
             on_status=statuses.append,
         )
-    assert callback({
-        "type": "response.output_text.delta",
-        "item_id": "msg_1",
-        "output_index": 0,
-        "delta": "Hello",
-    })
+
+    assert callback(
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "delta": "Hello",
+        }
+    )
     assert chunks == ["Hello"]
     assert state["answer"] == "Hello"
-    assert callback({
-        "type": "response.output_text.delta",
-        "item_id": "msg_1",
-        "output_index": 0,
-        "delta": " world",
-    })
+    assert callback(
+        {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "delta": " world",
+        }
+    )
     assert chunks == ["Hello", " world"]
     assert state["stream_delta_count"] == 2
     assert statuses == ["live model token stream started"]
@@ -1864,6 +1851,7 @@ def test_openwebui_response_completion_streams_tokens_before_final_snapshot():
 def test_openwebui_response_completion_streams_reasoning_in_order():
     state = _openwebui_stream_test_state()
     chunks = []
+
     def callback(data):
         return openwebui_socket._consume_response_completion(
             data,
@@ -1873,25 +1861,30 @@ def test_openwebui_response_completion_streams_reasoning_in_order():
             on_tool=lambda value: None,
             on_status=lambda value: None,
         )
+
     for fragment in ("Check ", "the logs"):
-        assert callback({
-            "type": "response.reasoning_text.delta",
-            "item_id": "reasoning_1",
-            "output_index": 0,
-            "delta": fragment,
-        })
+        assert callback(
+            {
+                "type": "response.reasoning_text.delta",
+                "item_id": "reasoning_1",
+                "output_index": 0,
+                "delta": fragment,
+            }
+        )
     assert chunks == ["Check ", "the logs"]
     assert state["reasoning_blocks"] == ["Check the logs"]
     assert state["phase"] == "model reasoning"
     assert state["stream_started"] is True
 
     # Native Responses API reasoning summary messages use their own delta type.
-    assert callback({
-        "type": "response.reasoning_summary_text.delta",
-        "item_id": "reasoning_2",
-        "output_index": 1,
-        "delta": "Next step",
-    })
+    assert callback(
+        {
+            "type": "response.reasoning_summary_text.delta",
+            "item_id": "reasoning_2",
+            "output_index": 1,
+            "delta": "Next step",
+        }
+    )
     assert chunks[-2:] == ["\n\n", "Next step"]
     assert state["reasoning_blocks"] == ["Check the logs", "Next step"]
 
@@ -1900,6 +1893,7 @@ def test_openwebui_response_completion_tool_start_and_result_are_live():
     state = _openwebui_stream_test_state()
     activity = []
     statuses = []
+
     def callback(data):
         return openwebui_socket._consume_response_completion(
             data,
@@ -1909,40 +1903,49 @@ def test_openwebui_response_completion_tool_start_and_result_are_live():
             on_tool=activity.append,
             on_status=statuses.append,
         )
+
     item = {
         "type": "function_call",
         "call_id": "call_1",
         "name": "splunk_search",
     }
-    assert callback({
-        "type": "response.output_item.added",
-        "output_index": 1,
-        "item": item,
-    })
+    assert callback(
+        {
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": item,
+        }
+    )
     assert state["tool_done"]["call_1"] is False
     assert activity == ["↳ splunk_search ..."]
-    assert callback({
-        "type": "response.function_call_arguments.delta",
-        "item_id": "call_1",
-        "delta": '{"search": "index=aws"}',
-    })
+    assert callback(
+        {
+            "type": "response.function_call_arguments.delta",
+            "item_id": "call_1",
+            "delta": '{"search": "index=aws"}',
+        }
+    )
     assert state["phase"] == "preparing tool call"
-    assert callback({
-        "type": "response.output_item.done",
-        "output_index": 1,
-        "item": item,
-    })
+    assert callback(
+        {
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": item,
+        }
+    )
     assert state["tool_done"]["call_1"] is False
     assert state["phase"] == "tool execution"
-    assert callback({
-        "type": "response.output_item.done",
-        "output_index": 2,
-        "item": {
-            "type": "function_call_output",
-            "call_id": "call_1",
-            "output": "1 event found",
-        },
-    })
+    assert callback(
+        {
+            "type": "response.output_item.done",
+            "output_index": 2,
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "1 event found",
+            },
+        }
+    )
     assert activity == ["↳ splunk_search ...", "↳ splunk_search done"]
     assert state["tool_results"] == [
         {"name": "splunk_search", "result": "1 event found"}
@@ -1959,15 +1962,21 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
         {
             "type": "chat:completion",
             "data": {
-                "sources": [{
-                    "source": {"name": "splunk-mcp_search"},
-                    "document": ["{'event_count': 8, 'index': 'digit_sec'}"],
-                    "metadata": [{
-                        "source": "splunk-mcp_search",
-                        "parameters": {"query": "index=digit_sec | stats count"},
-                    }],
-                    "tool_result": True,
-                }],
+                "sources": [
+                    {
+                        "source": {"name": "splunk-mcp_search"},
+                        "document": ["{'event_count': 8, 'index': 'digit_sec'}"],
+                        "metadata": [
+                            {
+                                "source": "splunk-mcp_search",
+                                "parameters": {
+                                    "query": "index=digit_sec | stats count"
+                                },
+                            }
+                        ],
+                        "tool_result": True,
+                    }
+                ],
             },
         },
         {
@@ -2005,7 +2014,7 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
                     "type": "function_call",
                     "call_id": "call-journal-1",
                     "name": "splunk-mcp_splunk_run_query",
-                    "arguments": "{\"query\":\"index=digit_sec | stats count\"}",
+                    "arguments": '{"query":"index=digit_sec | stats count"}',
                 },
             },
         },
@@ -2065,10 +2074,13 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
             async def push_stream():
                 for event in payloads:
                     await asyncio.sleep(0)
-                    await self.handlers["events"]({
-                        "chat_id": "temporary:socket-1",
-                        "data": event,
-                    })
+                    await self.handlers["events"](
+                        {
+                            "chat_id": "temporary:socket-1",
+                            "data": event,
+                        }
+                    )
+
             asyncio.create_task(push_stream())
             return {"id": "test-user"}
 
@@ -2114,12 +2126,8 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
     assert result["answer"] == "Hello world"
     assert result["reasoning"] == "Thinking"
     assert result["remote_task_ids"] == ["task-1"]
-    assert [value for kind, value in events if kind == "text"] == [
-        "Hello", " world"
-    ]
-    assert [value for kind, value in events if kind == "reasoning"] == [
-        "Thinking"
-    ]
+    assert [value for kind, value in events if kind == "text"] == ["Hello", " world"]
+    assert [value for kind, value in events if kind == "reasoning"] == ["Thinking"]
     assert ("status", "live model token stream started") in events
     saved = [item for kind, item in events if kind == "checkpoint"]
     assert len(saved) == 1
@@ -2138,7 +2146,6 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
     assert any(kind == "tool" and "splunk-mcp_search" in line for kind, line in events)
 
 
-
 def test_legacy_mcp_source_capture_matches_openwebui_numbered_source_ids():
     state = _openwebui_stream_test_state()
     state["last_progress_at"] = 0.0
@@ -2153,10 +2160,12 @@ def test_legacy_mcp_source_capture_matches_openwebui_numbered_source_ids():
         {
             "source": {"name": "splunk-mcp_search"},
             "document": ["{'event_count': 8, 'et': 1791286913.205}"],
-            "metadata": [{
-                "source": "splunk-mcp_search",
-                "parameters": {"query": "index=digit_sec | stats count"},
-            }],
+            "metadata": [
+                {
+                    "source": "splunk-mcp_search",
+                    "parameters": {"query": "index=digit_sec | stats count"},
+                }
+            ],
             "tool_result": True,
         },
     ]
@@ -2184,17 +2193,22 @@ def test_legacy_mcp_source_capture_matches_openwebui_numbered_source_ids():
 def test_legacy_mcp_source_capture_ignores_non_tool_citations():
     state = _openwebui_stream_test_state()
     captured = []
-    assert openwebui_socket._capture_server_tool_sources(
-        [{
-            "source": {"name": "KB excerpt"},
-            "metadata": [{"source": "kb-1"}],
-            "document": ["one fake source"],
-        }],
-        state,
-        tool_ids=["server:mcp:splunk-mcp"],
-        on_tool=lambda value: None,
-        on_source=captured.append,
-    ) == 0
+    assert (
+        openwebui_socket._capture_server_tool_sources(
+            [
+                {
+                    "source": {"name": "KB excerpt"},
+                    "metadata": [{"source": "kb-1"}],
+                    "document": ["one fake source"],
+                }
+            ],
+            state,
+            tool_ids=["server:mcp:splunk-mcp"],
+            on_tool=lambda value: None,
+            on_source=captured.append,
+        )
+        == 0
+    )
     assert captured == []
     assert state["tool_results"] == []
 
@@ -2236,10 +2250,16 @@ def test_explicit_mcp_search_requires_server_executed_evidence(
         openwebui,
         "_prepare_openwebui_request",
         lambda prompt, client, **kwargs: (
-            [{"role": "user", "content": "Execute Splunk MCP searches for this notable"}],
+            [
+                {
+                    "role": "user",
+                    "content": "Execute Splunk MCP searches for this notable",
+                }
+            ],
             [],
         ),
     )
+
     async def fake_runner(**kwargs):
         return {
             "answer": "8 events",
@@ -2250,6 +2270,7 @@ def test_explicit_mcp_search_requires_server_executed_evidence(
             "remote_chat_id": "temporary:test",
             "remote_task_ids": ["task"],
         }
+
     monkeypatch.setattr(openwebui, "run_chat_with_tools_with_files", fake_runner)
     model = openwebui.OpenWebUIModel("glm-5.3")
     result = SimpleNamespace(response_json=None)
@@ -2336,9 +2357,7 @@ def test_default_openwebui_mcp_transport_uses_browser_native_loop():
     "builtin_tools",
     [True, None, False],
 )
-def test_openwebui_doctor_reports_native_mcp_readiness(
-    monkeypatch, builtin_tools
-):
+def test_openwebui_doctor_reports_native_mcp_readiness(monkeypatch, builtin_tools):
     from click.testing import CliRunner
 
     monkeypatch.setattr(
@@ -2361,9 +2380,7 @@ def test_openwebui_doctor_reports_native_mcp_readiness(
         pass
 
     openwebui.register_commands(app)
-    result = CliRunner().invoke(
-        app, ["openwebui", "doctor", "--model", "glm-5.3"]
-    )
+    result = CliRunner().invoke(app, ["openwebui", "doctor", "--model", "glm-5.3"])
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["iterative_mcp_ready"] is True
@@ -2374,7 +2391,6 @@ def test_openwebui_doctor_reports_native_mcp_readiness(
     assert payload["server_added_builtins_possible"] is (builtin_tools is not False)
     assert payload["action"] is None
     assert "browser" in payload["note"].lower()
-
 
 
 def test_native_openwebui_sequential_mcp_results_are_both_captured():
@@ -2422,10 +2438,7 @@ def test_native_openwebui_sequential_mcp_results_are_both_captured():
         "call-cloudtrail": True,
     }
     assert len(state["tool_results"]) == 2
-    counts = [
-        item["result"]["results"][0]["count"]
-        for item in state["tool_results"]
-    ]
+    counts = [item["result"]["results"][0]["count"] for item in state["tool_results"]]
     assert counts == [2, 3]
     assert len([item for item in activity if " done" in item]) == 2
 

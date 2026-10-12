@@ -7,6 +7,7 @@ complete arguments and result payloads live in private local sidecar files.
 A recovery is a NEW model request from saved evidence, not a reconnect to a
 still-running Open WebUI task. It never re-executes saved tools by itself.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -34,7 +35,9 @@ def _json_bytes(value: Any) -> bytes:
             value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
         ).encode("utf-8")
     except (ValueError, TypeError) as exc:
-        raise CheckpointError(f"Non-JSON tool evidence cannot be checkpointed: {exc}") from exc
+        raise CheckpointError(
+            f"Non-JSON tool evidence cannot be checkpointed: {exc}"
+        ) from exc
 
 
 def _safe_conversation_id(conversation_id: str) -> str:
@@ -109,7 +112,9 @@ def save_tool_checkpoint(
                 raise CheckpointError("Existing checkpoint is corrupt") from exc
             for key in ("provider_run_id", "call_id", "name", "arguments", "output"):
                 if previous.get(key) != record.get(key):
-                    raise CheckpointError("Conflicting results for the same tool call ID")
+                    raise CheckpointError(
+                        "Conflicting results for the same tool call ID"
+                    )
         data = existing
         digest = hashlib.sha256(data).hexdigest()
     else:
@@ -161,8 +166,9 @@ def _load_checkpoint(conversation_id: str, pointer: dict[str, Any]) -> dict[str,
     if not target.is_relative_to(root) or not target.is_file():
         raise CheckpointError(f"Checkpoint sidecar unavailable: {relative}")
     raw = target.read_bytes()
-    if (len(raw) != pointer.get("size_bytes") or
-            hashlib.sha256(raw).hexdigest() != pointer.get("sha256")):
+    if len(raw) != pointer.get("size_bytes") or hashlib.sha256(
+        raw
+    ).hexdigest() != pointer.get("sha256"):
         raise CheckpointError(f"Checkpoint checksum mismatch: {relative}")
     try:
         document = json.loads(raw.decode("utf-8"))
@@ -175,7 +181,10 @@ def _load_checkpoint(conversation_id: str, pointer: dict[str, Any]) -> dict[str,
         or document.get("name") != pointer.get("tool")
     ):
         raise CheckpointError("Checkpoint identity or format mismatch")
-    if not isinstance(document.get("arguments"), (str, dict)) or "output" not in document:
+    if (
+        not isinstance(document.get("arguments"), (str, dict))
+        or "output" not in document
+    ):
         raise CheckpointError("Incomplete tool checkpoint")
     return document
 
@@ -214,7 +223,8 @@ def load_recovery(
                 records.append(value)
 
     requests = [
-        r for r in records
+        r
+        for r in records
         if r.get("type") == "provider_request"
         and r.get("provider") == "openwebui"
         and isinstance(r.get("provider_run_id"), str)
@@ -243,7 +253,8 @@ def load_recovery(
         raise CheckpointError("The requested turn was already completed")
 
     pointers = [
-        r for r in records
+        r
+        for r in records
         if r.get("type") == "provider_tool_checkpoint"
         and r.get("provider_run_id") == run_id
     ]
@@ -256,6 +267,8 @@ def load_recovery(
     seen: set[str] = set()
     for pointer in pointers:
         call_id = pointer.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            raise CheckpointError("Invalid checkpoint call ID")
         if call_id in seen:
             continue
         checkpoints.append(_load_checkpoint(conversation_id, pointer))
@@ -273,7 +286,9 @@ def load_recovery(
     }
 
 
-def build_resume_messages(recovery: dict[str, Any], *, allow_new_searches: bool = False) -> list[dict[str, Any]]:
+def build_resume_messages(
+    recovery: dict[str, Any], *, allow_new_searches: bool = False
+) -> list[dict[str, Any]]:
     """Reconstruct valid assistant tool-call/tool-output history without re-calling tools."""
     original = recovery["request"]["messages"]
     # Round-trip to deep-copy the persisted JSON messages; never mutate journal data.
@@ -283,7 +298,9 @@ def build_resume_messages(recovery: dict[str, Any], *, allow_new_searches: bool 
         raise CheckpointError("Recovery requires at least one completed tool result")
     for item in checkpoints:
         args = item["arguments"]
-        arguments = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        arguments = (
+            args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+        )
         try:
             parsed = json.loads(arguments)
         except (TypeError, json.JSONDecodeError) as exc:
@@ -294,39 +311,51 @@ def build_resume_messages(recovery: dict[str, Any], *, allow_new_searches: bool 
             raise CheckpointError("Tool arguments are not a JSON object")
         name = item["name"]
         call_id = item["call_id"]
-        messages.append({
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {"name": name, "arguments": arguments},
-            }],
-        })
+        messages.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                ],
+            }
+        )
         output = item["output"]
-        content = output if isinstance(output, str) else json.dumps(output, ensure_ascii=False)
-        messages.append({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": content,
-        })
+        content = (
+            output
+            if isinstance(output, str)
+            else json.dumps(output, ensure_ascii=False)
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            }
+        )
     mode = (
         "You may run NEW bounded read-only searches if essential, but must not "
         "repeat the completed tool calls supplied in the transcript. "
-        if allow_new_searches else
-        "No new tools are available. Base the report solely on the preserved "
+        if allow_new_searches
+        else "No new tools are available. Base the report solely on the preserved "
         "tool results and identify all unresolved questions explicitly. "
     )
-    messages.append({
-        "role": "user",
-        "content": (
-            "Continue the interrupted investigation using the exact completed "
-            "tool-call results above. These results were durably checkpointed "
-            "before the prior provider connection failed. Do not assume the "
-            "old remote task is still running. Do not repeat completed searches. "
-            + mode +
-            "Separate verified observations from hypotheses, retain source "
-            "scope and timestamps, and provide a concise evidence ledger."
-        ),
-    })
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Continue the interrupted investigation using the exact completed "
+                "tool-call results above. These results were durably checkpointed "
+                "before the prior provider connection failed. Do not assume the "
+                "old remote task is still running. Do not repeat completed searches. "
+                + mode
+                + "Separate verified observations from hypotheses, retain source "
+                "scope and timestamps, and provide a concise evidence ledger."
+            ),
+        }
+    )
     return messages

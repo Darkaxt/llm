@@ -66,9 +66,13 @@ def _sessionless_recovery_grace() -> float:
     try:
         seconds = float(value)
     except ValueError as exc:
-        raise ConfigError("LLM_OPENWEBUI_RECOVERY_GRACE must be a number of seconds") from exc
+        raise ConfigError(
+            "LLM_OPENWEBUI_RECOVERY_GRACE must be a number of seconds"
+        ) from exc
     if not math.isfinite(seconds) or seconds < 0:
-        raise ConfigError("LLM_OPENWEBUI_RECOVERY_GRACE must be non-negative and finite")
+        raise ConfigError(
+            "LLM_OPENWEBUI_RECOVERY_GRACE must be non-negative and finite"
+        )
     return min(seconds, 600.0)
 
 
@@ -116,9 +120,7 @@ def _meaningful_progress_timeout() -> float:
             "LLM_OPENWEBUI_PROGRESS_TIMEOUT must be a number of seconds"
         ) from exc
     if not math.isfinite(seconds) or seconds <= 0:
-        raise ConfigError(
-            "LLM_OPENWEBUI_PROGRESS_TIMEOUT must be positive and finite"
-        )
+        raise ConfigError("LLM_OPENWEBUI_PROGRESS_TIMEOUT must be positive and finite")
     return seconds
 
 
@@ -152,9 +154,9 @@ async def _stop_remote_chat_tasks(
     on_status: Callable[[str], None],
 ) -> bool:
     """Cancel only the caller's chat tasks via Open WebUI's user-scoped API."""
-    endpoint = (
-        f"{base_url.rstrip('/')}/api/tasks/chat/{quote(chat_id, safe='')}/stop"
-    )
+    import aiohttp
+
+    endpoint = f"{base_url.rstrip('/')}/api/tasks/chat/{quote(chat_id, safe='')}/stop"
     try:
         async with session.post(
             endpoint,
@@ -166,7 +168,7 @@ async def _stop_remote_chat_tasks(
                 return False
             on_status("remote chat task cancellation requested")
             return True
-    except Exception as exc:
+    except (aiohttp.ClientError, OSError, _AsyncTimeoutError) as exc:
         on_status(f"could not stop remote chat tasks: {exc}")
         return False
 
@@ -236,7 +238,11 @@ def _structured_reasoning(output: Any) -> list[str]:
     for item in output:
         if not isinstance(item, dict) or item.get("type") != "reasoning":
             continue
-        parts = item.get("summary") if isinstance(item.get("summary"), list) else item.get("content")
+        parts = (
+            item.get("summary")
+            if isinstance(item.get("summary"), list)
+            else item.get("content")
+        )
         text = _structured_parts_text(parts)
         if text:
             blocks.append(text)
@@ -279,7 +285,6 @@ def _structured_tool_events(output: Any) -> list[dict[str, Any]]:
     return events
 
 
-
 def _capture_server_tool_sources(
     sources: Any,
     state: dict[str, Any],
@@ -318,9 +323,7 @@ def _capture_server_tool_sources(
         for meta in metadata:
             if not isinstance(meta, dict):
                 continue
-            source_key = str(
-                meta.get("source") or origin.get("id") or "N/A"
-            )
+            source_key = str(meta.get("source") or origin.get("id") or "N/A")
             if source_key not in source_ids:
                 source_ids[source_key] = len(source_ids) + 1
         if source.get("tool_result") is not True:
@@ -329,17 +332,15 @@ def _capture_server_tool_sources(
         name = str(origin.get("name") or "")
         if not name:
             continue
-        tool_metadata = next(
-            (item for item in metadata if isinstance(item, dict)), {}
-        )
-        source_key = str(
-            tool_metadata.get("source") or origin.get("id") or "N/A"
-        )
-        citation_id = source_ids.setdefault(
-            source_key, len(source_ids) + 1
-        )
+        tool_metadata = next((item for item in metadata if isinstance(item, dict)), {})
+        source_key = str(tool_metadata.get("source") or origin.get("id") or "N/A")
+        citation_id = source_ids.setdefault(source_key, len(source_ids) + 1)
         documents = source.get("document")
-        content = "\n".join(str(doc) for doc in documents) if isinstance(documents, list) else ""
+        content = (
+            "\n".join(str(doc) for doc in documents)
+            if isinstance(documents, list)
+            else ""
+        )
         params = tool_metadata.get("parameters")
         params = params if isinstance(params, dict) else {}
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -399,7 +400,7 @@ def _reconcile_answer_snapshot(
     """Append only genuinely new text from an authoritative full snapshot."""
     previous = state["answer"]
     if answer.startswith(previous):
-        suffix = answer[len(previous):]
+        suffix = answer[len(previous) :]
         if suffix:
             on_text(suffix)
             state["last_progress_at"] = time.monotonic()
@@ -410,7 +411,6 @@ def _reconcile_answer_snapshot(
         # without printing a duplicate or garbled suffix.
         state["answer"] = answer
         state["last_progress_at"] = time.monotonic()
-
 
 
 def _record_native_tool_item(
@@ -434,7 +434,8 @@ def _record_native_tool_item(
         # after argument deltas have populated the same call ID. Never erase
         # a complete argument string with an empty/stale placeholder.
         fields = {
-            key: value for key, value in item.items()
+            key: value
+            for key, value in item.items()
             if value is not None and (value != "" or not old.get(key))
         }
         state["native_call_items"][call_id] = {**old, **fields}
@@ -561,13 +562,12 @@ def _consume_response_completion(
             return False
         item_type = item.get("type")
         if item_type in {"function_call", "function_call_output"}:
-            _record_native_tool_item(
-                item, state, on_checkpoint=on_checkpoint
-            )
+            _record_native_tool_item(item, state, on_checkpoint=on_checkpoint)
         if item_type == "function_call":
             name = str(item.get("name") or "")
             call_id = str(
-                item.get("call_id") or item.get("id")
+                item.get("call_id")
+                or item.get("id")
                 or f"output:{data.get('output_index')}"
             )
             if name and call_id not in state["tool_done"]:
@@ -610,9 +610,7 @@ def _consume_response_completion(
                 if isinstance(arguments, str):
                     entry["arguments"] = arguments
             elif isinstance(data.get("delta"), str):
-                entry["arguments"] = (
-                    str(entry.get("arguments") or "") + data["delta"]
-                )
+                entry["arguments"] = str(entry.get("arguments") or "") + data["delta"]
             _emit_native_checkpoint_if_ready(state, call_id, on_checkpoint)
         # Do not leak complete tool arguments to the terminal status area.
         # Generating tool arguments still counts as meaningful progress.
@@ -668,9 +666,7 @@ def _build_browser_chat_body(
         # backward-compatible fallback for older Open WebUI deployments.
         "chat_id": chat_id,
         "id": message_id,
-        "message_ids": [
-            {"model_id": model, "message_id": message_id, "modelIdx": 0}
-        ],
+        "message_ids": [{"model_id": model, "message_id": message_id, "modelIdx": 0}],
         "parent_id": None,
         "user_message": {
             "id": user_message_id,
@@ -760,10 +756,10 @@ async def run_chat_with_tools_with_files(
     user_message_id = str(uuid.uuid4())
 
     state: dict[str, Any] = {
-        "answer": "",        # last rendered answer prose (stripped)
-        "raw_content": "",   # serialized legacy content or current structured output
+        "answer": "",  # last rendered answer prose (stripped)
+        "raw_content": "",  # serialized legacy content or current structured output
         "reasoning_blocks": [],  # list of reasoning strings
-        "tool_done": {},     # tool key -> done? (to detect executing->done)
+        "tool_done": {},  # tool key -> done? (to detect executing->done)
         "tool_results": [],  # [{name, result}] for structured result capture
         "error": None,
         "last_event_at": time.monotonic(),
@@ -796,7 +792,7 @@ async def run_chat_with_tools_with_files(
                 out_reasoning(block)
                 state["last_progress_at"] = time.monotonic()
             elif block.startswith(prev_blocks[i]):
-                delta = block[len(prev_blocks[i]):]
+                delta = block[len(prev_blocks[i]) :]
                 if delta:
                     out_reasoning(delta)
                     state["last_progress_at"] = time.monotonic()
@@ -900,7 +896,9 @@ async def run_chat_with_tools_with_files(
         if etype in ("response:completion", "chat:completion"):
             # Open WebUI emits live token and argument deltas here.
             # Some backends wrap Responses events in chat:completion.
-            if isinstance(data, dict) and str(data.get("type") or "").startswith("response."):
+            if isinstance(data, dict) and str(data.get("type") or "").startswith(
+                "response."
+            ):
                 _consume_response_completion(
                     data,
                     state,
@@ -962,7 +960,7 @@ async def run_chat_with_tools_with_files(
                     out_reasoning(block)
                     state["last_progress_at"] = time.monotonic()
                 elif block.startswith(prev_blocks[i]):
-                    delta = block[len(prev_blocks[i]):]
+                    delta = block[len(prev_blocks[i]) :]
                     if delta:
                         out_reasoning(delta)
                         state["last_progress_at"] = time.monotonic()
@@ -980,7 +978,9 @@ async def run_chat_with_tools_with_files(
                     if done_now:
                         state["phase"] = "model continuation"
                         state["phase_started_at"] = time.monotonic()
-                        out_status("tool result received; waiting for model continuation")
+                        out_status(
+                            "tool result received; waiting for model continuation"
+                        )
                     else:
                         state["phase"] = "tool execution"
                         state["phase_started_at"] = time.monotonic()
@@ -1083,7 +1083,9 @@ async def run_chat_with_tools_with_files(
         raise APIError(
             f"Open WebUI user-join returned an invalid response: {joined_user!r}"
         )
-    out_status(f"socket authenticated as {joined_user.get('name') or joined_user['id']}")
+    out_status(
+        f"socket authenticated as {joined_user.get('name') or joined_user['id']}"
+    )
 
     if not chat_id:
         chat_id = f"temporary:{session_id}"
@@ -1100,9 +1102,7 @@ async def run_chat_with_tools_with_files(
         # omitted (main.py:1124). So a minimal client that omits it makes the
         # background task crash with AttributeError('NoneType' ... 'get') before
         # emitting any chat-events - the request 200s but you get nothing.
-        request_session_id = (
-            None if sessionless_server_tools else session_id
-        )
+        request_session_id = None if sessionless_server_tools else session_id
         body = _build_browser_chat_body(
             model=model,
             model_item=model_item,
@@ -1129,6 +1129,7 @@ async def run_chat_with_tools_with_files(
             out_status(
                 "request submitted · native server tools · hidden builtins suppressed"
             )
+
             async def post_sessionless_chat() -> Any:
                 headers = {
                     "Accept": "application/json",
@@ -1160,8 +1161,8 @@ async def run_chat_with_tools_with_files(
                                 )
                             else:
                                 detail = parsed
-                        except Exception:
-                            pass
+                        except json.JSONDecodeError:
+                            detail = raw
                         raise APIError(
                             "Open WebUI sessionless chat request failed "
                             f"({response.status}): {detail}"
@@ -1170,7 +1171,7 @@ async def run_chat_with_tools_with_files(
                         return None
                     try:
                         return json.loads(raw)
-                    except Exception:
+                    except json.JSONDecodeError:
                         return raw
 
             post_task = asyncio.create_task(post_sessionless_chat())
@@ -1195,9 +1196,7 @@ async def run_chat_with_tools_with_files(
                     post_task.cancel()
                     break
                 remaining_idle = timeout - (now - state["last_event_at"])
-                remaining_progress = progress_limit - (
-                    now - state["last_progress_at"]
-                )
+                remaining_progress = progress_limit - (now - state["last_progress_at"])
                 wait_for = min(1.0, remaining_idle, remaining_progress)
                 try:
                     await asyncio.wait_for(done.wait(), timeout=wait_for)
@@ -1223,9 +1222,11 @@ async def run_chat_with_tools_with_files(
             except asyncio.CancelledError:
                 if not state["error"]:
                     state["error"] = "sessionless Open WebUI request cancelled"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 if not state["error"]:
-                    if isinstance(exc, (aiohttp.ClientError, OSError, _AsyncTimeoutError)):
+                    if isinstance(
+                        exc, (aiohttp.ClientError, OSError, _AsyncTimeoutError)
+                    ):
                         await _recover_sessionless_completion(
                             done,
                             state,
@@ -1234,9 +1235,7 @@ async def run_chat_with_tools_with_files(
                             grace_seconds=_sessionless_recovery_grace(),
                         )
                     else:
-                        state["error"] = (
-                            f"sessionless Open WebUI request failed: {exc}"
-                        )
+                        state["error"] = f"sessionless Open WebUI request failed: {exc}"
 
             if not done.is_set() and not state["error"]:
                 state["error"] = (

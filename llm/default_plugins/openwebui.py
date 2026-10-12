@@ -19,30 +19,40 @@ import shutil
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import zipfile
 import uuid
+import zipfile
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Literal, cast
 from urllib.parse import quote, urlparse
 
 import click
 import httpx2
+from openwebui_sdk import ChatResult, OpenWebUIClient
+from openwebui_sdk.errors import APIError, AuthError
+
 import llm
 from llm.chat_journal import (
     append_record as append_chat_journal_record,
+)
+from llm.chat_journal import (
     ensure_session as ensure_chat_journal_session,
 )
+from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
 from llm.openwebui_recovery import (
     CheckpointError,
     build_resume_messages,
     load_recovery,
     save_tool_checkpoint,
 )
-from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
-from llm.parts import AttachmentPart, ReasoningPart, StreamEvent, TextPart, ToolResultPart
-from openwebui_sdk import ChatResult, OpenWebUIClient
-from openwebui_sdk.errors import APIError, AuthError
+from llm.parts import (
+    AttachmentPart,
+    ReasoningPart,
+    StreamEvent,
+    TextPart,
+    ToolResultPart,
+)
 
 CONFIG_FILENAME = "openwebui.json"
 
@@ -111,7 +121,7 @@ def _escape_pressed() -> bool:
         import ctypes
 
         return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x0001)
-    except Exception:
+    except (AttributeError, OSError):
         return False
 
 
@@ -187,7 +197,7 @@ def _version_triplet(value: Any) -> tuple[int, int, int] | None:
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
     if not match:
         return None
-    return tuple(int(part) for part in match.groups())
+    return int(match[1]), int(match[2]), int(match[3])
 
 
 _OPENWEBUI_MCP_CLEANUP_FIXED = (0, 9, 3)
@@ -253,9 +263,7 @@ def _server_builtin_tools_setting(model_item: dict[str, Any]) -> bool | None:
     meta = info.get("meta") if isinstance(info, dict) else None
     capabilities = meta.get("capabilities") if isinstance(meta, dict) else None
     value = (
-        capabilities.get("builtin_tools")
-        if isinstance(capabilities, dict)
-        else None
+        capabilities.get("builtin_tools") if isinstance(capabilities, dict) else None
     )
     return value if isinstance(value, bool) else None
 
@@ -328,7 +336,7 @@ def _owui_http_json(
                         )
                     if detail is None:
                         detail = payload
-                except Exception:
+                except ValueError:
                     detail = response.text
                 raise llm.ModelError(
                     f"Open WebUI {method.upper()} {path} failed "
@@ -440,17 +448,13 @@ def _resolve_knowledge_selector(
     if not available:
         raise click.ClickException("Open WebUI returned no knowledge bases")
 
-    exact_id = [
-        item for item in available if str(item.get("id") or "") == selector
-    ]
+    exact_id = [item for item in available if str(item.get("id") or "") == selector]
     if exact_id:
         return exact_id[0]
 
     folded = selector.casefold()
     exact_name = [
-        item
-        for item in available
-        if str(item.get("name") or "").casefold() == folded
+        item for item in available if str(item.get("name") or "").casefold() == folded
     ]
     if len(exact_name) == 1:
         return exact_name[0]
@@ -458,9 +462,7 @@ def _resolve_knowledge_selector(
         matches = ", ".join(
             f"{item.get('name')} ({item.get('id')})" for item in exact_name
         )
-        raise click.ClickException(
-            f"Knowledge base name is ambiguous: {matches}"
-        )
+        raise click.ClickException(f"Knowledge base name is ambiguous: {matches}")
 
     partial = [
         item
@@ -477,9 +479,7 @@ def _resolve_knowledge_selector(
         raise click.ClickException(
             f"Knowledge selector {selector!r} is ambiguous: {matches}"
         )
-    raise click.ClickException(
-        f"No Open WebUI knowledge base matches {selector!r}"
-    )
+    raise click.ClickException(f"No Open WebUI knowledge base matches {selector!r}")
 
 
 def _enabled_knowledge_items(
@@ -578,7 +578,6 @@ def _knowledge_file_text(
     return str(payload.get("content") or "")
 
 
-
 _TIDE_BUNDLE_DIR = "ec-tide-splunk-investigation-kb"
 _TIDE_MACRO_FILE_RE = re.compile(
     r"(?:ec-tide-splunk-investigation-kb/)?"
@@ -625,7 +624,8 @@ def _knowledge_find_nested_file(
     parent_id = ""
     for segment in parts[:-1]:
         matches = [
-            item for item in list_children(parent_id)
+            item
+            for item in list_children(parent_id)
             if str(item.get("name") or "").casefold() == segment.casefold()
         ]
         if not matches:
@@ -646,12 +646,11 @@ def _knowledge_find_nested_file(
             f"/api/v1/knowledge/{knowledge_id}/files",
             params={"directory_id": parent_id, "query": filename, "page": page},
         )
-        if not isinstance(payload, dict) or not isinstance(
-            payload.get("items"), list
-        ):
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
             raise llm.ModelError(f"Invalid Knowledge file result for {path!r}")
         found.extend(
-            item for item in payload["items"]
+            item
+            for item in payload["items"]
             if isinstance(item, dict)
             and str(item.get("filename") or "").casefold() == filename.casefold()
         )
@@ -761,9 +760,11 @@ def _tide_macro_index_matches(
         return "", []
     names = [item.strip().casefold() for item in header]
     column = next(
-        (i for i, col in enumerate(names) if col in {
-            "stanza", "macro", "name", "macro_name", "stanza_name"
-        }),
+        (
+            i
+            for i, col in enumerate(names)
+            if col in {"stanza", "macro", "name", "macro_name", "stanza_name"}
+        ),
         0,
     )
     selected = []
@@ -815,15 +816,19 @@ def _resolve_tide_v3_evidence(
         if actual_path in seen:
             return content
         seen.add(actual_path)
-        resolution_meta["files"].append({
-            "knowledge_id": knowledge_id,
-            "id": file_id,
-            "path": actual_path,
-            "filename": actual_path.rsplit("/", 1)[-1],
-            "chars": len(content),
-        })
-        display = content if len(content) <= max_chars else (
-            content[:max_chars] + "\n[File excerpt truncated by CLI]"
+        resolution_meta["files"].append(
+            {
+                "knowledge_id": knowledge_id,
+                "id": file_id,
+                "path": actual_path,
+                "filename": actual_path.rsplit("/", 1)[-1],
+                "chars": len(content),
+            }
+        )
+        display = (
+            content
+            if len(content) <= max_chars
+            else (content[:max_chars] + "\n[File excerpt truncated by CLI]")
         )
         sections.extend([f'<file path="{actual_path}">', display, "</file>"])
         return content
@@ -860,9 +865,7 @@ def _resolve_tide_v3_evidence(
 
     suffix = _tide_macro_suffix_request(_conversation_text(messages))
     if suffix:
-        catalog = _knowledge_tide_file(
-            client, knowledge_id, "macros/index.tsv", cache
-        )
+        catalog = _knowledge_tide_file(client, knowledge_id, "macros/index.tsv", cache)
         if catalog is None:
             sections.append(
                 '<missing_evidence path="macros/index.tsv">'
@@ -872,21 +875,27 @@ def _resolve_tide_v3_evidence(
         else:
             actual, file_id, tsv = catalog
             header, matching = _tide_macro_index_matches(tsv, suffix)
-            resolution_meta["files"].append({
-                "knowledge_id": knowledge_id,
-                "id": file_id,
-                "path": actual,
-                "filename": "index.tsv",
-                "chars": len(tsv),
-                "selected_rows": len(matching),
-            })
-            sections.extend([
-                f'<exact_evidence source="{actual}" suffix="{suffix}" '
-                f'total_matches="{len(matching)}">',
-                header,
-                *[line for _, line in matching[:150]],
-                "</exact_evidence>",
-            ])
+            resolution_meta["files"].append(
+                {
+                    "knowledge_id": knowledge_id,
+                    "id": file_id,
+                    "path": actual,
+                    "filename": "index.tsv",
+                    "chars": len(tsv),
+                    "selected_rows": len(matching),
+                }
+            )
+            sections.extend(
+                [
+                    (
+                        f'<exact_evidence source="{actual}" suffix="{suffix}" '
+                        f'total_matches="{len(matching)}">'
+                    ),
+                    header,
+                    *[line for _, line in matching[:150]],
+                    "</exact_evidence>",
+                ]
+            )
             for stanza, _ in matching[:24]:
                 append_path(
                     f"macros/by-stanza/{quote(stanza, safe='')}.json",
@@ -944,9 +953,7 @@ def _json_matching_fragments(
                     visit(child)
 
     if _json_contains_needles(value, needles):
-        if isinstance(value, dict):
-            visit(value)
-        elif isinstance(value, list):
+        if isinstance(value, (dict, list)):
             visit(value)
         else:
             matches.append(value)
@@ -1073,7 +1080,8 @@ def _resolve_knowledge_context(
 
         version3 = "macros/by-stanza/" in fetched.get("SKILL.md", ("", ""))[1]
         catalog_only = bool(
-            version3 and not uuids
+            version3
+            and not uuids
             and _tide_macro_suffix_request(_conversation_text(messages))
         )
         for filename in ("SKILL.md", "SPEC.md"):
@@ -1112,7 +1120,7 @@ def _resolve_knowledge_context(
             try:
                 parsed_index = json.loads(raw_index)
                 rule_fragments = _json_matching_fragments(parsed_index, uuids)
-            except Exception:
+            except json.JSONDecodeError:
                 matching_lines = [
                     line
                     for line in raw_index.splitlines()
@@ -1140,7 +1148,7 @@ def _resolve_knowledge_context(
                     continue
                 try:
                     rule_records.append(json.loads(line))
-                except Exception:
+                except json.JSONDecodeError:
                     rule_records.append(line)
                 if len(rule_records) >= 10:
                     break
@@ -1171,13 +1179,11 @@ def _resolve_knowledge_context(
             try:
                 parsed_macros = json.loads(raw_macros)
                 macro_subset = _extract_macro_subset(parsed_macros, macro_names)
-            except Exception:
+            except json.JSONDecodeError:
                 macro_subset = {
-                    name: [
-                        line
-                        for line in raw_macros.splitlines()
-                        if name in line
-                    ][:10]
+                    name: [line for line in raw_macros.splitlines() if name in line][
+                        :10
+                    ]
                     for name in sorted(macro_names)
                 }
             if macro_subset:
@@ -1197,11 +1203,15 @@ def _resolve_knowledge_context(
         section_lines.extend(
             [
                 "<instructions>",
-                "The material above was resolved deterministically from the "
-                "persistent Open WebUI Knowledge Base before this model call.",
+                (
+                    "The material above was resolved deterministically from the "
+                    "persistent Open WebUI Knowledge Base before this model call."
+                ),
                 "Treat SKILL.md and SPEC.md as authoritative when present.",
-                "Exact evidence blocks contain only records matching identifiers "
-                "from the conversation. Do not assume omitted KB records are absent.",
+                (
+                    "Exact evidence blocks contain only records matching identifiers "
+                    "from the conversation. Do not assume omitted KB records are absent."
+                ),
                 "</instructions>",
                 "</persistent_knowledge>",
             ]
@@ -1216,15 +1226,15 @@ def _resolve_knowledge_context(
     if scoped and scoped[0].get("role") == "system":
         existing = str(scoped[0].get("content") or "")
         scoped[0]["content"] = (
-            existing + "\n\n" + resolved_context
-            if existing
-            else resolved_context
+            existing + "\n\n" + resolved_context if existing else resolved_context
         )
     else:
         scoped.insert(0, {"role": "system", "content": resolved_context})
 
     resolution_meta["context_chars"] = len(resolved_context)
-    resolution_meta["macro_names"] = sorted(macro_names) if "macro_names" in locals() else []
+    resolution_meta["macro_names"] = (
+        sorted(macro_names) if "macro_names" in locals() else []
+    )
     return scoped, resolution_meta
 
 
@@ -1244,11 +1254,10 @@ def _safe_archive_member_path(name: str) -> PurePosixPath | None:
     path = PurePosixPath(normalized)
     if not path.name:
         return None
-    if any(part in {"", ".", ".."} for part in path.parts):
-        if ".." in path.parts:
-            raise click.ClickException(
-                f"Archive member uses an unsafe relative path: {name!r}"
-            )
+    if ".." in path.parts:
+        raise click.ClickException(
+            f"Archive member uses an unsafe relative path: {name!r}"
+        )
     if any(part.startswith(".") for part in path.parts):
         return None
     return path
@@ -1295,9 +1304,7 @@ def _sevenzip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]
     try:
         with py7zr.SevenZipFile(path, mode="r") as archive:
             if archive.needs_password():
-                raise click.ClickException(
-                    f"7z archive {path} is password-protected"
-                )
+                raise click.ClickException(f"7z archive {path} is password-protected")
             infos = [info for info in archive.list() if not info.is_directory]
             selected: list[tuple[str, PurePosixPath]] = []
             total = 0
@@ -1344,9 +1351,7 @@ def _sevenzip_knowledge_members(path: Path) -> list[tuple[PurePosixPath, bytes]]
     except py7zr.Bad7zFile as exc:
         raise click.ClickException(f"Invalid 7z archive {path}: {exc}") from exc
     except Exception as exc:
-        raise click.ClickException(
-            f"Failed to read 7z archive {path}: {exc}"
-        ) from exc
+        raise click.ClickException(f"Failed to read 7z archive {path}: {exc}") from exc
 
 
 def _knowledge_archive_members(
@@ -1421,8 +1426,7 @@ def _local_knowledge_manifest(root: Path) -> list[dict[str, Any]]:
         dirnames[:] = sorted(
             name
             for name in dirnames
-            if not name.startswith(".")
-            and not (Path(dirpath) / name).is_symlink()
+            if not name.startswith(".") and not (Path(dirpath) / name).is_symlink()
         )
         for filename in sorted(filenames):
             if filename.startswith("."):
@@ -1463,7 +1467,6 @@ def _local_knowledge_manifest(root: Path) -> list[dict[str, Any]]:
         )
     )
     return manifest
-
 
 
 def _content_type_for_path(path: Path) -> str:
@@ -1543,9 +1546,7 @@ def _create_knowledge_directory(
     current_path = ""
     parent_id: str | None = None
     for segment in segments:
-        current_path = (
-            f"{current_path}/{segment}" if current_path else segment
-        )
+        current_path = f"{current_path}/{segment}" if current_path else segment
         existing = directory_ids.get(current_path)
         if existing:
             parent_id = existing
@@ -1561,8 +1562,7 @@ def _create_knowledge_directory(
         )
         if not isinstance(payload, dict) or not payload.get("id"):
             raise llm.ModelError(
-                f"Open WebUI failed to create knowledge directory "
-                f"{current_path!r}"
+                f"Open WebUI failed to create knowledge directory " f"{current_path!r}"
             )
         parent_id = str(payload["id"])
         directory_ids[current_path] = parent_id
@@ -1705,17 +1705,12 @@ def _sync_knowledge_folder(
             "Refusing to sync an empty folder."
         )
     wire_manifest = [
-        {
-            key: entry[key]
-            for key in ("filename", "path", "checksum", "size")
-        }
+        {key: entry[key] for key in ("filename", "path", "checksum", "size")}
         for entry in manifest
     ]
 
     if on_status is not None:
-        on_status(
-            f"knowledge sync · comparing {len(wire_manifest)} local files"
-        )
+        on_status(f"knowledge sync · comparing {len(wire_manifest)} local files")
     diff = _owui_http_json(
         client,
         "POST",
@@ -1743,9 +1738,7 @@ def _sync_knowledge_folder(
         if isinstance(item, dict)
     }
     files_to_upload = [
-        entry
-        for entry in manifest
-        if (entry["path"], entry["filename"]) in wanted
+        entry for entry in manifest if (entry["path"], entry["filename"]) in wanted
     ]
 
     # Detect an interrupted population before making any further server-side
@@ -1762,9 +1755,7 @@ def _sync_knowledge_folder(
             for candidate in candidates_by_hash.get(str(entry["checksum"]), []):
                 meta = candidate.get("meta") or {}
                 meta_name = meta.get("name") if isinstance(meta, dict) else None
-                candidate_name = str(
-                    meta_name or candidate.get("filename") or ""
-                )
+                candidate_name = str(meta_name or candidate.get("filename") or "")
                 if candidate_name == str(entry["filename"]):
                     matching.append(candidate)
             if matching:
@@ -1800,9 +1791,7 @@ def _sync_knowledge_folder(
 
     if stale_ids or rmdir:
         if on_status is not None:
-            on_status(
-                f"knowledge sync · removing {len(stale_ids)} stale files"
-            )
+            on_status(f"knowledge sync · removing {len(stale_ids)} stale files")
         _owui_http_json(
             client,
             "POST",
@@ -1827,11 +1816,7 @@ def _sync_knowledge_folder(
 
     work_items: list[tuple[int, dict[str, Any], str | None]] = []
     for ordinal, entry in enumerate(files_to_upload, start=1):
-        directory_id = (
-            directory_ids.get(entry["path"])
-            if entry["path"]
-            else None
-        )
+        directory_id = directory_ids.get(entry["path"]) if entry["path"] else None
         if entry["path"] and not directory_id:
             directory_id = _create_knowledge_directory(
                 client,
@@ -1850,7 +1835,6 @@ def _sync_knowledge_folder(
             "uploaded": 0,
             "reused": 0,
         }
-
 
     concurrency = min(_knowledge_sync_concurrency(), len(work_items))
     progress_lock = threading.Lock()
@@ -1979,11 +1963,7 @@ def _journal_file_reference(item: dict[str, Any]) -> dict[str, Any]:
         "status",
         "url",
     )
-    return {
-        key: item.get(key)
-        for key in keys
-        if item.get(key) is not None
-    }
+    return {key: item.get(key) for key in keys if item.get(key) is not None}
 
 
 def _tool_kind(tool_id: str) -> str:
@@ -2136,8 +2116,7 @@ def _select_sidecar_members(member_names: list[str]) -> dict[str, str]:
     }
     if ambiguous:
         detail = "; ".join(
-            f"{name}: {', '.join(paths)}"
-            for name, paths in sorted(ambiguous.items())
+            f"{name}: {', '.join(paths)}" for name, paths in sorted(ambiguous.items())
         )
         raise llm.ModelError(
             "Archive contains ambiguous TIDE sidecar filenames under "
@@ -2225,7 +2204,8 @@ def _sevenzip_sidecar_attachments(
     content_type = attachment.type or ""
     if not (
         filename.lower().endswith(".7z")
-        or content_type in {
+        or content_type
+        in {
             "application/x-7z-compressed",
             "application/7z",
         }
@@ -2234,7 +2214,6 @@ def _sevenzip_sidecar_attachments(
 
     try:
         import py7zr
-        from py7zr.io import BytesIOFactory
     except ImportError as exc:
         raise llm.ModelError(
             "7z attachment support requires py7zr; reinstall the project "
@@ -2244,9 +2223,7 @@ def _sevenzip_sidecar_attachments(
     try:
         content = attachment.content_bytes()
     except Exception as exc:
-        raise llm.ModelError(
-            f"Could not read 7z attachment {filename}: {exc}"
-        ) from exc
+        raise llm.ModelError(f"Could not read 7z attachment {filename}: {exc}") from exc
     if not content:
         return []
 
@@ -2285,9 +2262,7 @@ def _sevenzip_sidecar_attachments(
         archive_buffer = io.BytesIO(content)
         with py7zr.SevenZipFile(archive_buffer, mode="r") as archive:
             if archive.needs_password():
-                raise llm.ModelError(
-                    f"7z attachment {filename} is password-protected"
-                )
+                raise llm.ModelError(f"7z attachment {filename} is password-protected")
 
             infos = [info for info in archive.list() if not info.is_directory]
             selected = _select_sidecar_members([info.filename for info in infos])
@@ -2325,18 +2300,20 @@ def _sevenzip_sidecar_attachments(
 
         sidecars: list[tuple[str, llm.Attachment]] = []
         for expected_name, mime in _ARCHIVE_SIDECAR_TYPES.items():
-            member_name = selected.get(expected_name)
-            if member_name is None:
+            selected_member_name = selected.get(expected_name)
+            if selected_member_name is None:
                 continue
-            normalized_member = _normalized_archive_path(member_name).as_posix()
+            normalized_member = _normalized_archive_path(
+                selected_member_name
+            ).as_posix()
             matches = [
                 product
                 for product_name, product in factory.products.items()
                 if _normalized_archive_path(product_name).as_posix()
                 == normalized_member
-                or _normalized_archive_path(product_name).as_posix().endswith(
-                    "/" + normalized_member
-                )
+                or _normalized_archive_path(product_name)
+                .as_posix()
+                .endswith("/" + normalized_member)
             ]
             if len(matches) != 1:
                 raise llm.ModelError(
@@ -2354,9 +2331,7 @@ def _sevenzip_sidecar_attachments(
     except py7zr.Bad7zFile:
         return []
     except Exception as exc:
-        raise llm.ModelError(
-            f"Failed to read 7z attachment {filename}: {exc}"
-        ) from exc
+        raise llm.ModelError(f"Failed to read 7z attachment {filename}: {exc}") from exc
 
 
 def _archive_sidecar_attachments(
@@ -2401,13 +2376,9 @@ def _knowledge_sync_concurrency() -> int:
     try:
         value = int(raw)
     except ValueError as exc:
-        raise llm.ModelError(
-            "LLM_OPENWEBUI_KB_CONCURRENCY must be an integer"
-        ) from exc
+        raise llm.ModelError("LLM_OPENWEBUI_KB_CONCURRENCY must be an integer") from exc
     if value < 1:
-        raise llm.ModelError(
-            "LLM_OPENWEBUI_KB_CONCURRENCY must be at least 1"
-        )
+        raise llm.ModelError("LLM_OPENWEBUI_KB_CONCURRENCY must be at least 1")
     # Keep accidental values from overwhelming the Open WebUI deployment.
     return min(value, 16)
 
@@ -2423,8 +2394,7 @@ def _format_elapsed(seconds: float) -> str:
 
 def _activity_bar(tick: int, width: int = 18) -> str:
     """Return an indeterminate moving marker, not a fake percentage."""
-    if width < 3:
-        width = 3
+    width = max(width, 3)
     cycle = (width - 1) * 2
     pos = tick % cycle
     if pos >= width:
@@ -2447,16 +2417,11 @@ def _render_file_progress(
 ) -> None:
     elapsed = _format_elapsed(time.monotonic() - started)
     if on_status is not None:
-        on_status(
-            f"attachments {ordinal}/{total} · {filename} · {status} · {elapsed}"
-        )
+        on_status(f"attachments {ordinal}/{total} · {filename} · {status} · {elapsed}")
         return
 
     bar = "[" + "=" * 18 + "]" if done else _activity_bar(tick)
-    line = (
-        f"[Open WebUI] {ordinal}/{total} {bar} "
-        f"{filename}: {status} · {elapsed}"
-    )
+    line = f"[Open WebUI] {ordinal}/{total} {bar} " f"{filename}: {status} · {elapsed}"
     if hasattr(sys.stderr, "isatty") and sys.stderr.isatty():
         click.echo("\r" + line.ljust(120), nl=done, err=True)
     else:
@@ -2520,9 +2485,7 @@ def _wait_for_file_processing(
         status = payload.get("status") if isinstance(payload, dict) else None
         display_status = status or "waiting"
         terminal_updates = interactive_status or (
-            on_status is None
-            and hasattr(sys.stderr, "isatty")
-            and sys.stderr.isatty()
+            on_status is None and hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
         )
         if status != last_status or terminal_updates:
             _render_file_progress(
@@ -2551,12 +2514,10 @@ def _wait_for_file_processing(
                     data = file_payload.get("data")
                     if isinstance(data, dict):
                         detail = data.get("error")
-            except Exception:
-                pass
+            except (httpx2.HTTPError, ValueError):
+                detail = None
             suffix = f": {detail}" if detail else ""
-            raise llm.ModelError(
-                f"Open WebUI failed to process {filename}{suffix}"
-            )
+            raise llm.ModelError(f"Open WebUI failed to process {filename}{suffix}")
         if status not in ("pending", "processing", None):
             raise llm.ModelError(
                 f"Open WebUI returned unexpected processing status "
@@ -2654,7 +2615,8 @@ def _upload_attachment(
     except Exception as exc:
         raise llm.ModelError(f"Open WebUI failed to upload {filename}: {exc}") from exc
 
-    meta = uploaded.get("meta") if isinstance(uploaded.get("meta"), dict) else {}
+    meta_value = uploaded.get("meta")
+    meta = meta_value if isinstance(meta_value, dict) else {}
     effective_type = meta.get("content_type") or content_type
     item: dict[str, Any] = {
         "type": "image" if str(effective_type).startswith("image/") else "file",
@@ -2709,7 +2671,10 @@ def _is_textual_attachment(item: dict[str, Any]) -> bool:
         "application/toml",
     }:
         return True
-    return Path(str(item.get("name") or "")).suffix.lower() in _TEXT_FULL_CONTEXT_EXTENSIONS
+    return (
+        Path(str(item.get("name") or "")).suffix.lower()
+        in _TEXT_FULL_CONTEXT_EXTENSIONS
+    )
 
 
 def _apply_attachment_context_policy(
@@ -2791,7 +2756,10 @@ def _prepare_openwebui_request(
                 isinstance(cached_sidecars, list)
                 and cached_sidecars
                 and cached_url == client.base_url
-                and all(isinstance(item, dict) and item.get("id") for item in cached_sidecars)
+                and all(
+                    isinstance(item, dict) and item.get("id")
+                    for item in cached_sidecars
+                )
             ):
                 total_attachments += len(cached_sidecars)
                 continue
@@ -2824,7 +2792,10 @@ def _prepare_openwebui_request(
                 isinstance(cached_sidecars, list)
                 and cached_sidecars
                 and cached_url == client.base_url
-                and all(isinstance(item, dict) and item.get("id") for item in cached_sidecars)
+                and all(
+                    isinstance(item, dict) and item.get("id")
+                    for item in cached_sidecars
+                )
             ):
                 if on_status is not None:
                     names = ", ".join(
@@ -2865,9 +2836,7 @@ def _prepare_openwebui_request(
                 part.provider_metadata = {
                     **metadata,
                     "openwebui_sidecars": uploaded_sidecars,
-                    "openwebui_sidecar_names": [
-                        name for name, _ in sidecars
-                    ],
+                    "openwebui_sidecar_names": [name for name, _ in sidecars],
                     "openwebui_url": client.base_url,
                     "openwebui_archive_replaced": True,
                 }
@@ -2908,7 +2877,7 @@ def _prepare_openwebui_request(
     files = list(files_by_id.values())
     _apply_attachment_context_policy(
         files,
-        prompt.options.openwebui_attachment_context,
+        cast(OpenWebUIModel.Options, prompt.options).openwebui_attachment_context,
         on_status=on_status,
     )
     return messages, files
@@ -2972,9 +2941,7 @@ class OpenWebUIModel(llm.Model):
             else f"transient:{time.time_ns()}"
         )
 
-        def journal_provider(
-            record: dict[str, Any], *, durable: bool = False
-        ) -> None:
+        def journal_provider(record: dict[str, Any], *, durable: bool = False) -> None:
             if conversation is not None:
                 append_chat_journal_record(
                     conversation.id,
@@ -3030,7 +2997,7 @@ class OpenWebUIModel(llm.Model):
             # actually remove those tools for CLI chats.
             tool_ids = (
                 _enabled_tool_ids(config)
-                if prompt.options.openwebui_tools
+                if cast(OpenWebUIModel.Options, prompt.options).openwebui_tools
                 else []
             )
             server_version, server_mcp_safe = _guard_server_mcp_version(
@@ -3038,7 +3005,9 @@ class OpenWebUIModel(llm.Model):
                 tool_ids,
             )
             if tool_ids:
-                transport = prompt.options.openwebui_mcp_transport
+                transport = cast(
+                    OpenWebUIModel.Options, prompt.options
+                ).openwebui_mcp_transport
                 if transport == "sessionless_native":
                     raise llm.ModelError(
                         "sessionless_native cannot run Open WebUI's iterative "
@@ -3071,20 +3040,29 @@ class OpenWebUIModel(llm.Model):
                 ],
                 "knowledge_resolution": knowledge_resolution,
                 "options": {
-                    "temperature": prompt.options.temperature,
+                    "temperature": cast(
+                        OpenWebUIModel.Options, prompt.options
+                    ).temperature,
                     "openwebui_attachment_context": (
-                        prompt.options.openwebui_attachment_context
+                        cast(
+                            OpenWebUIModel.Options, prompt.options
+                        ).openwebui_attachment_context
                     ),
-                    "openwebui_tools": prompt.options.openwebui_tools,
+                    "openwebui_tools": cast(
+                        OpenWebUIModel.Options, prompt.options
+                    ).openwebui_tools,
                     "sessionless_server_tools": False,
-                    "openwebui_mcp_transport": prompt.options.openwebui_mcp_transport,
+                    "openwebui_mcp_transport": cast(
+                        OpenWebUIModel.Options, prompt.options
+                    ).openwebui_mcp_transport,
                     "native_tool_scope": (
                         "selected MCP tools + server-enabled builtins"
                         if tool_ids
-                        and prompt.options.openwebui_mcp_transport == "background_native"
-                        else "selected tools (legacy prepass)"
-                        if tool_ids
-                        else "none"
+                        and cast(
+                            OpenWebUIModel.Options, prompt.options
+                        ).openwebui_mcp_transport
+                        == "background_native"
+                        else "selected tools (legacy prepass)" if tool_ids else "none"
                     ),
                 },
                 "server": {
@@ -3106,12 +3084,20 @@ class OpenWebUIModel(llm.Model):
         worker_finished = threading.Event()
         tool_activity: list[str] = []
         remote_execution: dict[str, Any] = {}
-        if tool_ids and prompt.options.openwebui_mcp_transport == "background_legacy":
+        if (
+            tool_ids
+            and cast(OpenWebUIModel.Options, prompt.options).openwebui_mcp_transport
+            == "background_legacy"
+        ):
             prepare_status(
                 "legacy MCP prepass: tools run before the answer; "
                 "the model cannot request additional searches during generation"
             )
-        elif tool_ids and prompt.options.openwebui_mcp_transport == "background_native":
+        elif (
+            tool_ids
+            and cast(OpenWebUIModel.Options, prompt.options).openwebui_mcp_transport
+            == "background_native"
+        ):
             prepare_status(
                 "native MCP: browser-equivalent iterative calls; "
                 "Open WebUI may also provide server-enabled builtin tools"
@@ -3142,9 +3128,7 @@ class OpenWebUIModel(llm.Model):
             # It must finish writing the complete native tool result before
             # accepting any more model/tool events. Never only journal a status.
             if conversation is not None:
-                save_tool_checkpoint(
-                    conversation.id, provider_run_id, checkpoint
-                )
+                save_tool_checkpoint(conversation.id, provider_run_id, checkpoint)
 
         def on_status(line: str) -> None:
             status_activity.append(line)
@@ -3176,14 +3160,23 @@ class OpenWebUIModel(llm.Model):
                             files=attached_files,
                             params={
                                 **(
-                                    {"temperature": prompt.options.temperature}
-                                    if prompt.options.temperature is not None
+                                    {
+                                        "temperature": cast(
+                                            OpenWebUIModel.Options, prompt.options
+                                        ).temperature
+                                    }
+                                    if cast(
+                                        OpenWebUIModel.Options, prompt.options
+                                    ).temperature
+                                    is not None
                                     else {}
                                 ),
                                 "tool_approval_mode": "full",
                                 **(
                                     {"function_calling": "legacy"}
-                                    if prompt.options.openwebui_mcp_transport
+                                    if cast(
+                                        OpenWebUIModel.Options, prompt.options
+                                    ).openwebui_mcp_transport
                                     == "background_legacy"
                                     else {}
                                 ),
@@ -3204,10 +3197,14 @@ class OpenWebUIModel(llm.Model):
                             "remote_chat_id": data.get("remote_chat_id"),
                             "remote_task_ids": data.get("remote_task_ids", []),
                             "server_tool_sources": data.get("server_tool_sources", []),
-                            "native_checkpoint_count": data.get("native_checkpoint_count", 0),
+                            "native_checkpoint_count": data.get(
+                                "native_checkpoint_count", 0
+                            ),
                             "verified_mcp_tool_results": sum(
-                                1 for source in data.get("server_tool_sources", [])
-                                if source.get("is_mcp") and source.get("server_executed")
+                                1
+                                for source in data.get("server_tool_sources", [])
+                                if source.get("is_mcp")
+                                and source.get("server_executed")
                             ),
                         }
                     )
@@ -3222,7 +3219,9 @@ class OpenWebUIModel(llm.Model):
                         model=self.remote_model_id,
                         messages=messages,
                         tool_ids=tool_ids,
-                        temperature=prompt.options.temperature,
+                        temperature=cast(
+                            OpenWebUIModel.Options, prompt.options
+                        ).temperature,
                         extra={"files": attached_files} if attached_files else None,
                         on_text=on_text,
                         on_reasoning=on_reasoning,
@@ -3230,7 +3229,7 @@ class OpenWebUIModel(llm.Model):
                         on_status=on_status,
                     )
                 events.put(("done", result))
-            except Exception as exc:  # handed back to the main iterator
+            except Exception as exc:  # noqa: BLE001
                 journal_provider(
                     {
                         "type": "provider_error",
@@ -3263,7 +3262,9 @@ class OpenWebUIModel(llm.Model):
                     if not prompt.hide_reasoning:
                         status_bar.clear()
                         chunk = str(payload)
-                        output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
+                        output_line_open = bool(chunk) and not chunk.endswith(
+                            ("\n", "\r")
+                        )
                         yield StreamEvent(type="reasoning", chunk=chunk)
                 elif kind in ("tool", "status"):
                     if output_line_open:
@@ -3278,22 +3279,16 @@ class OpenWebUIModel(llm.Model):
                     if isinstance(payload, (APIError, AuthError)):
                         context_bits = []
                         if status_activity:
-                            context_bits.append(
-                                f"last status: {status_activity[-1]}"
-                            )
+                            context_bits.append(f"last status: {status_activity[-1]}")
                         if remote_execution.get("remote_chat_id"):
                             context_bits.append(
                                 f"remote chat: {remote_execution['remote_chat_id']}"
                             )
                         task_ids = remote_execution.get("remote_task_ids") or []
                         if task_ids:
-                            context_bits.append(
-                                "remote task(s): " + ",".join(task_ids)
-                            )
+                            context_bits.append("remote task(s): " + ",".join(task_ids))
                         suffix = (
-                            " [" + "; ".join(context_bits) + "]"
-                            if context_bits
-                            else ""
+                            " [" + "; ".join(context_bits) + "]" if context_bits else ""
                         )
                         raise llm.ModelError(str(payload) + suffix) from payload
                     raise payload
@@ -3307,7 +3302,8 @@ class OpenWebUIModel(llm.Model):
                     # legitimately finish without any MCP call.
                     user_text = "\n".join(
                         str(message.get("content") or "")
-                        for message in messages if message.get("role") == "user"
+                        for message in messages
+                        if message.get("role") == "user"
                     )
                     expects_mcp = bool(
                         re.search(r"\bMCP\b", user_text, re.IGNORECASE)
@@ -3319,20 +3315,20 @@ class OpenWebUIModel(llm.Model):
                     )
                     mcp_servers = [
                         item[len("server:mcp:") :]
-                        for item in tool_ids if item.startswith("server:mcp:")
+                        for item in tool_ids
+                        if item.startswith("server:mcp:")
                     ]
-                    observed = (
-                        remote_execution.get("verified_mcp_tool_results", 0) > 0
-                        or any(
-                            (
-                                str(call.get("name") or "") == server_id
-                                or str(call.get("name") or "").startswith(server_id + "_")
-                            )
-                            and call.get("result") is not None
-                            for call in (result.tool_calls or [])
-                            if isinstance(call, dict)
-                            for server_id in mcp_servers
+                    observed = remote_execution.get(
+                        "verified_mcp_tool_results", 0
+                    ) > 0 or any(
+                        (
+                            str(call.get("name") or "") == server_id
+                            or str(call.get("name") or "").startswith(server_id + "_")
                         )
+                        and call.get("result") is not None
+                        for call in (result.tool_calls or [])
+                        if isinstance(call, dict)
+                        for server_id in mcp_servers
                     )
                     if tool_ids and expects_mcp and not observed:
                         error = (
@@ -3342,11 +3338,13 @@ class OpenWebUIModel(llm.Model):
                             "live Splunk evidence. Check the provider_tool_source "
                             "journal records or retry the investigation."
                         )
-                        journal_provider({
-                            "type": "provider_error",
-                            "error": error,
-                            "error_class": "MCPVerificationError",
-                        })
+                        journal_provider(
+                            {
+                                "type": "provider_error",
+                                "error": error,
+                                "error_class": "MCPVerificationError",
+                            }
+                        )
                         raise llm.ModelError(error)
                     response.response_json = {
                         "provider": "openwebui",
@@ -3438,9 +3436,7 @@ def register_commands(cli):
                 "mcp_cleanup_fix": (
                     "present"
                     if server_mcp_safe is True
-                    else "missing"
-                    if server_mcp_safe is False
-                    else "unknown"
+                    else "missing" if server_mcp_safe is False else "unknown"
                 ),
                 "minimum_safe_version": "0.9.3",
             },
@@ -3482,9 +3478,7 @@ def register_commands(cli):
             raise click.ClickException(str(exc)) from exc
         builtin_setting = _server_builtin_tools_setting(model_item)
         tool_ids = _enabled_tool_ids(config)
-        selected_mcp = [
-            item for item in tool_ids if item.startswith("server:mcp:")
-        ]
+        selected_mcp = [item for item in tool_ids if item.startswith("server:mcp:")]
         ready = bool(selected_mcp)
         output = {
             "model": model_id,
@@ -3494,25 +3488,23 @@ def register_commands(cli):
             "iterative_mcp_ready": ready,
             "wire_protocol": "socket.io + native/default function calling",
             "live_execution_verified": False,
-            "recommended_transport": (
-                "background_native" if ready else None
-            ),
+            "recommended_transport": ("background_native" if ready else None),
             "server_added_builtins_possible": builtin_setting is not False,
             "note": (
                 "Native mode uses the same server-side tool loop as the browser. "
                 "The CLI selects only the configured MCP integrations, but "
                 "Open WebUI may also inject its enabled builtin tools."
-                if builtin_setting is not False else
-                "Native mode uses the browser tool loop with no additional "
+                if builtin_setting is not False
+                else "Native mode uses the browser tool loop with no additional "
                 "server builtins advertised by this model."
             ),
             "action": (
-                None if ready else
-                "Select an MCP server using llm openwebui tool enable."
+                None
+                if ready
+                else "Select an MCP server using llm openwebui tool enable."
             ),
         }
         click.echo(json.dumps(output, indent=2, ensure_ascii=False))
-
 
     @openwebui_group.command(name="resume")
     @click.argument("conversation_id")
@@ -3530,7 +3522,9 @@ def register_commands(cli):
         is_flag=True,
         help="Recover a process-killed run without a provider_error (only if the task is stopped)",
     )
-    @click.option("--dry-run", is_flag=True, help="Verify checkpoints; do not contact the model")
+    @click.option(
+        "--dry-run", is_flag=True, help="Verify checkpoints; do not contact the model"
+    )
     def resume(
         conversation_id: str,
         provider_run_id: str | None,
@@ -3584,12 +3578,17 @@ def register_commands(cli):
         # Never widen the previous request's explicit MCP scope. In particular,
         # do not reactivate unrelated user-visible tools after reconnecting.
         selected = set(_enabled_tool_ids(config))
-        tool_ids = [
-            item for item in original_ids
-            if isinstance(item, str)
-            and item.startswith("server:mcp:")
-            and item in selected
-        ] if allow_new_searches else []
+        tool_ids = (
+            [
+                item
+                for item in original_ids
+                if isinstance(item, str)
+                and item.startswith("server:mcp:")
+                and item in selected
+            ]
+            if allow_new_searches
+            else []
+        )
         if allow_new_searches and not tool_ids:
             raise click.ClickException(
                 "No MCP server remains enabled from the original request"
@@ -3610,9 +3609,11 @@ def register_commands(cli):
         new_id = str(uuid.uuid4())
         run_id = f"{new_id}:{time.time_ns()}"
         ensure_chat_journal_session(
-            new_id, model=f"openwebui/{origin['model']}",
+            new_id,
+            model=f"openwebui/{origin['model']}",
             name=f"Recovery of {conversation_id}",
         )
+
         def journal(entry: dict[str, Any], *, durable: bool = False) -> None:
             append_chat_journal_record(
                 new_id,
@@ -3620,19 +3621,26 @@ def register_commands(cli):
                 durable=durable,
             )
 
-        journal({
-            "type": "provider_request",
-            "model": origin["model"],
-            "messages": messages,
-            "tool_ids": tool_ids,
-            "recovery": summary,
-        }, durable=True)
-        append_chat_journal_record(conversation_id, {
-            "type": "recovery_started",
-            "source_provider_run_id": recovery["provider_run_id"],
-            "recovery_conversation_id": new_id,
-            "allow_new_searches": allow_new_searches,
-        }, durable=True)
+        journal(
+            {
+                "type": "provider_request",
+                "model": origin["model"],
+                "messages": messages,
+                "tool_ids": tool_ids,
+                "recovery": summary,
+            },
+            durable=True,
+        )
+        append_chat_journal_record(
+            conversation_id,
+            {
+                "type": "recovery_started",
+                "source_provider_run_id": recovery["provider_run_id"],
+                "recovery_conversation_id": new_id,
+                "allow_new_searches": allow_new_searches,
+            },
+            durable=True,
+        )
 
         click.echo(
             f"Recovery conversation: {new_id} "
@@ -3642,7 +3650,7 @@ def register_commands(cli):
             "Evidence-only: no tools will be executed."
             if not allow_new_searches
             else "Native MCP enabled for new calls; duplicate searches remain "
-                 "possible if requested again by the model."
+            "possible if requested again by the model."
         )
         status_bar = _OpenWebUIStatusBar()
 
@@ -3654,7 +3662,9 @@ def register_commands(cli):
         def on_reasoning(chunk: str) -> None:
             status_bar.clear()
             click.echo(click.style(chunk, dim=True), nl=False, err=True)
-            journal({"type": "assistant_stream", "event_type": "reasoning", "chunk": chunk})
+            journal(
+                {"type": "assistant_stream", "event_type": "reasoning", "chunk": chunk}
+            )
 
         def on_tool(line: str) -> None:
             journal({"type": "provider_tool", "tool": line})
@@ -3686,7 +3696,10 @@ def register_commands(cli):
                     params=(
                         {"tool_approval_mode": "full"}
                         if allow_new_searches
-                        else {"function_calling": "legacy", "tool_approval_mode": "full"}
+                        else {
+                            "function_calling": "legacy",
+                            "tool_approval_mode": "full",
+                        }
                     ),
                     timeout=client.timeout,
                     on_text=on_text,
@@ -3698,30 +3711,44 @@ def register_commands(cli):
                 )
             )
             status_bar.clear()
-            journal({
-                "type": "recovery_completed",
-                "native_checkpoint_count": result.get("native_checkpoint_count", 0),
-                "remote_chat_id": result.get("remote_chat_id"),
-                "answer": result.get("answer"),
-            }, durable=True)
-            append_chat_journal_record(conversation_id, {
-                "type": "recovery_completed",
-                "recovery_conversation_id": new_id,
-            }, durable=True)
+            journal(
+                {
+                    "type": "recovery_completed",
+                    "native_checkpoint_count": result.get("native_checkpoint_count", 0),
+                    "remote_chat_id": result.get("remote_chat_id"),
+                    "answer": result.get("answer"),
+                },
+                durable=True,
+            )
+            append_chat_journal_record(
+                conversation_id,
+                {
+                    "type": "recovery_completed",
+                    "recovery_conversation_id": new_id,
+                },
+                durable=True,
+            )
             click.echo()
             click.echo(f"Completed recovery; local journal: {new_id}.jsonl")
         except (APIError, AuthError, CheckpointError, KeyboardInterrupt) as exc:
             status_bar.clear()
-            journal({
-                "type": "provider_error",
-                "error": str(exc),
-                "error_class": type(exc).__name__,
-            }, durable=True)
-            append_chat_journal_record(conversation_id, {
-                "type": "recovery_failed",
-                "recovery_conversation_id": new_id,
-                "error": str(exc),
-            }, durable=True)
+            journal(
+                {
+                    "type": "provider_error",
+                    "error": str(exc),
+                    "error_class": type(exc).__name__,
+                },
+                durable=True,
+            )
+            append_chat_journal_record(
+                conversation_id,
+                {
+                    "type": "recovery_failed",
+                    "recovery_conversation_id": new_id,
+                    "error": str(exc),
+                },
+                durable=True,
+            )
             if isinstance(exc, KeyboardInterrupt):
                 raise click.Abort() from exc
             raise click.ClickException(str(exc)) from exc
@@ -3736,7 +3763,6 @@ def register_commands(cli):
             click.echo(
                 f"openwebui/{item.get('id')}\t{item.get('name') or item.get('id')}"
             )
-
 
     @openwebui_group.group(name="knowledge")
     def knowledge_group():
@@ -3816,8 +3842,7 @@ def register_commands(cli):
                 _save_config(config)
         click.echo(
             f"Created knowledge base {knowledge.get('name') or name} "
-            f"({knowledge_id})"
-            + (" and enabled it for CLI chats." if enable else ".")
+            f"({knowledge_id})" + (" and enabled it for CLI chats." if enable else ".")
         )
 
     @knowledge_group.command(name="enable")
@@ -3949,15 +3974,11 @@ def register_commands(cli):
         client = _client(config)
         try:
             knowledge = _resolve_knowledge_selector(client, selector)
-            hit = _knowledge_tide_file(
-                client, str(knowledge["id"]), path, {}
-            )
+            hit = _knowledge_tide_file(client, str(knowledge["id"]), path, {})
         except llm.ModelError as exc:
             raise click.ClickException(str(exc)) from exc
         if hit is None:
-            raise click.ClickException(
-                f"No Knowledge file matches exact path {path!r}"
-            )
+            raise click.ClickException(f"No Knowledge file matches exact path {path!r}")
         click.echo(hit[2])
 
     @knowledge_group.command(name="rebuild")
@@ -4024,9 +4045,7 @@ def register_commands(cli):
         try:
             status_bar.update(f"knowledge rebuild · resetting {name}")
             _reset_knowledge_base(client, knowledge_id)
-            status_bar.update(
-                f"knowledge rebuild · repopulating {len(manifest)} files"
-            )
+            status_bar.update(f"knowledge rebuild · repopulating {len(manifest)} files")
             result = _sync_knowledge_folder(
                 client,
                 knowledge,
@@ -4159,9 +4178,7 @@ def register_commands(cli):
             return
         for tool in available:
             marker = "*" if tool.id in enabled else " "
-            click.echo(
-                f"{marker}\t{_tool_kind(tool.id)}\t{tool.name}\t{tool.id}"
-            )
+            click.echo(f"{marker}\t{_tool_kind(tool.id)}\t{tool.name}\t{tool.id}")
 
     @openwebui_group.group(name="tool")
     def tool_group():
@@ -4185,9 +4202,7 @@ def register_commands(cli):
             enabled.append(tool.id)
             config["enabled_tool_ids"] = enabled
             _save_config(config)
-        click.echo(
-            f"Enabled {_tool_kind(tool.id)} tool {tool.name} ({tool.id})"
-        )
+        click.echo(f"Enabled {_tool_kind(tool.id)} tool {tool.name} ({tool.id})")
 
     @tool_group.command(name="disable")
     @click.argument("selector")
@@ -4203,15 +4218,11 @@ def register_commands(cli):
             raise click.ClickException(str(exc)) from exc
 
         enabled = [
-            tool_id
-            for tool_id in _enabled_tool_ids(config)
-            if tool_id != tool.id
+            tool_id for tool_id in _enabled_tool_ids(config) if tool_id != tool.id
         ]
         config["enabled_tool_ids"] = enabled
         _save_config(config)
-        click.echo(
-            f"Disabled {_tool_kind(tool.id)} tool {tool.name} ({tool.id})"
-        )
+        click.echo(f"Disabled {_tool_kind(tool.id)} tool {tool.name} ({tool.id})")
 
     @tool_group.command(name="clear")
     def tool_clear():

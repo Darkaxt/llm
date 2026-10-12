@@ -44,32 +44,31 @@ def append_record(
         default=str,
     )
     encoded = (line + "\n").encode("utf-8")
-    with _lock:
-        # A process may have died midway through the final JSONL record.
-        # Remove ONLY that incomplete tail before appending the next record,
-        # so a recovery attempt does not turn it into interior corruption.
-        with path.open("a+b") as handle:
-            handle.seek(0, os.SEEK_END)
-            position = handle.tell()
-            if position:
-                handle.seek(-1, os.SEEK_END)
-                if handle.read(1) != b"\n":
-                    while position:
-                        start = max(0, position - 4096)
-                        handle.seek(start)
-                        chunk = handle.read(position - start)
-                        last_newline = chunk.rfind(b"\n")
-                        if last_newline >= 0:
-                            handle.truncate(start + last_newline + 1)
-                            break
-                        position = start
-                    else:
-                        handle.truncate(0)
-            handle.seek(0, os.SEEK_END)
-            handle.write(encoded)
-            handle.flush()
-            if durable:
-                os.fsync(handle.fileno())
+    # A process may have died midway through the final JSONL record.
+    # Remove ONLY that incomplete tail before appending the next record,
+    # so a recovery attempt does not turn it into interior corruption.
+    with _lock, path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        if position:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                while position:
+                    start = max(0, position - 4096)
+                    handle.seek(start)
+                    chunk = handle.read(position - start)
+                    last_newline = chunk.rfind(b"\n")
+                    if last_newline >= 0:
+                        handle.truncate(start + last_newline + 1)
+                        break
+                    position = start
+                else:
+                    handle.truncate(0)
+        handle.seek(0, os.SEEK_END)
+        handle.write(encoded)
+        handle.flush()
+        if durable:
+            os.fsync(handle.fileno())
     return path
 
 

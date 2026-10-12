@@ -69,7 +69,6 @@ from llm.models import ChainResponse, _BaseChainResponse, _BaseConversation
 from .chat_journal import append_record as append_chat_journal_record
 from .chat_journal import ensure_session as ensure_chat_journal_session
 from .chat_journal import journal_path as chat_journal_path
-
 from .logs import (
     LogStore,
     legacy_log_row_extras,
@@ -207,8 +206,8 @@ def _serialize_chat_attachment(attachment: Attachment) -> dict[str, Any]:
     }
     try:
         payload["id"] = attachment.id()
-    except Exception:
-        pass
+    except (OSError, httpx2.HTTPError):
+        payload["id_unavailable"] = True
     if attachment.content is not None:
         payload["content_size"] = len(attachment.content)
     return {key: value for key, value in payload.items() if value is not None}
@@ -268,7 +267,6 @@ def _append_completed_turn_jsonl(
     )
 
 
-
 def _chat_turn_headers_enabled() -> bool:
     return bool(
         getattr(sys.stdin, "isatty", lambda: False)()
@@ -316,7 +314,11 @@ def _run_chat(
 
     argument_fragments = list(initial_fragments or [])
     argument_attachments = list(initial_attachments or [])
-    prompt_session = _build_chat_prompt_session() if sys.stdin.isatty() and sys.stdout.isatty() else None
+    prompt_session = (
+        _build_chat_prompt_session()
+        if sys.stdin.isatty() and sys.stdout.isatty()
+        else None
+    )
 
     turn_headers = _chat_turn_headers_enabled()
     turn_counter = 0
@@ -395,12 +397,10 @@ def _run_chat(
                 "model": model_label,
                 "prompt": prompt,
                 "fragments": [
-                    _serialize_chat_fragment(fragment)
-                    for fragment in fragments
+                    _serialize_chat_fragment(fragment) for fragment in fragments
                 ],
                 "attachments": [
-                    _serialize_chat_attachment(attachment)
-                    for attachment in attachments
+                    _serialize_chat_attachment(attachment) for attachment in attachments
                 ],
             }
             if retry_of is not None:
@@ -413,7 +413,7 @@ def _run_chat(
         try:
             response = prompt_callback(prompt, fragments, attachments)
 
-            def journaled_events():
+            def journaled_events(response=response, turn_id=turn_id):
                 stream = response.stream_events()
                 try:
                     for event in stream:
