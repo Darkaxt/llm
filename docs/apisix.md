@@ -11,14 +11,22 @@ server-side knowledge or MCP APIs. Keep the existing Open WebUI profile and KB.
 
 Run inside your existing LLM source checkout on the work computer. Preserve any
 local changes; Git will refuse a conflicting switch rather than discard them.
+Select the Python executable from the environment where LLM is installed. The
+example below uses the existing workplace `Projects\.venv` beside the checkout;
+adjust that one path if your environment is elsewhere. Use the same executable
+for installation and every subsequent command. A bare `python` may select a
+different installation even when you are inside the source checkout.
 
 ```powershell
 git fetch origin
 git switch codex/apisix-profile-availability
-python -m pip install -e .
+git pull --ff-only
+$LlmPython = (Resolve-Path "..\.venv\Scripts\python.exe").Path
+& $LlmPython -m pip install -e .
 git rev-parse HEAD
-python --version
-llm apisix --help
+& $LlmPython --version
+& $LlmPython -c "import sys, sqlite_utils, llm; print(sys.executable); print(llm.__file__)"
+& $LlmPython -m llm apisix --help
 ```
 
 Git can automatically track the matching remote branch on the first switch.
@@ -28,9 +36,9 @@ instead of replacing the existing origin.
 ## Create the first profile
 
 ```powershell
-llm apisix profile create work --no-verify-ssl
-llm keys set apisix-work
-llm apisix models --profile work
+& $LlmPython -m llm apisix profile create work --no-verify-ssl
+& $LlmPython -m llm keys set apisix-work
+& $LlmPython -m llm apisix models --profile work
 ```
 
 At the first prompt, enter the complete `OPENAI_BASE_URL` from your email,
@@ -55,7 +63,7 @@ running model probes. Do not guess an ID.
 ## Assess the existing TIDE bundle
 
 ```powershell
-llm apisix knowledge --profile work --directory "D:\path\to\existing-TIDE-folder"
+& $LlmPython -m llm apisix knowledge --profile work --directory "D:\path\to\existing-TIDE-folder"
 ```
 
 Use the existing local folder containing the instructions and rule bundle.
@@ -79,7 +87,7 @@ Replace `EXACT_PROVIDER_MODEL_ID` with a returned model ID, removing only the
 `apisix/work/` prefix. Preserve slashes within the actual provider ID.
 
 ```powershell
-llm apisix check --profile work --model "EXACT_PROVIDER_MODEL_ID" --output apisix-availability.json
+& $LlmPython -m llm apisix check --profile work --model "EXACT_PROVIDER_MODEL_ID" --output apisix-availability.json
 ```
 
 The probes run sequentially: model discovery, ordinary completion, SSE text,
@@ -106,8 +114,8 @@ outcomes remain separate from the API probe exit status.
 After passing synthetic probes, ordinary client commands are available:
 
 ```powershell
-llm -m "apisix/work/EXACT_PROVIDER_MODEL_ID" "Reply with APISIX_PROBE_OK"
-llm chat -m "apisix/work/EXACT_PROVIDER_MODEL_ID"
+& $LlmPython -m llm -m "apisix/work/EXACT_PROVIDER_MODEL_ID" "Reply with APISIX_PROBE_OK"
+& $LlmPython -m llm chat -m "apisix/work/EXACT_PROVIDER_MODEL_ID"
 ```
 
 These commands use provider reasoning defaults unless you explicitly supply an

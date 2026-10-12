@@ -56,6 +56,14 @@ Open WebUI, recovery and chat regression checks pass with existing expected-fail
 and XPASS outcomes retained. Ruff, Black, mypy, Cog documentation checks and
 sdist/wheel packaging pass. These checks use synthetic protocol fixtures.
 
+First workplace artifact (issue comment `6124613360`): the checkout matches
+`d361179` and editable installation succeeded in `Projects\.venv`. Subsequent
+bare `python` commands failed on import of `sqlite_utils`, which the installation
+log confirms exists in that virtual environment. The profile/key/discovery commands
+never reached execution. Workplace instructions now select one explicit environment
+executable for every command. No production change is required for this mismatch;
+successful workplace imports and first API discovery remain unverified until rerun.
+
 External blocker B1 (Stage 3, R3-R5): the development host cannot reach corporate
 services, has no corporate credentials or actual TIDE folder, and has no direct
 MCP transport/authentication contract. Resolution requires workplace discovery,
