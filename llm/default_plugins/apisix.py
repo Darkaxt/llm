@@ -71,14 +71,27 @@ def _client(name, profile, key=None):
         raise click.ClickException(
             "No profile key. Run: llm keys set {}".format(profile["key_alias"])
         )
+    trace_directory = os.environ.get("LLM_APISIX_TRACE_DIR")
+    if trace_directory:
+        from llm.apisix_trace import CaptureClient
+
+        http_client = CaptureClient(
+            trace_directory,
+            profile=name,
+            verify=profile.get("verify_ssl", True),
+            timeout=None,
+            follow_redirects=False,
+        )
+    else:
+        http_client = httpx2.Client(
+            verify=profile.get("verify_ssl", True), timeout=None, follow_redirects=False
+        )
     return openai.OpenAI(
         base_url=profile["base_url"],
         api_key=api_key,
         timeout=None,
         max_retries=0,
-        http_client=httpx2.Client(
-            verify=profile.get("verify_ssl", True), timeout=None, follow_redirects=False
-        ),
+        http_client=http_client,
     )
 
 
@@ -413,6 +426,20 @@ def register_commands(cli):
     @cli.group()
     def apisix():
         "Configure APISIX profiles and check OpenAI-compatible API availability."
+
+    @apisix.command(name="trace-summary")
+    @click.argument("trace", type=click.Path(exists=True, dir_okay=False))
+    def trace_summary(trace):
+        "Summarize a local raw HTTP trace without printing prompt or response text."
+        from llm.apisix_trace import summarize_trace
+
+        try:
+            report = summarize_trace(trace)
+        except (OSError, ValueError, httpx2.HTTPError) as ex:
+            raise click.ClickException(
+                f"Cannot summarize trace: {type(ex).__name__}"
+            ) from None
+        click.echo(json.dumps(report, indent=2))
 
     @apisix.group()
     def profile():

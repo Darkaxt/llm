@@ -3,6 +3,10 @@
 Job and artifact replies: [XSoar-MDR issue #28](https://github.com/Darkaxt/XSoar-MDR/issues/28).
 Implementation requirements and stage ledger: [APISIX specification](apisix-spec.md).
 
+Current validation concerns long-running requests and sustained conversations;
+the platform owner handles Open WebUI integration. For completed-run durations
+and opt-in raw reasoning-event capture, see [APISIX timing and tracing](apisix-tracing.md).
+
 The APISIX provider uses the OpenAI-compatible Chat Completions API and the
 existing LLM conversation and function-tool loop. It does not use Open WebUI's
 server-side knowledge or MCP APIs. Keep the existing Open WebUI profile and KB.
@@ -77,9 +81,9 @@ or `inspect_if_needed` retain their existing policy.
 rule semantics, local prompt injection, or remote KB availability. `incomplete`
 means inspect the reported missing files or JSON error before rebuilding.
 `not_configured` in the availability report means no local folder has been
-selected. No KB is uploaded, recreated, deleted, or modified. APISIX knowledge
-injection and direct Splunk MCP integration belong to the later investigation
-stage after workplace access has been established.
+selected. No KB is uploaded, recreated, deleted, or modified. Knowledge injection
+and direct Splunk MCP integration are not acceptance requirements for the current
+endurance-validation job.
 
 ## Probe a discovered model
 
@@ -131,13 +135,11 @@ and stop there. Include the knowledge summary if it has been run. Inspect the
 artifact before posting and keep keys, headers, local configuration and the
 original email off GitHub.
 
-For direct Splunk MCP, report only whether you already have an approved endpoint,
-the advertised transport (`streamable HTTP`, legacy SSE, or stdio), and the
-authentication method's name. Do not post its address or credential. Without
-that contract, the report explicitly marks MCP `not_tested`; neither the APISIX
-gateway nor the inaccessible ITSEC metrics service establishes MCP access.
+The availability report's independent MCP field remains `not_tested`; direct
+Splunk MCP integration is no longer required for this job. The platform owner
+handles the Open WebUI integration. Preserve the earlier probe evidence.
 
 Each issue reply will identify passed/remaining criteria, evidence and root cause,
 implemented fixes with commits and verification, and exact next commands. Real
-corporate availability and the complete investigation remain required before the
-migration can be declared complete.
+corporate endurance evidence remains required before the observed duration and
+conversation envelope can be reported.

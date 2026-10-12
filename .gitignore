@@ -13,3 +13,4 @@ build/
 uv.lock
 *.db
 backups-do-not-delete/
+apisix-trace-*/
