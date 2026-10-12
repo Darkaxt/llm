@@ -81,6 +81,7 @@ Commands:
   logs          Tools for exploring logged prompts and responses
   models        Manage available models
   openai        Commands for working with OpenAI and OpenAI-compatible APIs
+  openwebui     Configure and inspect the Open WebUI provider.
   plugins       List installed plugins
   schemas       Manage stored schemas
   similar       Return top N similar IDs from a collection using cosine...
@@ -189,28 +190,32 @@ Usage: llm chat [OPTIONS]
   Hold an ongoing chat with a model.
 
 Options:
-  -s, --system TEXT             System prompt to use
-  -m, --model TEXT              Model to use
-  -c, --continue                Continue the most recent conversation.
-  --cid, --conversation TEXT    Continue the conversation with the given ID.
-  -f, --fragment TEXT           Fragment (alias, URL, hash or file path) to add
-                                to the prompt
-  --sf, --system-fragment TEXT  Fragment to add to system prompt
-  -t, --template TEXT           Template to use
-  -p, --param <TEXT TEXT>...    Parameters for template
-  -o, --option <TEXT TEXT>...   key/value options for the model
-  -d, --database FILE           Path to log database
-  --no-stream                   Do not stream output
-  -R, --hide-reasoning          Hide reasoning output
-  --key TEXT                    API key to use
-  -T, --tool TEXT               Name of a tool to make available to the model
-  --functions TEXT              Python code block or file path defining
-                                functions to register as tools
-  --td, --tools-debug           Show full details of tool executions
-  --ta, --tools-approve         Manually approve every tool execution
-  --cl, --chain-limit INTEGER   How many chained tool responses to allow,
-                                default 5, set 0 for unlimited
-  -h, --help                    Show this message and exit.
+  -s, --system TEXT               System prompt to use
+  -m, --model TEXT                Model to use
+  -c, --continue                  Continue the most recent conversation.
+  --cid, --conversation TEXT      Continue the conversation with the given ID.
+  -a, --attachment ATTACHMENT     Attachment path or URL or -
+  --at, --attachment-type <TEXT TEXT>...
+                                  Attachment with explicit mimetype, --at FILE
+                                  MIME
+  -f, --fragment TEXT             Fragment (alias, URL, hash or file path) to
+                                  add to the prompt
+  --sf, --system-fragment TEXT    Fragment to add to system prompt
+  -t, --template TEXT             Template to use
+  -p, --param <TEXT TEXT>...      Parameters for template
+  -o, --option <TEXT TEXT>...     key/value options for the model
+  -d, --database FILE             Path to log database
+  --no-stream                     Do not stream output
+  -R, --hide-reasoning            Hide reasoning output
+  --key TEXT                      API key to use
+  -T, --tool TEXT                 Name of a tool to make available to the model
+  --functions TEXT                Python code block or file path defining
+                                  functions to register as tools
+  --td, --tools-debug             Show full details of tool executions
+  --ta, --tools-approve           Manually approve every tool execution
+  --cl, --chain-limit INTEGER     How many chained tool responses to allow,
+                                  default 5, set 0 for unlimited
+  -h, --help                      Show this message and exit.
 ```
 
 (help-keys)=
@@ -1085,6 +1090,297 @@ Usage: llm collections delete [OPTIONS] COLLECTION
 Options:
   -d, --database FILE  Path to embeddings database
   -h, --help           Show this message and exit.
+```
+
+(help-openwebui)=
+### llm openwebui --help
+```
+Usage: llm openwebui [OPTIONS] COMMAND [ARGS]...
+
+  Configure and inspect the Open WebUI provider.
+
+Options:
+  -h, --help  Show this message and exit.
+
+Commands:
+  doctor     Check browser-native MCP readiness and report server builtin...
+  knowledge  Manage reusable Open WebUI knowledge bases.
+  login      Sign in with email/password and cache the visible model...
+  models     Show the cached Open WebUI model catalogue.
+  resume     Start a new continuation from complete, verified local tool...
+  sync       Refresh the session and cached model catalogue.
+  tool       Enable or disable Open WebUI tools for CLI chats.
+  tools      List Open WebUI tools and MCP servers visible to this user.
+  whoami     Validate the current session and show its identity.
+```
+
+(help-openwebui-login)=
+#### llm openwebui login --help
+```
+Usage: llm openwebui login [OPTIONS]
+
+  Sign in with email/password and cache the visible model catalogue.
+
+Options:
+  --url TEXT       Open WebUI base URL  [required]
+  --email TEXT     Open WebUI email address  [required]
+  --password TEXT
+  -h, --help       Show this message and exit.
+```
+
+(help-openwebui-whoami)=
+#### llm openwebui whoami --help
+```
+Usage: llm openwebui whoami [OPTIONS]
+
+  Validate the current session and show its identity.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-sync)=
+#### llm openwebui sync --help
+```
+Usage: llm openwebui sync [OPTIONS]
+
+  Refresh the session and cached model catalogue.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-doctor)=
+#### llm openwebui doctor --help
+```
+Usage: llm openwebui doctor [OPTIONS]
+
+  Check browser-native MCP readiness and report server builtin scope.
+
+Options:
+  -m, --model TEXT  Open WebUI model ID to test for iterative MCP readiness
+                    [required]
+  -h, --help        Show this message and exit.
+```
+
+(help-openwebui-resume)=
+#### llm openwebui resume --help
+```
+Usage: llm openwebui resume [OPTIONS] CONVERSATION_ID
+
+  Start a new continuation from complete, verified local tool checkpoints.
+
+  This does NOT reconnect to a failed server task. Evidence-only recovery is the
+  default: no MCP tools or other server builtins are available.
+
+Options:
+  --provider-run-id TEXT  Select an earlier failed provider run from this
+                          journal
+  --allow-new-searches    Permit additional MCP calls; duplicate queries cannot
+                          be prevented remotely
+  --assume-stopped        Recover a process-killed run without a provider_error
+                          (only if the task is stopped)
+  --dry-run               Verify checkpoints; do not contact the model
+  -h, --help              Show this message and exit.
+```
+
+(help-openwebui-models)=
+#### llm openwebui models --help
+```
+Usage: llm openwebui models [OPTIONS]
+
+  Show the cached Open WebUI model catalogue.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge)=
+#### llm openwebui knowledge --help
+```
+Usage: llm openwebui knowledge [OPTIONS] COMMAND [ARGS]...
+
+  Manage reusable Open WebUI knowledge bases.
+
+Options:
+  -h, --help  Show this message and exit.
+
+Commands:
+  clear     Disable all CLI-persisted Open WebUI knowledge bases.
+  create    Create a persistent Open WebUI knowledge base.
+  disable   Stop attaching a persisted knowledge base to CLI chats.
+  enable    Enable a persistent knowledge base for every Open WebUI CLI chat.
+  list      List knowledge bases visible to this user.
+  read      Print one Knowledge text file by its exact nested relative path.
+  rebuild   Reset a knowledge base in place and repopulate it from its...
+  register  Create/reuse, sync and enable a knowledge base in one command.
+  sync      Incrementally sync a local folder into an Open WebUI knowledge...
+```
+
+(help-openwebui-knowledge-list)=
+##### llm openwebui knowledge list --help
+```
+Usage: llm openwebui knowledge list [OPTIONS]
+
+  List knowledge bases visible to this user.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-create)=
+##### llm openwebui knowledge create --help
+```
+Usage: llm openwebui knowledge create [OPTIONS] NAME
+
+  Create a persistent Open WebUI knowledge base.
+
+Options:
+  --description TEXT  Knowledge base description.  [default: Managed by llm Open
+                      WebUI CLI.]
+  --enable            Enable this knowledge base for future CLI chats.
+  -h, --help          Show this message and exit.
+```
+
+(help-openwebui-knowledge-enable)=
+##### llm openwebui knowledge enable --help
+```
+Usage: llm openwebui knowledge enable [OPTIONS] SELECTOR
+
+  Enable a persistent knowledge base for every Open WebUI CLI chat.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-disable)=
+##### llm openwebui knowledge disable --help
+```
+Usage: llm openwebui knowledge disable [OPTIONS] SELECTOR
+
+  Stop attaching a persisted knowledge base to CLI chats.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-clear)=
+##### llm openwebui knowledge clear --help
+```
+Usage: llm openwebui knowledge clear [OPTIONS]
+
+  Disable all CLI-persisted Open WebUI knowledge bases.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-sync)=
+##### llm openwebui knowledge sync --help
+```
+Usage: llm openwebui knowledge sync [OPTIONS] SELECTOR [SOURCE]
+
+  Incrementally sync a local folder into an Open WebUI knowledge base.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-read)=
+##### llm openwebui knowledge read --help
+```
+Usage: llm openwebui knowledge read [OPTIONS] SELECTOR PATH
+
+  Print one Knowledge text file by its exact nested relative path.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-rebuild)=
+##### llm openwebui knowledge rebuild --help
+```
+Usage: llm openwebui knowledge rebuild [OPTIONS] SELECTOR [SOURCE]
+
+  Reset a knowledge base in place and repopulate it from its local folder.
+
+Options:
+  --yes       Skip the destructive reset confirmation.
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-knowledge-register)=
+##### llm openwebui knowledge register --help
+```
+Usage: llm openwebui knowledge register [OPTIONS] NAME SOURCE
+
+  Create/reuse, sync and enable a knowledge base in one command.
+
+Options:
+  --description TEXT  Description used if the knowledge base must be created.
+                      [default: Reusable knowledge synchronized by llm Open
+                      WebUI CLI.]
+  -h, --help          Show this message and exit.
+```
+
+(help-openwebui-tools)=
+#### llm openwebui tools --help
+```
+Usage: llm openwebui tools [OPTIONS]
+
+  List Open WebUI tools and MCP servers visible to this user.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-tool)=
+#### llm openwebui tool --help
+```
+Usage: llm openwebui tool [OPTIONS] COMMAND [ARGS]...
+
+  Enable or disable Open WebUI tools for CLI chats.
+
+Options:
+  -h, --help  Show this message and exit.
+
+Commands:
+  clear    Disable all CLI-persisted Open WebUI tools.
+  disable  Remove a persisted Open WebUI tool/MCP server from CLI chats.
+  enable   Persist an Open WebUI tool/MCP server as enabled for CLI chats.
+```
+
+(help-openwebui-tool-enable)=
+##### llm openwebui tool enable --help
+```
+Usage: llm openwebui tool enable [OPTIONS] SELECTOR
+
+  Persist an Open WebUI tool/MCP server as enabled for CLI chats.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-tool-disable)=
+##### llm openwebui tool disable --help
+```
+Usage: llm openwebui tool disable [OPTIONS] SELECTOR
+
+  Remove a persisted Open WebUI tool/MCP server from CLI chats.
+
+Options:
+  -h, --help  Show this message and exit.
+```
+
+(help-openwebui-tool-clear)=
+##### llm openwebui tool clear --help
+```
+Usage: llm openwebui tool clear [OPTIONS]
+
+  Disable all CLI-persisted Open WebUI tools.
+
+Options:
+  -h, --help  Show this message and exit.
 ```
 
 (help-openai)=
