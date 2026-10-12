@@ -45,7 +45,7 @@ first implementation to those requirements without claiming migration completion
 |---|---|---|
 | 1. Preserve Open WebUI baseline | COMPLETE | PR #1 merged as `31b9bce`; regression/dependency, lint, formatting, type, documentation and packaging QA inspected |
 | 2. Profile and availability diagnostics | COMPLETE | A1-A4 verified with protocol/client-loop fixtures and affected regressions; A5 setup/report instructions delivered in issue #28 |
-| 3. Workplace availability validation | BLOCKED | R3-R5 require user artifacts from the corporate environment |
+| 3. Workplace availability validation | BLOCKED | Profile creation and authenticated model discovery verified; inference/stream/tool, local KB assessment and direct MCP artifacts remain required |
 | 4. Investigation integration and validation | NOT STARTED | R4-R7 depend on confirmed workplace model/MCP contracts |
 
 Stage 2 verification: APISIX profile, secret-safe error reporting, two TLS flag
@@ -62,12 +62,24 @@ bare `python` commands failed on import of `sqlite_utils`, which the installatio
 log confirms exists in that virtual environment. The profile/key/discovery commands
 never reached execution. Workplace instructions now select one explicit environment
 executable for every command. No production change is required for this mismatch;
-successful workplace imports and first API discovery remain unverified until rerun.
+The following workplace artifact resolves those import and discovery checks.
+
+Second workplace artifact (issue comment `6124690308`, checkout `2020b30`):
+the explicit virtual-environment executable successfully imports this checkout,
+creates the APISIX profile with the selected TLS flag, stores the key, and lists
+`deepseek-v4-flash`, `deepseek-v41-flash` and `glm-5.3` through authenticated
+discovery. This verifies the real profile/authentication/discovery path, not model
+inference. The KB command again used bare `python` and failed before assessment.
+The directory listing confirms local `SKILL.md`, `SPEC.md` and a bundle directory
+exist; completeness and macro resolution remain unverified. No KB recreation or
+production-code fix is justified by this artifact. The next workplace commands
+use the same explicit executable for KB assessment and the first model report.
 
 External blocker B1 (Stage 3, R3-R5): the development host cannot reach corporate
 services, has no corporate credentials or actual TIDE folder, and has no direct
-MCP transport/authentication contract. Resolution requires workplace discovery,
-availability and local-knowledge artifacts plus the approved MCP transport and
+MCP transport/authentication contract. Discovery is now verified; resolution of
+the remaining criteria requires workplace inference/stream/tool and local-knowledge
+artifacts plus the approved MCP transport and
 authentication method. Until that evidence arrives, live model availability,
 incremental streaming/function calling, actual knowledge reuse and independent
 MCP access remain unverified. Stage 4 integration and the final investigation
