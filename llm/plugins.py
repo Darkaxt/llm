@@ -11,6 +11,7 @@ DEFAULT_PLUGINS = (
     "llm.default_plugins.openai_models",
     "llm.default_plugins.default_tools",
     "llm.default_plugins.openwebui",
+    "llm.default_plugins.apisix",
 )
 
 pm = pluggy.PluginManager("llm")

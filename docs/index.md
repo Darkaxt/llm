@@ -131,6 +131,7 @@ setup
 usage
 openai-models
 other-models
+apisix
 tools
 schemas
 templates

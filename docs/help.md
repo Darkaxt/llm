@@ -70,6 +70,7 @@ Options:
 Commands:
   prompt*       Execute a prompt
   aliases       Manage model aliases
+  apisix        Configure APISIX profiles and check OpenAI-compatible API...
   chat          Hold an ongoing chat with a model.
   collections   View and manage collections of embeddings
   embed         Embed text and store or return the result
@@ -1090,6 +1091,90 @@ Usage: llm collections delete [OPTIONS] COLLECTION
 Options:
   -d, --database FILE  Path to embeddings database
   -h, --help           Show this message and exit.
+```
+
+(help-apisix)=
+### llm apisix --help
+```
+Usage: llm apisix [OPTIONS] COMMAND [ARGS]...
+
+  Configure APISIX profiles and check OpenAI-compatible API availability.
+
+Options:
+  -h, --help  Show this message and exit.
+
+Commands:
+  check      Run synthetic model, streaming and function-call checks; write...
+  knowledge  Assess and remember an existing local TIDE folder, without...
+  models     Discover and cache actual model IDs for a profile.
+  profile    Manage local APISIX connection profiles.
+```
+
+(help-apisix-profile)=
+#### llm apisix profile --help
+```
+Usage: llm apisix profile [OPTIONS] COMMAND [ARGS]...
+
+  Manage local APISIX connection profiles.
+
+Options:
+  -h, --help  Show this message and exit.
+
+Commands:
+  create  Create a profile without altering existing profiles or storing a...
+```
+
+(help-apisix-profile-create)=
+##### llm apisix profile create --help
+```
+Usage: llm apisix profile create [OPTIONS] NAME
+
+  Create a profile without altering existing profiles or storing a key.
+
+Options:
+  --base-url TEXT                 [required]
+  --verify-ssl / --no-verify-ssl  [default: verify-ssl]
+  -h, --help                      Show this message and exit.
+```
+
+(help-apisix-models)=
+#### llm apisix models --help
+```
+Usage: llm apisix models [OPTIONS]
+
+  Discover and cache actual model IDs for a profile.
+
+Options:
+  --profile TEXT  [required]
+  -h, --help      Show this message and exit.
+```
+
+(help-apisix-knowledge)=
+#### llm apisix knowledge --help
+```
+Usage: llm apisix knowledge [OPTIONS]
+
+  Assess and remember an existing local TIDE folder, without uploading.
+
+Options:
+  --profile TEXT         [required]
+  --directory DIRECTORY  [required]
+  -h, --help             Show this message and exit.
+```
+
+(help-apisix-check)=
+#### llm apisix check --help
+```
+Usage: llm apisix check [OPTIONS]
+
+  Run synthetic model, streaming and function-call checks; write a safe report.
+
+Options:
+  --profile TEXT  [required]
+  --model TEXT    Exact provider model ID from discovery, without the
+                  apisix/profile/ prefix.  [required]
+  --output FILE   [required]
+  -h, --help      Show this message and exit.
 ```
 
 (help-openwebui)=
