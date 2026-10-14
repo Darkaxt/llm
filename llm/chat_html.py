@@ -16,6 +16,7 @@ from .chat_ui import (
     LLM_COLOR,
     PROGRAM_COLOR,
     REASONING_COLOR,
+    RESULT_DISPLAY_NOTE,
     TOOL_COLOR,
     USER_COLOR,
     cancellation_notice,
@@ -97,6 +98,7 @@ label[for=event-times]{{cursor:pointer;color:var(--program);font-size:13px}}
 .tool summary:focus-visible{{outline:2px solid var(--tool);outline-offset:2px}}
 .tool details[open] summary{{border-bottom:1px solid #615044}}
 .tool details pre{{padding:12px}}
+.tool details > p{{margin:12px}}
 footer{{position:fixed;bottom:0;left:0;right:0;background:#262321;color:var(--program);border-top:1px solid #615044;padding:12px 24px;font-size:13px;max-height:30vh;overflow:auto}}
 footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anywhere}}footer small{{display:block;color:var(--reasoning)}}
 @media(max-width:600px){{header,main{{padding:16px}}main{{padding-bottom:10rem}}section{{padding-left:12px}}footer{{padding:10px 16px}}
@@ -312,7 +314,9 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
                 )
                 + '</pre></details><details class="tool-result"><summary>Full result · '
                 + _text(checkpoint["name"])
-                + '</summary><pre class="timed-lines">'
+                + '</summary><p class="line-time">'
+                + _text(RESULT_DISPLAY_NOTE)
+                + '</p><pre class="timed-lines">'
                 + self._lines(tool_output_text(checkpoint["output"]), timing)
                 + "</pre></details></section>\n"
             )

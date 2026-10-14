@@ -409,7 +409,18 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
                     "call_id": "new-call",
                     "name": "new-search",
                     "arguments": {},
-                    "output": "recovered result " * 200 + "FULL_RECOVERY_RESULT",
+                    "output": [
+                        {
+                            "type": "tool_result",
+                            "text": json.dumps(
+                                {
+                                    "message": "recovered result " * 200
+                                    + "FULL_RECOVERY_RESULT",
+                                    "truncated": False,
+                                }
+                            ),
+                        }
+                    ],
                 }
             )
         if termination == "signal":
@@ -490,6 +501,8 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
         assert error["server_reason"] == "synthetic owner stop"
     if allow_new:
         assert "Result preview:" in output.output
+        assert '"text": {' in output.output
+        assert '\\"message\\"' not in output.output
         assert "[truncated" in output.output
         assert "FULL_RECOVERY_RESULT" not in output.output
         report = journal_path(recovered_id).with_suffix(".html").read_text("utf-8")

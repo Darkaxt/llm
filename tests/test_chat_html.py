@@ -225,8 +225,24 @@ def test_html_stream_updates_do_not_read_or_rewrite_history(tmp_path, monkeypatc
         },
         "",
         None,
+        '{"results":[{"count":7}],"truncated":false}',
+        [
+            {
+                "type": "tool_result",
+                "text": '{"results":[{"count":7}],"truncated":false}',
+            }
+        ],
     ],
-    ids=["timestamp", "long", "many-lines", "structured", "empty", "null"],
+    ids=[
+        "timestamp",
+        "long",
+        "many-lines",
+        "structured",
+        "empty",
+        "null",
+        "encoded-json",
+        "wrapped-json",
+    ],
 )
 def test_provider_tools_are_inline_auditable_and_in_html(
     tmp_path, monkeypatch, tool_output, html_transcript
@@ -305,6 +321,20 @@ def test_provider_tools_are_inline_auditable_and_in_html(
         if isinstance(tool_output, str)
         else json.dumps(tool_output, ensure_ascii=False, indent=2)
     )
+    if tool_output == '{"results":[{"count":7}],"truncated":false}':
+        result_text = json.dumps(
+            {"results": [{"count": 7}], "truncated": False}, indent=2
+        )
+    elif isinstance(tool_output, list):
+        result_text = json.dumps(
+            [
+                {
+                    "type": "tool_result",
+                    "text": {"results": [{"count": 7}], "truncated": False},
+                }
+            ],
+            indent=2,
+        )
     if len(result_text) > 2000 or len(result_text.splitlines()) > 20:
         preview = result.stderr.split("Result preview:\n", 1)[1].split(
             "\n[truncated", 1
@@ -367,10 +397,15 @@ def test_provider_tools_are_inline_auditable_and_in_html(
         .splitlines()
     ]
     pointer = next(row for row in records if row.get("type") == "tool_result_display")
+    from llm.openwebui_recovery import _load_checkpoint
+
+    original_sidecar = (tmp_path / pointer["checkpoint_file"]).read_bytes()
+    assert _load_checkpoint(conversation.id, pointer)["output"] == tool_output
     append_record(conversation.id, pointer)
     assert (tmp_path / f"{conversation.id}.html").read_text("utf-8").count(
         '<details class="tool-result">'
     ) == 1
+    assert (tmp_path / pointer["checkpoint_file"]).read_bytes() == original_sidecar
 
 
 def test_corrupt_result_does_not_break_journal_or_replace_readable_report(

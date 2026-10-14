@@ -1,7 +1,9 @@
 """Shared foreground palette for terminal chat and provider status messages."""
 
 import json
+import math
 import os
+from decimal import Decimal
 
 import click
 
@@ -10,6 +12,7 @@ USER_COLOR = (142, 199, 230)
 LLM_COLOR = (230, 221, 214)
 REASONING_COLOR = (174, 183, 196)
 TOOL_COLOR = (196, 119, 158)  # Muted dark pink, #c4779e
+RESULT_DISPLAY_NOTE = "Formatted display: JSON text expanded when valid; original payload/types in checkpoint."
 
 
 def colors_enabled() -> bool:
@@ -42,12 +45,57 @@ def cancellation_notice(record: dict) -> str:
     return message
 
 
+def _json_display_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key would lose an original value")
+        result[key] = value
+    return result
+
+
+def _json_display_float(text):
+    value = float(text)
+    if not math.isfinite(value) or Decimal(text) != Decimal(str(value)):
+        raise ValueError("JSON number cannot be displayed without precision loss")
+    return value
+
+
+def _expand_json_text(value):
+    if isinstance(value, str):
+        original = value
+        # Some tools encode a JSON document more than once. Unwrap only when
+        # the final result is an object/array, never an ordinary/scalar string.
+        while isinstance(value, str) and value.lstrip().startswith(("{", "[", '"')):
+            try:
+                value = json.loads(
+                    value,
+                    object_pairs_hook=_json_display_object,
+                    parse_float=_json_display_float,
+                    parse_constant=_json_display_float,
+                )
+            except (ValueError, RecursionError):
+                return original
+        if not isinstance(value, (dict, list)):
+            return original
+    if isinstance(value, dict):
+        return {key: _expand_json_text(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_json_text(item) for item in value]
+    return value
+
+
 def tool_output_text(output) -> str:
-    """Keep string results intact and all structured result fields visible."""
+    """Indent JSON, expanding encoded containers for display without mutation."""
+    try:
+        formatted = _expand_json_text(output)
+    except RecursionError:
+        # A deeply encoded string is still useful evidence in its original form.
+        formatted = output
     return (
-        output
-        if isinstance(output, str)
-        else json.dumps(output, ensure_ascii=False, indent=2)
+        formatted
+        if isinstance(formatted, str)
+        else json.dumps(formatted, ensure_ascii=False, indent=2)
     )
 
 
@@ -71,6 +119,7 @@ def checkpoint_notice(checkpoint: dict, pointer: dict, *, preview: bool = True) 
         output = tool_output_text(checkpoint["output"])
         # Display bounds only: the model and saved output remain untouched.
         excerpt = "".join(output[:2000].splitlines(keepends=True)[:20])
+        notice += "\n" + RESULT_DISPLAY_NOTE
         notice += "\nResult preview:\n" + (excerpt or "(empty string)")
         if len(excerpt) < len(output):
             notice += "\n[truncated; full result in HTML and checkpoint above]"

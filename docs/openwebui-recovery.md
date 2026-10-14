@@ -20,6 +20,19 @@ background is retained. Redirected output and saved journals remain plain;
 set `NO_COLOR` to disable this chat palette. Recovery uses the same reply,
 reasoning and status colors in an interactive terminal.
 
+## Readable tool results
+
+Tool results are formatted for readability in both the terminal preview and the
+HTML Full result panel. Complete JSON object/array strings are expanded and
+indented, including JSON encoded inside a tool wrapper's text fields. Wrapper
+fields, order, error fields and Unicode remain visible. This is a display view:
+an expanded JSON string can appear as an object, while the checkpoint retains
+the original string type/content. Ordinary/scalar text, malformed JSON,
+duplicate-key documents and JSON numbers that would lose precision stay intact.
+The model/recovery payload, sidecar bytes and digest do not change. Terminal
+preview limits still apply; HTML contains the full formatted result. Rebuilding
+an existing report applies the same formatting without rerunning tools.
+
 ## HTML line and event timing
 
 Each logical conversation line has its originating journal timestamp in **UTC
