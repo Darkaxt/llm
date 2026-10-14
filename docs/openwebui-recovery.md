@@ -20,6 +20,48 @@ background is retained. Redirected output and saved journals remain plain;
 set `NO_COLOR` to disable this chat palette. Recovery uses the same reply,
 reasoning and status colors in an interactive terminal.
 
+## Cancellation and Windows idle sleep
+
+During generation, **Ctrl+C** (or Windows Ctrl+Break) interrupts this console's
+request. Escape is no longer polled across the desktop; using it in another app
+cannot cancel this response through the old global-key hook. Composer bindings
+are unchanged. Locking the workstation is not a cancellation command.
+
+The terminal and HTML identify an observed process signal, such as SIGINT, or a
+local KeyboardInterrupt whose origin is unknown. A process signal does not prove
+a physical keypress: software can also send signals. The journal's
+`turn_cancelled` record includes `source`, `signal`, `reason` and available Windows
+clock samples. `provider_stop_requested` separately records local response-iterator
+closure. The worker's generic stop error says **stopped by local client**, rather
+than assuming the user requested it. An explicit server `task-cancelled` event is
+retained as `source=server_event`, with its event name and actual server reason
+(or an explicit missing reason), in provider/turn errors. Server failures are not
+silently ignored or automatically retried.
+
+Windows Open WebUI requests prevent **idle system sleep** by default, only while
+the active request thread owns its execution-state request. Completion, error or
+cancellation restores the same thread's prior state; the CLI waits for its local
+worker to exit before returning to the next prompt. That local exit is not
+independent proof that a remote server task has stopped. Native power API failure
+is journaled/reported and inference continues.
+
+Opt out for a request with `-o openwebui_keep_awake false`. Recovery has
+`--keep-awake` (default) and `--no-keep-awake`. Non-Windows hosts record this
+mechanism as unsupported. No power plan, display-on requirement, lock policy,
+scheduled task or background service is installed. Explicit Sleep, a lid/power
+action or corporate policy can still suspend the machine.
+
+`provider_power` records acquisition/release/failure plus `tick_count_ms`
+(sleep-inclusive uptime) and `awake_time_100ns` (awake-only uptime) when Windows
+provides them. Cancellation captures the same raw clocks. These samples support
+comparison across a request; they are not lock notifications or proof that a
+sleep transition caused cancellation. Preserve OS power/session events when a
+workplace lock/suspend failure needs correlation.
+
+Windows API contracts: [execution state](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate),
+[sleep-inclusive uptime](https://learn.microsoft.com/windows/win32/sysinfo/windows-time)
+and [awake-only uptime](https://learn.microsoft.com/en-us/windows/win32/api/realtimeapiset/nf-realtimeapiset-queryunbiasedinterrupttime).
+
 Tool activity remains inline in muted dark pink (`#c4779e`), so later status
 updates do not erase it. After a native result is durably checkpointed, its
 notice includes the actual tool name, call ID, full arguments and the saved

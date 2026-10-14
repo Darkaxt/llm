@@ -256,7 +256,6 @@ def test_provider_tools_are_inline_auditable_and_in_html(
     )
     monkeypatch.setattr(openwebui, "_server_config", lambda _: {"version": "0.12.0"})
     monkeypatch.setattr(openwebui, "_enabled_knowledge_items", lambda *args: [])
-    monkeypatch.setattr(openwebui, "_escape_pressed", lambda: False)
     prompts = iter(["synthetic validation", "quit"])
     monkeypatch.setattr(llm.cli, "_read_chat_prompt", lambda _: next(prompts))
     conversation = openwebui.OpenWebUIModel("glm-5.3").conversation()
@@ -458,7 +457,6 @@ def test_tty_status_events_do_not_split_streamed_words(tmp_path, monkeypatch):
     monkeypatch.setattr(openwebui, "_get_model_item", lambda *args: {"id": "glm-5.3"})
     monkeypatch.setattr(openwebui, "_server_config", lambda _: {"version": "0.12.0"})
     monkeypatch.setattr(openwebui, "_enabled_knowledge_items", lambda *args: [])
-    monkeypatch.setattr(openwebui, "_escape_pressed", lambda: False)
     original_init = openwebui._OpenWebUIStatusBar.__init__
 
     def tty_init(self):

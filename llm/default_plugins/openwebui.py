@@ -44,6 +44,7 @@ from llm.chat_ui import (
     LLM_COLOR,
     REASONING_COLOR,
     TOOL_COLOR,
+    cancellation_notice,
     chat_style,
     checkpoint_notice,
     echo_program,
@@ -61,6 +62,11 @@ from llm.parts import (
     StreamEvent,
     TextPart,
     ToolResultPart,
+)
+from llm.request_control import (
+    capture_interrupt_signals,
+    local_interrupt_details,
+    prevent_idle_sleep,
 )
 
 CONFIG_FILENAME = "openwebui.json"
@@ -129,22 +135,6 @@ class _OpenWebUIStatusBar:
         sys.stderr.write("\r" + (" " * (width - 1)) + "\r")
         sys.stderr.flush()
         self.visible = False
-
-
-def _escape_pressed() -> bool:
-    """Return True when Escape was pressed during generation on Windows.
-
-    GetAsyncKeyState lets us detect Escape without consuming type-ahead from
-    stdin. Ctrl+C remains handled by Python's normal KeyboardInterrupt path.
-    """
-    if os.name != "nt":
-        return False
-    try:
-        import ctypes
-
-        return bool(ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x0001)
-    except (AttributeError, OSError):
-        return False
 
 
 def _config_path() -> Path:
@@ -2911,6 +2901,7 @@ class OpenWebUIModel(llm.Model):
     class Options(llm.Options):
         temperature: float | None = None
         openwebui_tools: bool = True
+        openwebui_keep_awake: bool = True
         openwebui_mcp_transport: Literal[
             "sessionless_native", "background_legacy", "background_native"
         ] = "background_native"
@@ -3073,6 +3064,9 @@ class OpenWebUIModel(llm.Model):
                     "openwebui_tools": cast(
                         OpenWebUIModel.Options, prompt.options
                     ).openwebui_tools,
+                    "openwebui_keep_awake": cast(
+                        OpenWebUIModel.Options, prompt.options
+                    ).openwebui_keep_awake,
                     "sessionless_server_tools": False,
                     "openwebui_mcp_transport": cast(
                         OpenWebUIModel.Options, prompt.options
@@ -3167,94 +3161,109 @@ class OpenWebUIModel(llm.Model):
             )
             events.put(("status", line))
 
+        def on_power(record: dict[str, Any]) -> None:
+            journal_provider({"type": "provider_power", **record})
+            if record["status"] in ("failed", "release_failed"):
+                on_status(
+                    f"Windows idle-sleep prevention {record['status']}; see provider_power journal record"
+                )
+
         def worker() -> None:
             try:
-                if tool_ids:
-                    # Always use our compatibility runner for tool-enabled chats.
-                    # The installed SDK still generates a bare UUID chat_id for
-                    # unsaved chats, which current Open WebUI treats as a missing
-                    # persisted chat and rejects with 404. Our runner mirrors the
-                    # browser's temporary:<socket-id> convention and also supports
-                    # attachments on the same request.
-                    data = __import__("asyncio").run(
-                        run_chat_with_tools_with_files(
-                            base_url=client.base_url,
-                            token=client.token or "",
-                            model=self.remote_model_id,
-                            model_item=model_item,
-                            messages=messages,
-                            tool_ids=tool_ids,
-                            files=attached_files,
-                            params={
-                                **(
-                                    {
-                                        "temperature": cast(
+                with prevent_idle_sleep(
+                    enabled=cast(
+                        OpenWebUIModel.Options, prompt.options
+                    ).openwebui_keep_awake,
+                    on_event=on_power,
+                ):
+                    if tool_ids:
+                        # Always use our compatibility runner for tool-enabled chats.
+                        # The installed SDK still generates a bare UUID chat_id for
+                        # unsaved chats, which current Open WebUI treats as a missing
+                        # persisted chat and rejects with 404. Our runner mirrors the
+                        # browser's temporary:<socket-id> convention and also supports
+                        # attachments on the same request.
+                        data = __import__("asyncio").run(
+                            run_chat_with_tools_with_files(
+                                base_url=client.base_url,
+                                token=client.token or "",
+                                model=self.remote_model_id,
+                                model_item=model_item,
+                                messages=messages,
+                                tool_ids=tool_ids,
+                                files=attached_files,
+                                params={
+                                    **(
+                                        {
+                                            "temperature": cast(
+                                                OpenWebUIModel.Options, prompt.options
+                                            ).temperature
+                                        }
+                                        if cast(
                                             OpenWebUIModel.Options, prompt.options
                                         ).temperature
-                                    }
-                                    if cast(
-                                        OpenWebUIModel.Options, prompt.options
-                                    ).temperature
-                                    is not None
-                                    else {}
+                                        is not None
+                                        else {}
+                                    ),
+                                    "tool_approval_mode": "full",
+                                    **(
+                                        {"function_calling": "legacy"}
+                                        if cast(
+                                            OpenWebUIModel.Options, prompt.options
+                                        ).openwebui_mcp_transport
+                                        == "background_legacy"
+                                        else {}
+                                    ),
+                                },
+                                timeout=client.timeout,
+                                sessionless_server_tools=False,
+                                stop_requested=cancel_requested,
+                                on_text=on_text,
+                                on_reasoning=on_reasoning,
+                                on_tool=on_tool,
+                                on_status=on_status,
+                                on_source=on_source,
+                                on_checkpoint=on_checkpoint,
+                            )
+                        )
+                        remote_execution.update(
+                            {
+                                "remote_chat_id": data.get("remote_chat_id"),
+                                "remote_task_ids": data.get("remote_task_ids", []),
+                                "server_tool_sources": data.get(
+                                    "server_tool_sources", []
                                 ),
-                                "tool_approval_mode": "full",
-                                **(
-                                    {"function_calling": "legacy"}
-                                    if cast(
-                                        OpenWebUIModel.Options, prompt.options
-                                    ).openwebui_mcp_transport
-                                    == "background_legacy"
-                                    else {}
+                                "native_checkpoint_count": data.get(
+                                    "native_checkpoint_count", 0
                                 ),
-                            },
-                            timeout=client.timeout,
-                            sessionless_server_tools=False,
-                            stop_requested=cancel_requested,
+                                "verified_mcp_tool_results": sum(
+                                    1
+                                    for source in data.get("server_tool_sources", [])
+                                    if source.get("is_mcp")
+                                    and source.get("server_executed")
+                                ),
+                            }
+                        )
+                        result = ChatResult(
+                            answer=data.get("answer", ""),
+                            reasoning=data.get("reasoning"),
+                            tool_calls=data.get("tool_calls", []),
+                            raw_content=data.get("raw_content", ""),
+                        )
+                    else:
+                        result = client.run_chat(
+                            model=self.remote_model_id,
+                            messages=messages,
+                            tool_ids=tool_ids,
+                            temperature=cast(
+                                OpenWebUIModel.Options, prompt.options
+                            ).temperature,
+                            extra={"files": attached_files} if attached_files else None,
                             on_text=on_text,
                             on_reasoning=on_reasoning,
                             on_tool=on_tool,
                             on_status=on_status,
-                            on_source=on_source,
-                            on_checkpoint=on_checkpoint,
                         )
-                    )
-                    remote_execution.update(
-                        {
-                            "remote_chat_id": data.get("remote_chat_id"),
-                            "remote_task_ids": data.get("remote_task_ids", []),
-                            "server_tool_sources": data.get("server_tool_sources", []),
-                            "native_checkpoint_count": data.get(
-                                "native_checkpoint_count", 0
-                            ),
-                            "verified_mcp_tool_results": sum(
-                                1
-                                for source in data.get("server_tool_sources", [])
-                                if source.get("is_mcp")
-                                and source.get("server_executed")
-                            ),
-                        }
-                    )
-                    result = ChatResult(
-                        answer=data.get("answer", ""),
-                        reasoning=data.get("reasoning"),
-                        tool_calls=data.get("tool_calls", []),
-                        raw_content=data.get("raw_content", ""),
-                    )
-                else:
-                    result = client.run_chat(
-                        model=self.remote_model_id,
-                        messages=messages,
-                        tool_ids=tool_ids,
-                        temperature=cast(
-                            OpenWebUIModel.Options, prompt.options
-                        ).temperature,
-                        extra={"files": attached_files} if attached_files else None,
-                        on_text=on_text,
-                        on_reasoning=on_reasoning,
-                        on_tool=on_tool,
-                        on_status=on_status,
-                    )
                 events.put(("done", result))
             except Exception as exc:  # noqa: BLE001
                 journal_provider(
@@ -3262,6 +3271,17 @@ class OpenWebUIModel(llm.Model):
                         "type": "provider_error",
                         "error": str(exc),
                         "error_class": type(exc).__name__,
+                        "source": getattr(
+                            exc,
+                            "cancellation_source",
+                            (
+                                "local_client"
+                                if cancel_requested.is_set()
+                                else "provider_or_client_error"
+                            ),
+                        ),
+                        "server_event": getattr(exc, "server_event", None),
+                        "server_reason": getattr(exc, "server_reason", None),
                     }
                 )
                 events.put(("error", exc))
@@ -3272,10 +3292,9 @@ class OpenWebUIModel(llm.Model):
         thread.start()
 
         output_line_open = False
+        request_terminal = False
         try:
             while True:
-                if _escape_pressed():
-                    raise KeyboardInterrupt
                 try:
                     kind, payload = events.get(timeout=0.1)
                 except queue.Empty:
@@ -3321,6 +3340,7 @@ class OpenWebUIModel(llm.Model):
                         defer=output_line_open,
                     )
                 elif kind == "error":
+                    request_terminal = True
                     status_bar.clear()
                     if isinstance(payload, (APIError, AuthError)):
                         context_bits = []
@@ -3339,6 +3359,7 @@ class OpenWebUIModel(llm.Model):
                         raise llm.ModelError(str(payload) + suffix) from payload
                     raise payload
                 elif kind == "done":
+                    request_terminal = True
                     status_bar.clear()
                     result = payload
                     # A user explicitly requesting Splunk MCP searches should
@@ -3405,9 +3426,22 @@ class OpenWebUIModel(llm.Model):
                     }
                     break
         finally:
-            if not worker_finished.is_set():
-                cancel_requested.set()
-            status_bar.clear()
+            try:
+                if not request_terminal and not worker_finished.is_set():
+                    cancel_requested.set()
+                    journal_provider(
+                        {
+                            "type": "provider_stop_requested",
+                            "source": "local_client",
+                            "reason": "response_iterator_closed",
+                        },
+                        durable=True,
+                    )
+            finally:
+                status_bar.clear()
+                # Do not expose a new prompt while the previous worker is still
+                # stopping or owns its idle-sleep request. No shutdown deadline.
+                thread.join()
 
 
 @llm.hookimpl
@@ -3571,12 +3605,18 @@ def register_commands(cli):
     @click.option(
         "--dry-run", is_flag=True, help="Verify checkpoints; do not contact the model"
     )
+    @click.option(
+        "--keep-awake/--no-keep-awake",
+        default=True,
+        help="Prevent Windows idle sleep during this recovery request",
+    )
     def resume(
         conversation_id: str,
         provider_run_id: str | None,
         allow_new_searches: bool,
         assume_stopped: bool,
         dry_run: bool,
+        keep_awake,
     ):
         """Start a new continuation from complete, verified local tool checkpoints.
 
@@ -3760,36 +3800,48 @@ def register_commands(cli):
         def on_source(source: dict[str, Any]) -> None:
             journal({"type": "provider_tool_source", **source})
 
+        def on_power(record: dict[str, Any]) -> None:
+            journal({"type": "provider_power", **record})
+            if record["status"] in ("failed", "release_failed"):
+                program(
+                    f"Windows idle-sleep prevention {record['status']}; see provider_power journal record"
+                )
+
+        observed_interrupt = {}
         try:
             # Use the same Socket.IO native loop as interactive chat. For
             # evidence-only mode, legacy with NO tool_ids prevents Open WebUI
             # from injecting its builtin tools. No tool prepass can run.
-            result = __import__("asyncio").run(
-                run_chat_with_tools_with_files(
-                    base_url=client.base_url,
-                    token=client.token or "",
-                    model=origin["model"],
-                    model_item=model_item,
-                    messages=messages,
-                    tool_ids=tool_ids,
-                    files=[],
-                    params=(
-                        {"tool_approval_mode": "full"}
-                        if allow_new_searches
-                        else {
-                            "function_calling": "legacy",
-                            "tool_approval_mode": "full",
-                        }
-                    ),
-                    timeout=client.timeout,
-                    on_text=on_text,
-                    on_reasoning=on_reasoning,
-                    on_tool=on_tool,
-                    on_status=on_status,
-                    on_checkpoint=on_checkpoint,
-                    on_source=on_source,
+            with (
+                capture_interrupt_signals() as observed_interrupt,
+                prevent_idle_sleep(enabled=keep_awake, on_event=on_power),
+            ):
+                result = __import__("asyncio").run(
+                    run_chat_with_tools_with_files(
+                        base_url=client.base_url,
+                        token=client.token or "",
+                        model=origin["model"],
+                        model_item=model_item,
+                        messages=messages,
+                        tool_ids=tool_ids,
+                        files=[],
+                        params=(
+                            {"tool_approval_mode": "full"}
+                            if allow_new_searches
+                            else {
+                                "function_calling": "legacy",
+                                "tool_approval_mode": "full",
+                            }
+                        ),
+                        timeout=client.timeout,
+                        on_text=on_text,
+                        on_reasoning=on_reasoning,
+                        on_tool=on_tool,
+                        on_status=on_status,
+                        on_checkpoint=on_checkpoint,
+                        on_source=on_source,
+                    )
                 )
-            )
             status_bar.clear()
             journal(
                 {
@@ -3812,11 +3864,26 @@ def register_commands(cli):
             program(f"Completed recovery; local journal: {new_id}.jsonl")
         except (APIError, AuthError, CheckpointError, KeyboardInterrupt) as exc:
             status_bar.clear()
+            interruption = (
+                local_interrupt_details(observed_interrupt)
+                if isinstance(exc, KeyboardInterrupt)
+                else {}
+            )
+            if interruption:
+                journal({"type": "turn_cancelled", **interruption}, durable=True)
+                echo_program(cancellation_notice(interruption), err=True)
             journal(
                 {
                     "type": "provider_error",
-                    "error": str(exc),
+                    "error": str(exc) or "Local response interruption",
+                    **interruption,
                     "error_class": type(exc).__name__,
+                    "source": interruption.get(
+                        "source",
+                        getattr(exc, "cancellation_source", "provider_or_client_error"),
+                    ),
+                    "server_event": getattr(exc, "server_event", None),
+                    "server_reason": getattr(exc, "server_reason", None),
                 },
                 durable=True,
             )
@@ -3825,7 +3892,8 @@ def register_commands(cli):
                 {
                     "type": "recovery_failed",
                     "recovery_conversation_id": new_id,
-                    "error": str(exc),
+                    "error": str(exc) or "Local response interruption",
+                    **interruption,
                 },
                 durable=True,
             )

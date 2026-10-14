@@ -1955,7 +1955,17 @@ def test_openwebui_response_completion_tool_start_and_result_are_live():
 
 
 @pytest.mark.parametrize(
-    "reasoning_boundary", [None, "empty", "tools", "legacy", "continuation", "snapshot"]
+    "reasoning_boundary",
+    [
+        None,
+        "empty",
+        "tools",
+        "legacy",
+        "continuation",
+        "snapshot",
+        "server_cancelled",
+        "server_cancelled_unknown",
+    ],
 )
 def test_openwebui_socket_runner_consumes_live_events_before_final(
     monkeypatch, reasoning_boundary
@@ -2053,8 +2063,18 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(
         },
     ]
 
+    server_cancelled = str(reasoning_boundary).startswith("server_cancelled")
+    if server_cancelled:
+        payloads[-1] = {
+            "type": "task-cancelled",
+            "data": (
+                {"reason": "synthetic owner stop"}
+                if reasoning_boundary == "server_cancelled"
+                else {}
+            ),
+        }
     expected_reasoning = "Thinking"
-    if reasoning_boundary:
+    if reasoning_boundary and not server_cancelled:
         # A tool/empty snapshot need not repeat earlier reasoning. The next
         # generation can emit a new item, or continue the same reasoning item.
         snapshot = {"output": []}
@@ -2179,6 +2199,19 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(
             on_checkpoint=lambda value: events.append(("checkpoint", value)),
         )
 
+    if server_cancelled:
+        with pytest.raises(openwebui_socket.ServerCancellationError) as raised:
+            asyncio.run(run())
+        assert raised.value.cancellation_source == "server_event"
+        assert raised.value.server_event == "task-cancelled"
+        assert raised.value.server_reason == (
+            "synthetic owner stop" if reasoning_boundary == "server_cancelled" else None
+        )
+        assert any(
+            kind == "status" and "server cancellation event:" in value
+            for kind, value in events
+        )
+        return
     result = asyncio.run(run())
     assert result["answer"] == "Hello world"
     assert result["reasoning"] == expected_reasoning

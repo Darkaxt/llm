@@ -60,6 +60,20 @@ from openwebui_sdk.render import (
 )
 
 
+class ServerCancellationError(APIError):
+    """An explicit server task event, distinct from a local console interrupt."""
+
+    cancellation_source = "server_event"
+    server_event = "task-cancelled"
+
+    def __init__(self, reason: Any = None):
+        self.server_reason = reason
+        super().__init__(
+            "task cancelled by server"
+            + (f": {reason}" if reason else " (reason not supplied)")
+        )
+
+
 def _sessionless_recovery_grace() -> float:
     """How long to keep listening for a final server event after HTTP disconnects."""
     value = os.environ.get("LLM_OPENWEBUI_RECOVERY_GRACE", "60")
@@ -886,7 +900,9 @@ async def run_chat_with_tools_with_files(
             # chat:tasks:cancel follows a normal completion in current Open WebUI,
             # so only treat the explicit task-cancelled event as an error.
             if etype == "task-cancelled":
-                state["error"] = "task cancelled by server"
+                reason = data.get("reason") or data.get("message") or data.get("error")
+                state["error"] = ServerCancellationError(reason)
+                out_status("server cancellation event: " + str(state["error"]))
                 done.set()
             return
 
@@ -1194,7 +1210,7 @@ async def run_chat_with_tools_with_files(
             while not done.is_set() and not post_task.done():
                 now = time.monotonic()
                 if stop_requested is not None and stop_requested.is_set():
-                    state["error"] = "Chat request cancelled by user"
+                    state["error"] = "Chat request stopped by local client"
                     post_task.cancel()
                     break
                 problem = _stalled_request_error(
@@ -1297,7 +1313,7 @@ async def run_chat_with_tools_with_files(
         while not sessionless_server_tools and not done.is_set():
             now = time.monotonic()
             if stop_requested is not None and stop_requested.is_set():
-                state["error"] = "Chat request cancelled by user"
+                state["error"] = "Chat request stopped by local client"
             else:
                 state["error"] = _stalled_request_error(
                     state, now, event_timeout=timeout, progress_timeout=progress_limit
@@ -1341,6 +1357,8 @@ async def run_chat_with_tools_with_files(
             await http_session.close()
 
     if state["error"]:
+        if isinstance(state["error"], ServerCancellationError):
+            raise state["error"]
         raise APIError(str(state["error"]))
     # Return a structured result so callers (notably ``ask --json``) can capture
     # reasoning + tool calls alongside the answer. The streaming callers that

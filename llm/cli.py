@@ -74,6 +74,7 @@ from .chat_ui import (
     PROGRAM_COLOR,
     REASONING_COLOR,
     USER_COLOR,
+    cancellation_notice,
     chat_style,
     colors_enabled,
     echo_program,
@@ -86,6 +87,7 @@ from .logs import (
 )
 from .migrations import migrate
 from .plugins import load_plugins, pm
+from .request_control import capture_interrupt_signals, local_interrupt_details
 from .utils import (
     ensure_fragment,
     extract_fenced_code_block,
@@ -458,56 +460,59 @@ def _run_chat(
         if turn_headers:
             _print_chat_turn_header("LLM")
 
+        observed_interrupt = {}
         try:
-            response = prompt_callback(prompt, fragments, attachments)
+            with capture_interrupt_signals() as observed_interrupt:
+                response = prompt_callback(prompt, fragments, attachments)
 
-            def journaled_events(response=response, turn_id=turn_id):
-                stream = response.stream_events()
+                def journaled_events(response=response, turn_id=turn_id):
+                    stream = response.stream_events()
+                    try:
+                        for event in stream:
+                            if conversation is not None and export_jsonl:
+                                append_chat_journal_record(
+                                    conversation.id,
+                                    {
+                                        "type": "assistant_stream",
+                                        "turn_id": turn_id,
+                                        "event_type": event.type,
+                                        "chunk": event.chunk,
+                                        "part_index": event.part_index,
+                                        "tool_call_id": event.tool_call_id,
+                                        "tool_name": event.tool_name,
+                                        "server_executed": event.server_executed,
+                                        "redacted": event.redacted,
+                                        "provider_metadata": event.provider_metadata,
+                                        "message_index": event.message_index,
+                                    },
+                                )
+                            yield event
+                    finally:
+                        # Closing the source generator propagates cancellation to
+                        # an in-flight provider worker (including remote MCP tasks).
+                        close = getattr(stream, "close", None)
+                        if callable(close):
+                            close()
+
+                events_iterator = journaled_events()
                 try:
-                    for event in stream:
-                        if conversation is not None and export_jsonl:
-                            append_chat_journal_record(
-                                conversation.id,
-                                {
-                                    "type": "assistant_stream",
-                                    "turn_id": turn_id,
-                                    "event_type": event.type,
-                                    "chunk": event.chunk,
-                                    "part_index": event.part_index,
-                                    "tool_call_id": event.tool_call_id,
-                                    "tool_name": event.tool_name,
-                                    "server_executed": event.server_executed,
-                                    "redacted": event.redacted,
-                                    "provider_metadata": event.provider_metadata,
-                                    "message_index": event.message_index,
-                                },
-                            )
-                        yield event
+                    display_stream_events(
+                        events_iterator,
+                        show_reasoning=show_reasoning,
+                        chat=turn_headers,
+                    )
                 finally:
-                    # Closing the source generator propagates cancellation to
-                    # an in-flight provider worker (including remote MCP tasks).
-                    close = getattr(stream, "close", None)
-                    if callable(close):
-                        close()
-
-            events_iterator = journaled_events()
-            try:
-                display_stream_events(
-                    events_iterator, show_reasoning=show_reasoning, chat=turn_headers
-                )
-            finally:
-                events_iterator.close()
+                    events_iterator.close()
         except KeyboardInterrupt:
             last_failed = (prompt, list(fragments), list(attachments), turn_id)
+            cancellation = {
+                "type": "turn_cancelled",
+                "turn_id": turn_id,
+                **local_interrupt_details(observed_interrupt),
+            }
             if conversation is not None and export_jsonl:
-                append_chat_journal_record(
-                    conversation.id,
-                    {
-                        "type": "turn_cancelled",
-                        "turn_id": turn_id,
-                    },
-                )
-            program("\nCancelled current response.", err=True, journal=False)
+                append_chat_journal_record(conversation.id, cancellation, durable=True)
+            program("\n" + cancellation_notice(cancellation), err=True, journal=False)
             continue
         except ModelError as exc:
             last_failed = (prompt, list(fragments), list(attachments), turn_id)
@@ -519,6 +524,13 @@ def _run_chat(
                         "turn_id": turn_id,
                         "error": str(exc),
                         "error_class": type(exc).__name__,
+                        "source": getattr(
+                            exc.__cause__,
+                            "cancellation_source",
+                            "provider_or_client_error",
+                        ),
+                        "server_event": getattr(exc.__cause__, "server_event", None),
+                        "server_reason": getattr(exc.__cause__, "server_reason", None),
                     },
                 )
             program(f"\nModel error: {exc}", err=True, journal=False)

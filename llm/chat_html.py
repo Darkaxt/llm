@@ -17,6 +17,7 @@ from .chat_ui import (
     REASONING_COLOR,
     TOOL_COLOR,
     USER_COLOR,
+    cancellation_notice,
     checkpoint_notice,
     echo_program,
     tool_output_text,
@@ -207,7 +208,7 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
             self.status = "Open WebUI │ " + str(record.get("status") or "")
         elif kind in ("turn_cancelled", "turn_error"):
             message = (
-                "Cancelled current response."
+                cancellation_notice(record)
                 if kind == "turn_cancelled"
                 else "Model error: " + str(record.get("error") or "")
             )

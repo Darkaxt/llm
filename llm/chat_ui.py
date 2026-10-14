@@ -31,6 +31,17 @@ def echo_program(text: str, **kwargs) -> None:
     click.echo(chat_style(text), **kwargs)
 
 
+def cancellation_notice(record: dict) -> str:
+    message = "Cancelled current response."
+    if record.get("source") == "process_signal":
+        message += f"\nCancellation source: process signal {record.get('signal')}."
+    elif record.get("source"):
+        message += (
+            "\nCancellation source: local KeyboardInterrupt (origin not identified)."
+        )
+    return message
+
+
 def tool_output_text(output) -> str:
     """Keep string results intact and all structured result fields visible."""
     return (

@@ -353,8 +353,9 @@ def test_recovery_cli_dry_run_does_not_connect(monkeypatch, recovery_journal):
 
 @pytest.mark.parametrize("allow_new", [False, True])
 @pytest.mark.parametrize("tty", [False, True])
+@pytest.mark.parametrize("termination", ["complete", "signal", "server"])
 def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
-    monkeypatch, recovery_journal, allow_new, tty
+    monkeypatch, recovery_journal, allow_new, tty, termination
 ):
     cid, rid, _root = recovery_journal
     _save_two_checkpoints(cid, rid)
@@ -411,6 +412,12 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
                     "output": "recovered result " * 200 + "FULL_RECOVERY_RESULT",
                 }
             )
+        if termination == "signal":
+            __import__("signal").raise_signal(__import__("signal").SIGINT)
+        elif termination == "server":
+            from llm.default_plugins.openwebui_socket import ServerCancellationError
+
+            raise ServerCancellationError("synthetic owner stop")
         kwargs["on_text"]("Recovered ans")
         kwargs["on_status"]("waiting for model (30s phase)")
         kwargs["on_text"]("wer")
@@ -430,8 +437,10 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
     args = ["openwebui", "resume", cid]
     if allow_new:
         args.append("--allow-new-searches")
+    if termination == "signal":
+        args.append("--no-keep-awake")
     output = CliRunner().invoke(app, args)
-    assert output.exit_code == 0, output.output
+    assert output.exit_code == (0 if termination == "complete" else 1), output.output
     assert len(calls) == 1
     wire = calls[0]
     assert wire["messages"][0]["content"] == "TIDE configuration"
@@ -443,8 +452,9 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
     else:
         assert wire["tool_ids"] == []
         assert wire["params"]["function_calling"] == "legacy"
-    assert "Recovered answer" in output.stdout
-    if tty:
+    if termination == "complete":
+        assert "Recovered answer" in output.stdout
+    if tty and termination == "complete":
         assert "Recovered reasoning" in click.unstyle(output.output)
         assert "Recovered answer" in click.unstyle(output.output)
     # A new journal is created, preserving the source journal untouched.
@@ -459,8 +469,25 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
     new_records = [
         json.loads(line) for line in journal_path(recovered_id).read_text().splitlines()
     ]
-    assert any(row.get("type") == "recovery_completed" for row in new_records)
+    assert any(
+        row.get("type")
+        == ("recovery_completed" if termination == "complete" else "provider_error")
+        for row in new_records
+    )
     assert any(row.get("type") == "provider_request" for row in new_records)
+    power = [row for row in new_records if row.get("type") == "provider_power"]
+    assert power
+    if termination == "signal":
+        assert power[0]["status"] == "disabled"
+        cancelled = next(
+            row for row in new_records if row.get("type") == "turn_cancelled"
+        )
+        assert cancelled["source"] == "process_signal"
+        assert cancelled["signal"] == "SIGINT"
+    elif termination == "server":
+        error = next(row for row in new_records if row.get("type") == "provider_error")
+        assert error["source"] == "server_event"
+        assert error["server_reason"] == "synthetic owner stop"
     if allow_new:
         assert "Result preview:" in output.output
         assert "[truncated" in output.output
@@ -468,7 +495,10 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
         report = journal_path(recovered_id).with_suffix(".html").read_text("utf-8")
         assert '<details class="tool-result">' in report
         assert "FULL_RECOVERY_RESULT" in report
-        assert report.index("FULL_RECOVERY_RESULT") < report.index("Recovered answer")
+        if termination == "complete":
+            assert report.index("FULL_RECOVERY_RESULT") < report.index(
+                "Recovered answer"
+            )
 
 
 def test_recovery_ignores_only_truncated_final_journal_line(recovery_journal):
