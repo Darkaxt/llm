@@ -1,5 +1,6 @@
 """Shared foreground palette for terminal chat and provider status messages."""
 
+import json
 import os
 
 import click
@@ -8,6 +9,7 @@ PROGRAM_COLOR = (217, 119, 87)  # Warm orange, #d97757
 USER_COLOR = (142, 199, 230)
 LLM_COLOR = (230, 221, 214)
 REASONING_COLOR = (174, 183, 196)
+TOOL_COLOR = (196, 119, 158)  # Muted dark pink, #c4779e
 
 
 def colors_enabled() -> bool:
@@ -27,3 +29,21 @@ def chat_style(text: str, *, fg=PROGRAM_COLOR, bold=None) -> str:
 
 def echo_program(text: str, **kwargs) -> None:
     click.echo(chat_style(text), **kwargs)
+
+
+def checkpoint_notice(checkpoint: dict, pointer: dict) -> str:
+    """Render actual call arguments and its durably saved result reference."""
+    arguments = checkpoint["arguments"]
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            pass
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments, ensure_ascii=False, indent=2)
+    return (
+        f"↳ {checkpoint['name']} · returned result\n"
+        f"Call ID: {checkpoint['call_id']}\nArguments:\n{arguments}\n"
+        f"Result checkpoint: {pointer['checkpoint_file']}\n"
+        f"Checkpoint: {pointer['size_bytes']} bytes · SHA-256 {pointer['sha256']}"
+    )

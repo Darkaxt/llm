@@ -39,7 +39,15 @@ from llm.chat_journal import (
 from llm.chat_journal import (
     ensure_session as ensure_chat_journal_session,
 )
-from llm.chat_ui import LLM_COLOR, REASONING_COLOR, chat_style, echo_program
+from llm.chat_journal import journal_path as chat_journal_path
+from llm.chat_ui import (
+    LLM_COLOR,
+    REASONING_COLOR,
+    TOOL_COLOR,
+    chat_style,
+    checkpoint_notice,
+    echo_program,
+)
 from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
 from llm.openwebui_recovery import (
     CheckpointError,
@@ -87,6 +95,12 @@ class _OpenWebUIStatusBar:
     def update(self, text: str, *, kind: str = "status") -> None:
         with self._lock:
             self.current = str(text)
+            if kind == "tool":
+                self._clear_line()
+                click.echo(
+                    chat_style(f"[Open WebUI tool] {text}", fg=TOOL_COLOR), err=True
+                )
+                return
             if not self.enabled:
                 prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
                 click.echo(f"{prefix} {text}", err=True)
@@ -102,12 +116,15 @@ class _OpenWebUIStatusBar:
 
     def clear(self) -> None:
         with self._lock:
-            if not self.enabled or not self.visible:
-                return
-            width = self._width()
-            sys.stderr.write("\r" + (" " * (width - 1)) + "\r")
-            sys.stderr.flush()
-            self.visible = False
+            self._clear_line()
+
+    def _clear_line(self) -> None:
+        if not self.enabled or not self.visible:
+            return
+        width = self._width()
+        sys.stderr.write("\r" + (" " * (width - 1)) + "\r")
+        sys.stderr.flush()
+        self.visible = False
 
 
 def _escape_pressed() -> bool:
@@ -3116,6 +3133,7 @@ class OpenWebUIModel(llm.Model):
                 {
                     "type": "provider_tool",
                     "tool": line,
+                    "display": False,
                 }
             )
             events.put(("tool", line))
@@ -3129,7 +3147,10 @@ class OpenWebUIModel(llm.Model):
             # It must finish writing the complete native tool result before
             # accepting any more model/tool events. Never only journal a status.
             if conversation is not None:
-                save_tool_checkpoint(conversation.id, provider_run_id, checkpoint)
+                pointer = save_tool_checkpoint(
+                    conversation.id, provider_run_id, checkpoint
+                )
+                on_tool(checkpoint_notice(checkpoint, pointer))
 
         def on_status(line: str) -> None:
             status_activity.append(line)
@@ -3137,6 +3158,7 @@ class OpenWebUIModel(llm.Model):
                 {
                     "type": "provider_status",
                     "status": line,
+                    "display": False,
                 }
             )
             events.put(("status", line))
@@ -3271,6 +3293,16 @@ class OpenWebUIModel(llm.Model):
                     if output_line_open:
                         click.echo("", err=True)
                         output_line_open = False
+                    # Source callbacks run in the worker. Mirror only the
+                    # consumed display event to preserve terminal order in HTML.
+                    journal_provider(
+                        {
+                            "type": (
+                                "tool_display" if kind == "tool" else "status_display"
+                            ),
+                            "tool" if kind == "tool" else "status": str(payload),
+                        }
+                    )
                     status_bar.update(
                         str(payload),
                         kind="tool" if kind == "tool" else "status",
@@ -3643,27 +3675,36 @@ def register_commands(cli):
             durable=True,
         )
 
-        echo_program(
+        def program(text: str) -> None:
+            echo_program(text)
+            journal({"type": "program_message", "text": text})
+
+        program(
             f"Recovery conversation: {new_id} "
             f"({len(recovery['checkpoints'])} preserved tool calls)"
         )
-        echo_program(
+        program(f"Autosave HTML: {chat_journal_path(new_id).with_suffix('.html')}")
+        program(
             "Evidence-only: no tools will be executed."
             if not allow_new_searches
             else "Native MCP enabled for new calls; duplicate searches remain "
             "possible if requested again by the model."
         )
         status_bar = _OpenWebUIStatusBar()
+        output_line_open = False
 
         def on_text(chunk: str) -> None:
+            nonlocal output_line_open
             status_bar.clear()
             click.echo(
                 chat_style(chunk, fg=LLM_COLOR) if status_bar.enabled else chunk,
                 nl=False,
             )
             journal({"type": "assistant_stream", "event_type": "text", "chunk": chunk})
+            output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
 
         def on_reasoning(chunk: str) -> None:
+            nonlocal output_line_open
             status_bar.clear()
             click.echo(
                 (
@@ -3677,17 +3718,27 @@ def register_commands(cli):
             journal(
                 {"type": "assistant_stream", "event_type": "reasoning", "chunk": chunk}
             )
+            output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
 
         def on_tool(line: str) -> None:
+            nonlocal output_line_open
+            if output_line_open:
+                click.echo("", err=True)
+                output_line_open = False
             journal({"type": "provider_tool", "tool": line})
             status_bar.update(line, kind="tool")
 
         def on_status(line: str) -> None:
+            nonlocal output_line_open
+            if output_line_open:
+                click.echo("", err=True)
+                output_line_open = False
             journal({"type": "provider_status", "status": line})
             status_bar.update(line)
 
         def on_checkpoint(item: dict[str, Any]) -> None:
-            save_tool_checkpoint(new_id, run_id, item)
+            pointer = save_tool_checkpoint(new_id, run_id, item)
+            on_tool(checkpoint_notice(item, pointer))
 
         def on_source(source: dict[str, Any]) -> None:
             journal({"type": "provider_tool_source", **source})
@@ -3741,7 +3792,7 @@ def register_commands(cli):
                 durable=True,
             )
             click.echo()
-            echo_program(f"Completed recovery; local journal: {new_id}.jsonl")
+            program(f"Completed recovery; local journal: {new_id}.jsonl")
         except (APIError, AuthError, CheckpointError, KeyboardInterrupt) as exc:
             status_bar.clear()
             journal(

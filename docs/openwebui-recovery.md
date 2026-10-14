@@ -20,6 +20,41 @@ background is retained. Redirected output and saved journals remain plain;
 set `NO_COLOR` to disable this chat palette. Recovery uses the same reply,
 reasoning and status colors in an interactive terminal.
 
+Tool activity remains inline in muted dark pink (`#c4779e`), so later status
+updates do not erase it. After a native result is durably checkpointed, its
+notice includes the actual tool name, call ID, full arguments and the saved
+result's relative path, byte count and SHA-256. A returned result is not a
+claim that its contents indicate success; inspect the checkpoint for the full
+output. Final arguments are shown with that returned result, not as an approval
+step before execution. Start/done notices remain visible as received.
+
+## Live HTML conversation report
+
+Each chat automatically maintains `<conversation-id>.html` beside its JSONL
+journal, including when `LLM_CHAT_EXPORT_DIR` changes the conversations folder.
+The CLI prints `Autosave HTML:` at startup. Open that file in a browser and
+refresh it while generation runs to see the latest saved text. It is a single
+offline document, with no server, scripts or external assets required.
+
+The report preserves input, replies, visible reasoning, inline tool notices
+and program messages in the terminal palette. Its footer shows current status;
+streamed chunks join without per-token line breaks. `--hide-reasoning` also
+hides reasoning in the report for that session. The dark report palette remains
+available when terminal colors are disabled using `NO_COLOR`.
+
+The full visible conversation, reasoning and tool arguments may contain incident
+data. Review them before sharing the HTML with your team. Hidden provider request
+metadata and raw result sidecars are not embedded. Keep matching checkpoints
+separately when your team needs to inspect complete returned results.
+
+Reports update incrementally without rewriting all earlier text for each chunk.
+Reopening a journal in a fresh process rebuilds its report and continues the
+same file. Original JSONL/checkpoints remain the recovery source of truth. A
+report I/O error prints a notice and disables report updates for that session;
+journaling and inference continue. Reopening can rebuild after the filesystem
+problem is resolved. A forcibly interrupted report write can likewise be rebuilt
+from the journal on the next open.
+
 ## Stored evidence
 
 On every **completed** native tool call, the fork stores the exact tool name,
@@ -30,6 +65,7 @@ The default storage locations on Windows are:
 
 ~~~text
 %APPDATA%\io.datasette.llm\conversations\<conversation-id>.jsonl
+%APPDATA%\io.datasette.llm\conversations\<conversation-id>.html
 %APPDATA%\io.datasette.llm\conversations\<conversation-id>.checkpoints\<run-hash>\<call-hash>.json
 ~~~
 

@@ -14,7 +14,7 @@ from llm.logs import LogStore, merged_log_rows
 
 def _strip_chat_session_banner(output):
     return re.sub(
-        r"Conversation ID: [^\\n]+\\nAutosave JSONL: [^\\n]+\\n",
+        r"Conversation ID: [^\n]+\nAutosave JSONL: [^\n]+\nAutosave HTML: [^\n]+\n",
         "",
         output,
     )

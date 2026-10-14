@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from . import user_dir
+from .chat_html import ensure_html_report, update_html_report
 
 _lock = threading.Lock()
 
@@ -69,6 +70,7 @@ def append_record(
         handle.flush()
         if durable:
             os.fsync(handle.fileno())
+        update_html_report(path, payload)
     return path
 
 
@@ -82,6 +84,7 @@ def ensure_session(
     with _lock:
         exists = path.exists() and path.stat().st_size > 0
         if exists:
+            ensure_html_report(path)
             return path
 
         payload = {
@@ -103,4 +106,5 @@ def ensure_session(
             )
             handle.write("\n")
             handle.flush()
+        ensure_html_report(path)
     return path

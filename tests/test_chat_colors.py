@@ -74,17 +74,40 @@ def test_status_bar_color_truncation_and_clear(monkeypatch, no_color):
     monkeypatch.setattr("sys.stdout", terminal)
     bar = _OpenWebUIStatusBar()
     monkeypatch.setattr(bar, "_width", lambda: 40)
-    bar.update("search " * 30, kind="tool")
+    bar.update("search " * 30)
     bar.clear()
     rendered = terminal.getvalue()
     line = rendered.split("\r")[2]
     assert len(click.unstyle(line)) == 39
-    assert click.unstyle(line).startswith("Open WebUI │ tool · ")
+    assert click.unstyle(line).startswith("Open WebUI │ ")
     assert click.unstyle(line).endswith("…")
     assert rendered.endswith("\r" + " " * 39 + "\r")
     assert (ORANGE in line) is not no_color
     if not no_color:
         assert line.endswith("\x1b[0m")
+
+
+def test_tool_notices_are_persistent_pink_and_not_truncated(monkeypatch):
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    terminal = Terminal()
+    monkeypatch.setattr("sys.stderr", terminal)
+    monkeypatch.setattr("sys.stdout", terminal)
+    bar = _OpenWebUIStatusBar()
+    monkeypatch.setattr(bar, "_width", lambda: 40)
+    bar.update("waiting")
+    call = "splunk_search\nArguments: " + "full query " * 20
+    bar.update(call, kind="tool")
+    before_clear = terminal.getvalue()
+    assert call in before_clear
+    assert "\x1b[38;2;196;119;158m" in before_clear
+    assert before_clear.endswith("\x1b[0m\n")
+    bar.clear()
+    assert terminal.getvalue() == before_clear
 
 
 @pytest.mark.parametrize("no_color", [False, True])

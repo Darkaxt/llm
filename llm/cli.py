@@ -326,24 +326,37 @@ def _run_chat(
     export_jsonl=True,
 ):
     """Run the terminal chat loop shared by managed and transient models."""
-    echo_program(f"Chatting with {model_label}")
-    if conversation is not None:
-        echo_program(f"Conversation ID: {conversation.id}")
-        if db is not None and export_jsonl:
-            export_path = _write_conversation_jsonl(
-                db,
-                conversation,
-                model_label=model_label,
+    if conversation is not None and export_jsonl:
+        export_path = _write_conversation_jsonl(
+            db, conversation, model_label=model_label
+        )
+        append_chat_journal_record(
+            conversation.id,
+            {"type": "display_options", "show_reasoning": show_reasoning},
+        )
+
+    def program(text, *, err=False, journal=True):
+        echo_program(text, err=err)
+        if conversation is not None and export_jsonl and journal:
+            append_chat_journal_record(
+                conversation.id, {"type": "program_message", "text": text}
             )
-            echo_program(f"Autosave JSONL: {export_path}")
-    echo_program("Type 'exit' or 'quit' to exit")
-    echo_program(
-        "Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
-    )
-    echo_program("Type '!edit' to open your default editor and modify the prompt")
-    echo_program("Press Ctrl+C during generation to cancel the current response")
+
+    program(f"Chatting with {model_label}")
+    if conversation is not None:
+        program(f"Conversation ID: {conversation.id}")
+        if db is not None and export_jsonl:
+            program(f"Autosave JSONL: {export_path}")
+        if export_jsonl:
+            program(
+                f"Autosave HTML: {chat_journal_path(conversation.id).with_suffix('.html')}"
+            )
+    program("Type 'exit' or 'quit' to exit")
+    program("Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)")
+    program("Type '!edit' to open your default editor and modify the prompt")
+    program("Press Ctrl+C during generation to cancel the current response")
     if db is not None:
-        echo_program(
+        program(
             "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         )
 
@@ -366,7 +379,7 @@ def _run_chat(
         retry_of = None
         if prompt.strip() in ("!retry", "!retry-force"):
             if last_failed is None:
-                echo_program("No failed or cancelled turn to retry.", err=True)
+                program("No failed or cancelled turn to retry.", err=True)
                 continue
             if (
                 prompt.strip() == "!retry"
@@ -380,7 +393,7 @@ def _run_chat(
                 try:
                     saved = load_recovery(conversation.id)
                 except CheckpointError as exc:
-                    echo_program(
+                    program(
                         "Open WebUI recovery evidence cannot be verified: "
                         f"{exc}. Refusing to silently replay any remote tool "
                         "calls. Use !retry-force only if you intentionally "
@@ -388,7 +401,7 @@ def _run_chat(
                         err=True,
                     )
                     continue
-                echo_program(
+                program(
                     f"{len(saved['checkpoints'])} completed MCP/tool result(s) "
                     f"are checkpointed. Use 'llm openwebui resume "
                     f"{conversation.id}' to continue without replaying them. "
@@ -412,7 +425,7 @@ def _run_chat(
             if prompt.strip() == "!edit":
                 edited_prompt = click.edit()
                 if edited_prompt is None:
-                    echo_program("Editor closed without saving.", err=True)
+                    program("Editor closed without saving.", err=True)
                     continue
                 prompt = edited_prompt.strip()
             if db is not None and prompt.strip().startswith("!fragment "):
@@ -494,7 +507,7 @@ def _run_chat(
                         "turn_id": turn_id,
                     },
                 )
-            echo_program("\nCancelled current response.", err=True)
+            program("\nCancelled current response.", err=True, journal=False)
             continue
         except ModelError as exc:
             last_failed = (prompt, list(fragments), list(attachments), turn_id)
@@ -508,7 +521,7 @@ def _run_chat(
                         "error_class": type(exc).__name__,
                     },
                 )
-            echo_program(f"\nModel error: {exc}", err=True)
+            program(f"\nModel error: {exc}", err=True, journal=False)
             continue
         except Exception as exc:
             if conversation is not None and export_jsonl:
