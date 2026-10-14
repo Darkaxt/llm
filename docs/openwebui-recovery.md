@@ -12,6 +12,14 @@ from the one-shot background_legacy tool prepass.
 
 Record the conversation ID printed by the CLI.
 
+Interactive terminal chat uses warm orange (`#d97757`) for program messages,
+turn separators, the prompt marker and the Open WebUI status line. Your input
+and **You** label are blue; replies and the **LLM** label are ivory. Reasoning
+uses a separate gray foreground rather than terminal dimming. The terminal's
+background is retained. Redirected output and saved journals remain plain;
+set `NO_COLOR` to disable this chat palette. Recovery uses the same reply,
+reasoning and status colors in an interactive terminal.
+
 ## Stored evidence
 
 On every **completed** native tool call, the fork stores the exact tool name,

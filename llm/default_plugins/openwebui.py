@@ -39,6 +39,7 @@ from llm.chat_journal import (
 from llm.chat_journal import (
     ensure_session as ensure_chat_journal_session,
 )
+from llm.chat_ui import LLM_COLOR, REASONING_COLOR, chat_style, echo_program
 from llm.default_plugins.openwebui_socket import run_chat_with_tools_with_files
 from llm.openwebui_recovery import (
     CheckpointError,
@@ -92,7 +93,7 @@ class _OpenWebUIStatusBar:
                 return
 
             width = self._width()
-            line = self._render_text(text, kind=kind)
+            line = chat_style(self._render_text(text, kind=kind))
             # Use only carriage returns/spaces rather than ANSI cursor control so
             # this remains reliable in Windows Terminal/PowerShell.
             sys.stderr.write("\r" + (" " * (width - 1)) + "\r" + line)
@@ -3642,11 +3643,11 @@ def register_commands(cli):
             durable=True,
         )
 
-        click.echo(
+        echo_program(
             f"Recovery conversation: {new_id} "
             f"({len(recovery['checkpoints'])} preserved tool calls)"
         )
-        click.echo(
+        echo_program(
             "Evidence-only: no tools will be executed."
             if not allow_new_searches
             else "Native MCP enabled for new calls; duplicate searches remain "
@@ -3656,12 +3657,23 @@ def register_commands(cli):
 
         def on_text(chunk: str) -> None:
             status_bar.clear()
-            click.echo(chunk, nl=False)
+            click.echo(
+                chat_style(chunk, fg=LLM_COLOR) if status_bar.enabled else chunk,
+                nl=False,
+            )
             journal({"type": "assistant_stream", "event_type": "text", "chunk": chunk})
 
         def on_reasoning(chunk: str) -> None:
             status_bar.clear()
-            click.echo(click.style(chunk, dim=True), nl=False, err=True)
+            click.echo(
+                (
+                    chat_style(chunk, fg=REASONING_COLOR)
+                    if status_bar.enabled
+                    else click.style(chunk, dim=True)
+                ),
+                nl=False,
+                err=True,
+            )
             journal(
                 {"type": "assistant_stream", "event_type": "reasoning", "chunk": chunk}
             )
@@ -3729,7 +3741,7 @@ def register_commands(cli):
                 durable=True,
             )
             click.echo()
-            click.echo(f"Completed recovery; local journal: {new_id}.jsonl")
+            echo_program(f"Completed recovery; local journal: {new_id}.jsonl")
         except (APIError, AuthError, CheckpointError, KeyboardInterrupt) as exc:
             status_bar.clear()
             journal(

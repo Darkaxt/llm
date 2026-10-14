@@ -69,6 +69,15 @@ from llm.models import ChainResponse, _BaseChainResponse, _BaseConversation
 from .chat_journal import append_record as append_chat_journal_record
 from .chat_journal import ensure_session as ensure_chat_journal_session
 from .chat_journal import journal_path as chat_journal_path
+from .chat_ui import (
+    LLM_COLOR,
+    PROGRAM_COLOR,
+    REASONING_COLOR,
+    USER_COLOR,
+    chat_style,
+    colors_enabled,
+    echo_program,
+)
 from .logs import (
     LogStore,
     legacy_log_row_extras,
@@ -105,10 +114,11 @@ class FragmentNotFound(Exception):
     pass
 
 
-def display_stream_events(events, *, show_reasoning=True):
+def display_stream_events(events, *, show_reasoning=True, chat=False):
     """Consume a sync iterator of StreamEvents and write them.
 
-    Text events go to stdout. Reasoning events go to stderr in dim style.
+    Text events go to stdout. Reasoning events go to stderr. Interactive chat
+    uses distinct foregrounds; ordinary prompt output retains its dim reasoning.
     Transitions in either direction always start on a fresh terminal line so
     visible reasoning cannot run into answer prose (or vice versa).
     """
@@ -117,12 +127,22 @@ def display_stream_events(events, *, show_reasoning=True):
         if event.type == "text":
             if last_visible_type == "reasoning" and show_reasoning:
                 click.echo("", err=True)
-            click.echo(event.chunk, nl=False)
+            click.echo(
+                chat_style(event.chunk, fg=LLM_COLOR) if chat else event.chunk, nl=False
+            )
             last_visible_type = "text"
         elif event.type == "reasoning" and show_reasoning:
             if last_visible_type == "text":
                 click.echo("", err=True)
-            click.echo(click.style(event.chunk, dim=True), nl=False, err=True)
+            click.echo(
+                (
+                    chat_style(event.chunk, fg=REASONING_COLOR)
+                    if chat
+                    else click.style(event.chunk, dim=True)
+                ),
+                nl=False,
+                err=True,
+            )
             last_visible_type = "reasoning"
 
 
@@ -149,6 +169,7 @@ def _build_chat_prompt_session():
     from prompt_toolkit.input.vt100_parser import _IS_PREFIX_OF_LONGER_MATCH_CACHE
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.keys import Keys
+    from prompt_toolkit.styles import Style
 
     # prompt_toolkit currently normalizes xterm Shift+Enter to plain Enter.
     # Re-map the common extended terminal encodings to an otherwise-unused
@@ -180,6 +201,14 @@ def _build_chat_prompt_session():
         key_bindings=bindings,
         prompt_continuation=lambda width, line_number, is_soft_wrap: "  ",
         enable_history_search=True,
+        style=Style.from_dict(
+            {
+                "": "fg:#{:02x}{:02x}{:02x}".format(*USER_COLOR),
+                "prompt": "fg:#{:02x}{:02x}{:02x}".format(*PROGRAM_COLOR),
+            }
+            if colors_enabled()
+            else {}
+        ),
     )
 
 
@@ -187,7 +216,7 @@ def _read_chat_prompt(session=None) -> str:
     # Tests and piped/non-interactive callers keep the existing Click path.
     if session is None:
         return click.prompt("", prompt_suffix="> ")
-    return session.prompt("> ")
+    return session.prompt([("class:prompt", "> ")])
 
 
 def _chat_export_dir() -> pathlib.Path:
@@ -276,7 +305,11 @@ def _chat_turn_headers_enabled() -> bool:
 
 def _print_chat_turn_header(label: str) -> None:
     click.echo()
-    click.echo(click.style(f"── {label} ──", bold=True))
+    click.echo(
+        chat_style("── ")
+        + chat_style(label, fg=USER_COLOR if label == "You" else LLM_COLOR, bold=True)
+        + chat_style(" ──")
+    )
 
 
 def _run_chat(
@@ -293,22 +326,24 @@ def _run_chat(
     export_jsonl=True,
 ):
     """Run the terminal chat loop shared by managed and transient models."""
-    click.echo(f"Chatting with {model_label}")
+    echo_program(f"Chatting with {model_label}")
     if conversation is not None:
-        click.echo(f"Conversation ID: {conversation.id}")
+        echo_program(f"Conversation ID: {conversation.id}")
         if db is not None and export_jsonl:
             export_path = _write_conversation_jsonl(
                 db,
                 conversation,
                 model_label=model_label,
             )
-            click.echo(f"Autosave JSONL: {export_path}")
-    click.echo("Type 'exit' or 'quit' to exit")
-    click.echo("Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)")
-    click.echo("Type '!edit' to open your default editor and modify the prompt")
-    click.echo("Press Ctrl+C during generation to cancel the current response")
+            echo_program(f"Autosave JSONL: {export_path}")
+    echo_program("Type 'exit' or 'quit' to exit")
+    echo_program(
+        "Enter sends; Shift+Enter adds a newline (Ctrl+J / Alt+Enter fallback)"
+    )
+    echo_program("Type '!edit' to open your default editor and modify the prompt")
+    echo_program("Press Ctrl+C during generation to cancel the current response")
     if db is not None:
-        click.echo(
+        echo_program(
             "Type '!fragment <my_fragment> [<another_fragment> ...]' to insert one or more fragments"
         )
 
@@ -331,7 +366,7 @@ def _run_chat(
         retry_of = None
         if prompt.strip() in ("!retry", "!retry-force"):
             if last_failed is None:
-                click.echo("No failed or cancelled turn to retry.", err=True)
+                echo_program("No failed or cancelled turn to retry.", err=True)
                 continue
             if (
                 prompt.strip() == "!retry"
@@ -345,7 +380,7 @@ def _run_chat(
                 try:
                     saved = load_recovery(conversation.id)
                 except CheckpointError as exc:
-                    click.echo(
+                    echo_program(
                         "Open WebUI recovery evidence cannot be verified: "
                         f"{exc}. Refusing to silently replay any remote tool "
                         "calls. Use !retry-force only if you intentionally "
@@ -353,7 +388,7 @@ def _run_chat(
                         err=True,
                     )
                     continue
-                click.echo(
+                echo_program(
                     f"{len(saved['checkpoints'])} completed MCP/tool result(s) "
                     f"are checkpointed. Use 'llm openwebui resume "
                     f"{conversation.id}' to continue without replaying them. "
@@ -377,7 +412,7 @@ def _run_chat(
             if prompt.strip() == "!edit":
                 edited_prompt = click.edit()
                 if edited_prompt is None:
-                    click.echo("Editor closed without saving.", err=True)
+                    echo_program("Editor closed without saving.", err=True)
                     continue
                 prompt = edited_prompt.strip()
             if db is not None and prompt.strip().startswith("!fragment "):
@@ -408,7 +443,7 @@ def _run_chat(
             append_chat_journal_record(conversation.id, record)
 
         if turn_headers:
-            _print_chat_turn_header("Assistant")
+            _print_chat_turn_header("LLM")
 
         try:
             response = prompt_callback(prompt, fragments, attachments)
@@ -444,7 +479,9 @@ def _run_chat(
 
             events_iterator = journaled_events()
             try:
-                display_stream_events(events_iterator, show_reasoning=show_reasoning)
+                display_stream_events(
+                    events_iterator, show_reasoning=show_reasoning, chat=turn_headers
+                )
             finally:
                 events_iterator.close()
         except KeyboardInterrupt:
@@ -457,7 +494,7 @@ def _run_chat(
                         "turn_id": turn_id,
                     },
                 )
-            click.echo("\nCancelled current response.", err=True)
+            echo_program("\nCancelled current response.", err=True)
             continue
         except ModelError as exc:
             last_failed = (prompt, list(fragments), list(attachments), turn_id)
@@ -471,7 +508,7 @@ def _run_chat(
                         "error_class": type(exc).__name__,
                     },
                 )
-            click.echo(f"\nModel error: {exc}", err=True)
+            echo_program(f"\nModel error: {exc}", err=True)
             continue
         except Exception as exc:
             if conversation is not None and export_jsonl:
