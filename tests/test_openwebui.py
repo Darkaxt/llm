@@ -1954,7 +1954,12 @@ def test_openwebui_response_completion_tool_start_and_result_are_live():
     assert statuses == ["tool result received; waiting for model continuation"]
 
 
-def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
+@pytest.mark.parametrize(
+    "reasoning_boundary", [None, "empty", "tools", "legacy", "continuation", "snapshot"]
+)
+def test_openwebui_socket_runner_consumes_live_events_before_final(
+    monkeypatch, reasoning_boundary
+):
     import asyncio
 
     events = []
@@ -2048,6 +2053,58 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
         },
     ]
 
+    expected_reasoning = "Thinking"
+    if reasoning_boundary:
+        # A tool/empty snapshot need not repeat earlier reasoning. The next
+        # generation can emit a new item, or continue the same reasoning item.
+        snapshot = {"output": []}
+        if reasoning_boundary == "tools":
+            snapshot = {
+                "output": [payloads[4]["data"]["item"], payloads[5]["data"]["item"]]
+            }
+        elif reasoning_boundary == "legacy":
+            snapshot = {"content": ""}
+        elif reasoning_boundary == "snapshot":
+            snapshot = {
+                "output": [
+                    payloads[-1]["data"]["output"][0],
+                    {
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": "Snapshot note"}],
+                    },
+                ]
+            }
+        continuation = reasoning_boundary == "continuation"
+        delta = " again" if continuation else "Next step"
+        payloads[-1:-1] = [
+            {"type": "chat:completion", "data": snapshot},
+            {
+                "type": "response:completion",
+                "data": {
+                    "type": "response.reasoning_text.delta",
+                    "item_id": "reasoning_1" if continuation else "reasoning_2",
+                    "output_index": 0 if continuation else 2,
+                    "delta": delta,
+                },
+            },
+        ]
+        expected_reasoning = (
+            "Thinking again" if continuation else "Thinking\n\nNext step"
+        )
+        if continuation:
+            payloads[-1]["data"]["output"][0]["summary"][0]["text"] = expected_reasoning
+        else:
+            payloads[-1]["data"]["output"].insert(
+                1,
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "Next step"}],
+                },
+            )
+            if reasoning_boundary == "snapshot":
+                payloads[-1]["data"]["output"].insert(1, snapshot["output"][1])
+                expected_reasoning = "Thinking\n\nSnapshot note\n\nNext step"
+
     class FakeHTTPClientSession:
         def __init__(self, **kwargs):
             assert kwargs["trust_env"] is True
@@ -2124,10 +2181,13 @@ def test_openwebui_socket_runner_consumes_live_events_before_final(monkeypatch):
 
     result = asyncio.run(run())
     assert result["answer"] == "Hello world"
-    assert result["reasoning"] == "Thinking"
+    assert result["reasoning"] == expected_reasoning
     assert result["remote_task_ids"] == ["task-1"]
     assert [value for kind, value in events if kind == "text"] == ["Hello", " world"]
-    assert [value for kind, value in events if kind == "reasoning"] == ["Thinking"]
+    assert (
+        "".join(value for kind, value in events if kind == "reasoning")
+        == expected_reasoning
+    )
     assert ("status", "live model token stream started") in events
     saved = [item for kind, item in events if kind == "checkpoint"]
     assert len(saved) == 1

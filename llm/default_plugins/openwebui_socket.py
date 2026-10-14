@@ -413,6 +413,37 @@ def _reconcile_answer_snapshot(
         state["last_progress_at"] = time.monotonic()
 
 
+def _reconcile_reasoning_snapshot(
+    current_blocks: list[str],
+    state: dict[str, Any],
+    on_reasoning: Callable[[str], None],
+) -> None:
+    """Merge cumulative reasoning without removing slots still used by deltas.
+
+    Tool-only and partial snapshots may omit earlier reasoning. Absence is not
+    deletion: the live stream and snapshots share this append-only slot list.
+    """
+    blocks = state["reasoning_blocks"]
+    for i, block in enumerate(current_blocks):
+        if i >= len(blocks):
+            if blocks:
+                on_reasoning("\n\n")
+            blocks.append(block)
+            on_reasoning(block)
+            state["last_progress_at"] = time.monotonic()
+        elif block.startswith(blocks[i]):
+            suffix = block[len(blocks[i]) :]
+            if suffix:
+                on_reasoning(suffix)
+                blocks[i] = block
+                state["last_progress_at"] = time.monotonic()
+        elif len(block) > len(blocks[i]):
+            # As with answers, retain canonical normalized text without trying
+            # to rewrite terminal output that has already been displayed.
+            blocks[i] = block
+            state["last_progress_at"] = time.monotonic()
+
+
 def _record_native_tool_item(
     item: dict[str, Any],
     state: dict[str, Any],
@@ -539,14 +570,14 @@ def _consume_response_completion(
             # Update the same reasoning state read by final-snapshot handling,
             # preventing the final full reasoning from being shown twice.
             key = (data.get("item_id"), data.get("output_index"), kind)
-            keys = state.setdefault("reasoning_stream_keys", [])
+            slots = state.setdefault("reasoning_stream_slots", {})
             blocks = state["reasoning_blocks"]
-            if key not in keys:
-                keys.append(key)
+            if key not in slots:
+                slots[key] = len(blocks)
                 if blocks:
                     on_reasoning("\n\n")
                 blocks.append("")
-            blocks[keys.index(key)] += delta
+            blocks[slots[key]] += delta
             on_reasoning(delta)
             phase = "model reasoning"
         if state.get("phase") != phase:
@@ -783,20 +814,9 @@ async def run_chat_with_tools_with_files(
         if answer:
             _emit_answer_snapshot(answer)
 
-        current_blocks = _structured_reasoning(output)
-        prev_blocks = state["reasoning_blocks"]
-        for i, block in enumerate(current_blocks):
-            if i >= len(prev_blocks):
-                if i > 0:
-                    out_reasoning("\n\n")
-                out_reasoning(block)
-                state["last_progress_at"] = time.monotonic()
-            elif block.startswith(prev_blocks[i]):
-                delta = block[len(prev_blocks[i]) :]
-                if delta:
-                    out_reasoning(delta)
-                    state["last_progress_at"] = time.monotonic()
-        state["reasoning_blocks"] = current_blocks
+        _reconcile_reasoning_snapshot(
+            _structured_reasoning(output), state, out_reasoning
+        )
 
         current_events = _structured_tool_events(output)
         new_results: list[dict[str, Any]] = []
@@ -951,20 +971,9 @@ async def run_chat_with_tools_with_files(
             content = data.get("content") or ""
 
             # Legacy serialized-content path.
-            current_blocks = extract_all_reasoning(content)
-            prev_blocks = state["reasoning_blocks"]
-            for i, block in enumerate(current_blocks):
-                if i >= len(prev_blocks):
-                    if i > 0:
-                        out_reasoning("\n\n")
-                    out_reasoning(block)
-                    state["last_progress_at"] = time.monotonic()
-                elif block.startswith(prev_blocks[i]):
-                    delta = block[len(prev_blocks[i]) :]
-                    if delta:
-                        out_reasoning(delta)
-                        state["last_progress_at"] = time.monotonic()
-            state["reasoning_blocks"] = current_blocks
+            _reconcile_reasoning_snapshot(
+                extract_all_reasoning(content), state, out_reasoning
+            )
 
             current_tool_events = extract_tool_events(content)
             results_by_name = {r["name"]: r for r in state["tool_results"]}

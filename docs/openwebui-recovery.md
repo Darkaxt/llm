@@ -80,6 +80,14 @@ checkpoint recovery (or refuses if evidence cannot be validated). Use
 
 ## Scope and limitations
 
+The client keeps live reasoning fragments and cumulative reasoning snapshots in
+stable slots throughout a request. Tool-only, empty or partial snapshots do not
+erase earlier reasoning or invalidate the next continuation's stream slot.
+Repeated snapshots append only new text, while completed tool checkpoints remain
+independent. This fixes a reproducible `error handling chat event: list index out
+of range` at a reasoning/tool boundary; it does not change model reasoning,
+timeouts or retries, and is not proof of corporate five-minute endurance.
+
 - This is **continuation from evidence**, not restoration of the provider's
   live task or of model-private reasoning.
 - An incomplete tool call is not presented as successful evidence.
