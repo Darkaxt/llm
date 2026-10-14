@@ -3606,6 +3606,11 @@ def register_commands(cli):
         "--dry-run", is_flag=True, help="Verify checkpoints; do not contact the model"
     )
     @click.option(
+        "--empty-answer",
+        is_flag=True,
+        help="Recover a completed turn with a recorded empty answer and tool checkpoints",
+    )
+    @click.option(
         "--keep-awake/--no-keep-awake",
         default=True,
         help="Prevent Windows idle sleep during this recovery request",
@@ -3616,6 +3621,7 @@ def register_commands(cli):
         allow_new_searches: bool,
         assume_stopped: bool,
         dry_run: bool,
+        empty_answer: bool,
         keep_awake,
     ):
         """Start a new continuation from complete, verified local tool checkpoints.
@@ -3628,6 +3634,7 @@ def register_commands(cli):
                 conversation_id,
                 provider_run_id=provider_run_id,
                 require_error=not assume_stopped,
+                allow_empty_answer=empty_answer,
             )
             messages = build_resume_messages(
                 recovery, allow_new_searches=allow_new_searches
@@ -3642,9 +3649,12 @@ def register_commands(cli):
             "source_provider_run": recovery["provider_run_id"],
             "model": origin["model"],
             "checkpointed_calls": len(recovery["checkpoints"]),
+            "inherited_checkpoint_count": len(recovery["checkpoints"]),
             "tool_names": [item["name"] for item in recovery["checkpoints"]],
             "mode": "new-searches-allowed" if allow_new_searches else "evidence-only",
             "remote_task_resumed": False,
+            "recovery_reason": recovery["recovery_reason"],
+            "reasoning_included": False,
         }
         if dry_run:
             click.echo(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -3809,6 +3819,25 @@ def register_commands(cli):
 
         observed_interrupt = {}
         try:
+            # Independent verified copies survive another failed recovery without
+            # claiming these tools executed in the new request.
+            for item in recovery["checkpoints"]:
+                pointer = save_tool_checkpoint(
+                    new_id,
+                    run_id,
+                    item,
+                    inherited_from={
+                        "conversation_id": conversation_id,
+                        "provider_run_id": recovery["provider_run_id"],
+                        "call_id": item["call_id"],
+                    },
+                )
+                on_tool(
+                    checkpoint_notice(
+                        {**item, "inherited_from": pointer["inherited_from"]}, pointer
+                    ),
+                    pointer=pointer,
+                )
             # Use the same Socket.IO native loop as interactive chat. For
             # evidence-only mode, legacy with NO tool_ids prevents Open WebUI
             # from injecting its builtin tools. No tool prepass can run.
@@ -3841,6 +3870,11 @@ def register_commands(cli):
                         on_checkpoint=on_checkpoint,
                         on_source=on_source,
                     )
+                )
+            if not str(result.get("answer") or "").strip():
+                raise APIError(
+                    "Recovery returned no final answer; preserved tool checkpoints "
+                    f"remain available in recovery conversation {new_id}"
                 )
             status_bar.clear()
             journal(

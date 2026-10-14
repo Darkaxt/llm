@@ -115,6 +115,13 @@ def checkpoint_notice(checkpoint: dict, pointer: dict, *, preview: bool = True) 
         f"Result checkpoint: {pointer['checkpoint_file']}\n"
         f"Checkpoint: {pointer['size_bytes']} bytes · SHA-256 {pointer['sha256']}"
     )
+    inherited = checkpoint.get("inherited_from")
+    if inherited:
+        notice += (
+            f"\nInherited from conversation: {inherited['conversation_id']}"
+            f"\nSource provider run: {inherited['provider_run_id']}"
+            "\nPreserved evidence; not executed in this recovery request."
+        )
     if preview:
         output = tool_output_text(checkpoint["output"])
         # Display bounds only: the model and saved output remain untouched.

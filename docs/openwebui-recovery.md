@@ -174,6 +174,52 @@ silently discarding data.
 These files contain **unencrypted incident-investigation evidence**.
 Protect them with the user's filesystem permissions.
 
+## Tool-evidence recovery extension specification (2026-10-14)
+
+The user authorizes expanding recovery to include tools that ran in the previous
+attempt. This section is authoritative for that extension; reasoning remains
+excluded. Earlier failed-turn recovery already reconstructs verified tool calls.
+
+- P1: Preserve every completed checkpoint's call ID, tool name, arguments and
+  full result, including KB builtins and MCP tools, without executing it again.
+  Verify sidecar identity, size and digest; reject missing/conflicting evidence.
+- P2: Add an explicit `--empty-answer` option for a terminal completed turn whose
+  answer is demonstrably empty and which has completed tool evidence. Refuse
+  nonempty/unknown completed answers and active runs. Existing failed-turn and
+  confirmed process-killed recovery remain available. Bound selection to the
+  chosen provider run, so a later turn cannot invalidate an older failed attempt.
+- P3: Copy inherited verified checkpoints into each new recovery journal with
+  source provenance, distinguishing inherited calls from execution in that run.
+  A subsequent failed recovery must preserve those calls plus any newly completed
+  calls, exactly once in model history, without relying on the original files.
+- P4: Keep evidence-only recovery as default; retain explicit original/current
+  MCP scope for new searches. Exclude reasoning, preserve original source files,
+  and introduce no automatic retries, deadlines, model/provider changes or tools.
+- P5: Verify complete CLI dry-run and continuation flows, including chained
+  failure/recovery, empty completion, run selection, provenance and corrupt
+  evidence rejection. Document usage, commit/push and deliver commands in issue
+  #28. Offline fixtures do not certify corporate recovery.
+
+| Stage | Status | Reconciliation |
+|---|---|---|
+| Previous-attempt tool evidence recovery (P1-P5) | ACTIVE | P1-P4 and P5 local verification/documentation pass; commit/push and issue delivery remain; no deferrals |
+
+Eligibility/run selection and inherited evidence blockers are resolved. Complete
+offline CLI flows verify empty-answer eligibility, active/nonempty/tool-free
+refusal, KB/MCP preservation, source provenance in terminal/HTML, chained recovery
+after original sidecar removal, no duplicate history, copy failure and corruption
+rejection. A recovery with an empty result fails explicitly while retaining its
+checkpoints. Affected provider/chat/HTML/timing/power regressions pass with the
+existing expected-failure/XPASS outcomes retained. Black, Ruff, focused source
+typing, generated CLI documentation and whitespace checks pass. An optional
+untyped-body check reproduces the same three Click Path typing errors in unchanged
+knowledge commands at the pre-change HEAD; these are outside this extension.
+
+The only remaining acceptance work is P5 commit/push and issue delivery. Closure
+review found no requirement-blocking design debt or required deferrals. Corporate
+endurance remains the separate external issue #28 validation boundary, not an
+implementation prerequisite.
+
 ## Resume a failed investigation
 
 The old remote task is NOT restarted or reconnected. A new model request is
@@ -214,6 +260,32 @@ that interrupted journal:
 Use --provider-run-id to select a specific older failed provider request.
 Every continuation writes a new conversation journal. The source journal
 records a link to the new conversation.
+
+Completed turns that produced no answer can be recovered explicitly, provided
+they contain at least one verified completed tool checkpoint:
+
+~~~powershell
+..\.venv\Scripts\python.exe -m llm openwebui resume <conversation-id> --empty-answer --dry-run
+..\.venv\Scripts\python.exe -m llm openwebui resume <conversation-id> --empty-answer
+~~~
+
+`--empty-answer` accepts only a recorded empty/whitespace-only answer. A missing
+answer field does not prove emptiness; successful nonempty turns and active runs
+remain protected. Use `--provider-run-id` for an older attempt, even when later
+turns completed. No reasoning is added to the recovery request, and a reasoning-
+only turn with no completed tools still has no recoverable tool evidence.
+
+Each recovery copies all verified completed calls into its own sidecars,
+including knowledge-base builtins as well as MCP calls. `inherited_from` records
+the source conversation, provider run and call ID; `executed_in_this_run: false`
+distinguishes these copies from newly executed calls. Full results are visible in
+the new HTML report. Existing source files are preserved. A failed recovery can
+itself be recovered using its new conversation ID, retaining both inherited
+results and any new completed calls without duplicating them in model history.
+Its own copies are sufficient; the original sidecars are not needed again.
+Conflicting history, corrupt/missing sidecars and incomplete inheritance fail
+explicitly. A recovery that returns no final answer is recorded as an error,
+with its tool evidence retained for another explicit recovery.
 
 Within interactive chat, !retry now redirects Open WebUI failures to
 checkpoint recovery (or refuses if evidence cannot be validated). Use

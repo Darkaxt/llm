@@ -56,6 +56,8 @@ def save_tool_checkpoint(
     conversation_id: str,
     provider_run_id: str,
     checkpoint: dict[str, Any],
+    *,
+    inherited_from: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Atomically persist the complete call+result before acknowledging it.
 
@@ -82,6 +84,8 @@ def save_tool_checkpoint(
         "output": checkpoint["output"],
         "completed_at": time.time(),
     }
+    if inherited_from is not None:
+        record["inherited_from"] = inherited_from
     data = _json_bytes(record)
     if len(data) > _CHECKPOINT_MAX_BYTES:
         raise CheckpointError(
@@ -110,7 +114,14 @@ def save_tool_checkpoint(
                 previous = json.loads(existing)
             except (UnicodeError, json.JSONDecodeError) as exc:
                 raise CheckpointError("Existing checkpoint is corrupt") from exc
-            for key in ("provider_run_id", "call_id", "name", "arguments", "output"):
+            for key in (
+                "provider_run_id",
+                "call_id",
+                "name",
+                "arguments",
+                "output",
+                "inherited_from",
+            ):
                 if previous.get(key) != record.get(key):
                     raise CheckpointError(
                         "Conflicting results for the same tool call ID"
@@ -151,7 +162,10 @@ def save_tool_checkpoint(
         "sha256": digest,
         "size_bytes": len(data),
         "server_executed": True,
+        "executed_in_this_run": inherited_from is None,
     }
+    if inherited_from is not None:
+        summary["inherited_from"] = inherited_from
     # Do not acknowledge a completed call until its journal pointer is durable.
     append_record(conversation_id, summary, durable=True)
     return summary
@@ -179,6 +193,7 @@ def _load_checkpoint(conversation_id: str, pointer: dict[str, Any]) -> dict[str,
         or document.get("provider_run_id") != pointer.get("provider_run_id")
         or document.get("call_id") != pointer.get("call_id")
         or document.get("name") != pointer.get("tool")
+        or document.get("inherited_from") != pointer.get("inherited_from")
     ):
         raise CheckpointError("Checkpoint identity or format mismatch")
     if (
@@ -194,11 +209,12 @@ def load_recovery(
     *,
     provider_run_id: str | None = None,
     require_error: bool = True,
+    allow_empty_answer: bool = False,
 ) -> dict[str, Any]:
     """Load verified checkpoints from the latest failed provider request.
 
-    Fail closed on incomplete journals, missing tool evidence, a completed
-    turn, corrupt sidecars or an active run lacking a terminal error.
+    A completed turn is eligible only with an explicit empty-answer opt-in and
+    a recorded empty answer. Later requests do not change the selected run.
     """
     _safe_conversation_id(conversation_id)
     path = journal_path(conversation_id)
@@ -235,26 +251,50 @@ def load_recovery(
         raise CheckpointError("No matching Open WebUI provider request in journal")
     request = requests[-1]
     run_id = request["provider_run_id"]
-    if require_error and not any(
+    start = next(i for i, row in enumerate(records) if row is request)
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(records))
+            if records[i].get("type") == "provider_request"
+        ),
+        len(records),
+    )
+    run_records = records[start:end]
+    completed = [
+        row
+        for row in run_records
+        if row.get("type") == "turn_completed"
+        or (
+            row.get("type") == "recovery_completed"
+            and row.get("provider_run_id") == run_id
+        )
+    ]
+    reason = "failed" if require_error else "assumed-stopped"
+    if completed:
+        if not allow_empty_answer:
+            raise CheckpointError("The requested turn was already completed")
+        terminal = completed[-1]
+        answer = (
+            (terminal.get("db_turn") or {}).get("response")
+            if terminal["type"] == "turn_completed"
+            else terminal.get("answer")
+        )
+        if not isinstance(answer, str) or answer.strip():
+            raise CheckpointError("The completed answer is not demonstrably empty")
+        reason = "empty-answer"
+    elif require_error and not any(
         r.get("type") == "provider_error" and r.get("provider_run_id") == run_id
-        for r in records
+        for r in run_records
     ):
         raise CheckpointError(
             "The run has no recorded provider error. Do not resume an active "
-            "or successfully completed request (use --allow-interrupted only "
+            "or successfully completed request (use --assume-stopped only "
             "after confirming it has stopped)."
         )
-    start_time = float(request.get("timestamp") or 0)
-    if any(
-        r.get("type") == "turn_completed"
-        and float(r.get("timestamp") or 0) >= start_time
-        for r in records
-    ):
-        raise CheckpointError("The requested turn was already completed")
-
     pointers = [
         r
-        for r in records
+        for r in run_records
         if r.get("type") == "provider_tool_checkpoint"
         and r.get("provider_run_id") == run_id
     ]
@@ -264,15 +304,23 @@ def load_recovery(
             "only captured tool status lines and cannot recreate missing results."
         )
     checkpoints: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
     for pointer in pointers:
         call_id = pointer.get("call_id")
         if not isinstance(call_id, str) or not call_id:
             raise CheckpointError("Invalid checkpoint call ID")
+        checkpoint = _load_checkpoint(conversation_id, pointer)
         if call_id in seen:
+            if checkpoint != seen[call_id]:
+                raise CheckpointError("Conflicting checkpoint records for call ID")
             continue
-        checkpoints.append(_load_checkpoint(conversation_id, pointer))
-        seen.add(call_id)
+        checkpoints.append(checkpoint)
+        seen[call_id] = checkpoint
+    inherited = (request.get("recovery") or {}).get("inherited_checkpoint_count")
+    if inherited is not None and inherited != sum(
+        "inherited_from" in checkpoint for checkpoint in checkpoints
+    ):
+        raise CheckpointError("Incomplete inherited checkpoint set")
     messages = request.get("messages")
     if not isinstance(messages, list) or not messages:
         raise CheckpointError("The original request has no replayable message history")
@@ -283,6 +331,7 @@ def load_recovery(
         "provider_run_id": run_id,
         "request": request,
         "checkpoints": checkpoints,
+        "recovery_reason": reason,
     }
 
 
@@ -311,6 +360,36 @@ def build_resume_messages(
             raise CheckpointError("Tool arguments are not a JSON object")
         name = item["name"]
         call_id = item["call_id"]
+        output = item["output"]
+        content = (
+            output
+            if isinstance(output, str)
+            else json.dumps(output, ensure_ascii=False)
+        )
+        # A failed recovery's original request already contains inherited pairs.
+        # Verify them against its own sidecars instead of appending duplicates.
+        prior_calls = [
+            call
+            for message in messages
+            if message.get("role") == "assistant"
+            for call in message.get("tool_calls", [])
+            if call.get("id") == call_id
+        ]
+        prior_results = [
+            message
+            for message in messages
+            if message.get("role") == "tool" and message.get("tool_call_id") == call_id
+        ]
+        if prior_calls or prior_results:
+            if (
+                len(prior_calls) != 1
+                or len(prior_results) != 1
+                or prior_calls[0].get("function")
+                != {"name": name, "arguments": arguments}
+                or prior_results[0].get("content") != content
+            ):
+                raise CheckpointError("Conflicting tool checkpoint and message history")
+            continue
         messages.append(
             {
                 "role": "assistant",
@@ -323,12 +402,6 @@ def build_resume_messages(
                     }
                 ],
             }
-        )
-        output = item["output"]
-        content = (
-            output
-            if isinstance(output, str)
-            else json.dumps(output, ensure_ascii=False)
         )
         messages.append(
             {
@@ -350,7 +423,7 @@ def build_resume_messages(
             "content": (
                 "Continue the interrupted investigation using the exact completed "
                 "tool-call results above. These results were durably checkpointed "
-                "before the prior provider connection failed. Do not assume the "
+                "during the previous attempt. Do not assume the "
                 "old remote task is still running. Do not repeat completed searches. "
                 + mode
                 + "Separate verified observations from hypotheses, retain source "

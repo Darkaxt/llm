@@ -186,6 +186,276 @@ def test_recovery_can_explicitly_assume_process_killed(recovery_journal):
     assert len(load_recovery(cid, require_error=False)["checkpoints"]) == 2
 
 
+@pytest.mark.parametrize("answer", ["", " \n", "A completed answer", None])
+def test_empty_answer_recovery_requires_explicit_known_empty_completion(
+    recovery_journal, answer
+):
+    cid, rid, _ = recovery_journal
+    _save_two_checkpoints(cid, rid)
+    append_record(
+        cid,
+        {"type": "turn_completed", "db_turn": {"response": answer}},
+    )
+    with pytest.raises(CheckpointError):
+        load_recovery(cid)
+    if isinstance(answer, str) and not answer.strip():
+        recovered = load_recovery(cid, allow_empty_answer=True)
+        assert len(recovered["checkpoints"]) == 2
+        assert recovered["recovery_reason"] == "empty-answer"
+    else:
+        with pytest.raises(CheckpointError, match="not demonstrably empty"):
+            load_recovery(cid, allow_empty_answer=True)
+
+
+def test_select_older_failed_run_ignores_later_completed_turn(recovery_journal):
+    cid, rid, _ = recovery_journal
+    _save_two_checkpoints(cid, rid)
+    append_record(cid, {"type": "provider_error", "provider_run_id": rid})
+    append_record(
+        cid,
+        {
+            "type": "provider_request",
+            "provider": "openwebui",
+            "provider_run_id": rid + "-next",
+            "model": "glm-5.3",
+            "messages": [{"role": "user", "content": "Later task"}],
+        },
+    )
+    append_record(cid, {"type": "turn_completed", "db_turn": {"response": "Done"}})
+    recovered = load_recovery(cid, provider_run_id=rid)
+    assert len(recovered["checkpoints"]) == 2
+
+
+def _recovery_app(monkeypatch, runner):
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {"enabled_tool_ids": ["server:mcp:splunk-mcp"]},
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_client",
+        lambda *_: SimpleNamespace(
+            base_url="https://example.test", token="test-jwt", timeout=1200
+        ),
+    )
+    monkeypatch.setattr(openwebui, "_get_model_item", lambda *_: {"id": "glm-5.3"})
+    monkeypatch.setattr(openwebui, "_guard_server_mcp_version", lambda *_: None)
+    monkeypatch.setattr(openwebui, "run_chat_with_tools_with_files", runner)
+
+    @click.group()
+    def app():
+        pass
+
+    openwebui.register_commands(app)
+    return app
+
+
+def _records(cid):
+    return [json.loads(line) for line in journal_path(cid).read_text().splitlines()]
+
+
+def test_empty_answer_cli_reuses_builtin_and_mcp_results(monkeypatch, recovery_journal):
+    cid, rid, root = recovery_journal
+    _save_two_checkpoints(cid, rid)
+    save_tool_checkpoint(
+        cid,
+        rid,
+        {
+            "call_id": "kb-read",
+            "name": "view_knowledge_file",
+            "arguments": {},
+            "output": "Exact rule contents",
+        },
+    )
+    append_record(
+        cid,
+        {
+            "type": "assistant_stream",
+            "event_type": "reasoning",
+            "chunk": "UNVERIFIED_SCRATCH_NOTES",
+        },
+    )
+    append_record(cid, {"type": "turn_completed", "db_turn": {"response": ""}})
+    before = journal_path(cid).read_bytes()
+    calls = []
+
+    async def runner(**kwargs):
+        calls.append(kwargs)
+        assert kwargs["tool_ids"] == []
+        assert "UNVERIFIED_SCRATCH_NOTES" not in json.dumps(kwargs["messages"])
+        assert [
+            m["tool_call_id"] for m in kwargs["messages"] if m["role"] == "tool"
+        ] == ["call-q1", "call-q2", "kb-read"]
+        kwargs["on_text"]("Recovered evidence report")
+        return {"answer": "Recovered evidence report"}
+
+    app = _recovery_app(monkeypatch, runner)
+    dry = CliRunner().invoke(
+        app, ["openwebui", "resume", cid, "--empty-answer", "--dry-run"]
+    )
+    assert dry.exit_code == 0, dry.output
+    assert json.loads(dry.output)["checkpointed_calls"] == 3
+    assert calls == []
+    assert journal_path(cid).read_bytes() == before
+    result = CliRunner().invoke(app, ["openwebui", "resume", cid, "--empty-answer"])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 1
+    child = next(
+        r["recovery_conversation_id"]
+        for r in _records(cid)
+        if r["type"] == "recovery_started"
+    )
+    inherited = [r for r in _records(child) if r["type"] == "provider_tool_checkpoint"]
+    assert len(inherited) == 3
+    assert all(r["executed_in_this_run"] is False for r in inherited)
+    assert all(r["inherited_from"]["conversation_id"] == cid for r in inherited)
+    for pointer in inherited:
+        saved = json.loads((root / pointer["checkpoint_file"]).read_text())
+        assert saved["inherited_from"] == pointer["inherited_from"]
+    assert journal_path(cid).read_bytes().startswith(before)
+    report = journal_path(child).with_suffix(".html").read_text("utf-8")
+    assert "Exact rule contents" in report
+    assert "Inherited from conversation:" in report
+    assert "not executed in this recovery request" in report
+    assert "Inherited from conversation:" in result.output
+
+
+def test_failed_recovery_preserves_inherited_and_new_results_without_duplicates(
+    monkeypatch, recovery_journal
+):
+    cid, rid, root = recovery_journal
+    source = _save_two_checkpoints(cid, rid)
+    append_record(
+        cid,
+        {"type": "provider_error", "provider_run_id": rid, "error": "lost connection"},
+    )
+    calls = []
+
+    async def runner(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            kwargs["on_checkpoint"](
+                {
+                    "call_id": "new-q3",
+                    "name": "splunk-mcp_splunk_run_query",
+                    "arguments": {"query": "index=other | stats count"},
+                    "output": {"results": [{"count": 7}]},
+                }
+            )
+            raise openwebui_socket.APIError("second connection lost")
+        assert kwargs["tool_ids"] == []
+        tools = [m for m in kwargs["messages"] if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tools] == ["call-q1", "call-q2", "new-q3"]
+        assert json.loads(tools[-1]["content"])["results"] == [{"count": 7}]
+        kwargs["on_text"]("Final report")
+        return {"answer": "Final report"}
+
+    app = _recovery_app(monkeypatch, runner)
+    first = CliRunner().invoke(
+        app, ["openwebui", "resume", cid, "--allow-new-searches"]
+    )
+    assert first.exit_code == 1, first.output
+    child = next(
+        r["recovery_conversation_id"]
+        for r in _records(cid)
+        if r["type"] == "recovery_started"
+    )
+    # Recovery owns independent copies: original sidecars are no longer needed.
+    for pointer in source:
+        (root / pointer["checkpoint_file"]).unlink()
+    recovered = load_recovery(child)
+    assert len(recovered["checkpoints"]) == 3
+    second = CliRunner().invoke(app, ["openwebui", "resume", child])
+    assert second.exit_code == 0, second.output
+    assert len(calls) == 2
+    with pytest.raises(CheckpointError, match="already completed"):
+        grandchild = next(
+            r["recovery_conversation_id"]
+            for r in _records(child)
+            if r["type"] == "recovery_started"
+        )
+        load_recovery(grandchild, require_error=False)
+
+
+def test_checkpoint_history_conflict_is_not_silently_duplicated(recovery_journal):
+    cid, rid, _ = recovery_journal
+    _save_two_checkpoints(cid, rid)
+    append_record(cid, {"type": "provider_error", "provider_run_id": rid})
+    recovered = load_recovery(cid)
+    history = build_resume_messages(recovered)
+    recovered["request"]["messages"] = history
+    assert len(build_resume_messages(recovered)) == len(history) + 1
+    recovered["request"]["messages"][3]["content"] = "Conflicting result"
+    with pytest.raises(CheckpointError, match="Conflicting.*history"):
+        build_resume_messages(recovered)
+
+
+def test_empty_answer_option_does_not_recover_active_or_tool_free_run(recovery_journal):
+    cid, _rid, _ = recovery_journal
+    with pytest.raises(CheckpointError, match="no recorded provider error"):
+        load_recovery(cid, allow_empty_answer=True)
+    append_record(cid, {"type": "turn_completed", "db_turn": {"response": ""}})
+    with pytest.raises(CheckpointError, match="No complete native tool checkpoints"):
+        load_recovery(cid, allow_empty_answer=True)
+
+
+def test_empty_recovery_response_is_failed_but_evidence_survives(
+    monkeypatch, recovery_journal
+):
+    cid, rid, _ = recovery_journal
+    _save_two_checkpoints(cid, rid)
+    append_record(cid, {"type": "provider_error", "provider_run_id": rid})
+
+    async def runner(**kwargs):
+        return {"answer": ""}
+
+    app = _recovery_app(monkeypatch, runner)
+    result = CliRunner().invoke(app, ["openwebui", "resume", cid])
+    assert result.exit_code == 1
+    assert "Recovery returned no final answer" in result.output
+    child = next(
+        r["recovery_conversation_id"]
+        for r in _records(cid)
+        if r["type"] == "recovery_started"
+    )
+    assert len(load_recovery(child)["checkpoints"]) == 2
+    assert not any(r["type"] == "recovery_completed" for r in _records(child))
+
+
+def test_incomplete_checkpoint_inheritance_refuses_model_and_further_recovery(
+    monkeypatch, recovery_journal
+):
+    cid, rid, _ = recovery_journal
+    _save_two_checkpoints(cid, rid)
+    append_record(cid, {"type": "provider_error", "provider_run_id": rid})
+    count = 0
+
+    def partial_copy(*args, **kwargs):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise CheckpointError("Synthetic disk failure during copy")
+        return save_tool_checkpoint(*args, **kwargs)
+
+    async def runner(**kwargs):
+        pytest.fail("Model must not be called after incomplete checkpoint copy")
+
+    app = _recovery_app(monkeypatch, runner)
+    monkeypatch.setattr(openwebui, "save_tool_checkpoint", partial_copy)
+    result = CliRunner().invoke(app, ["openwebui", "resume", cid])
+    assert result.exit_code == 1, result.output
+    assert "Synthetic disk failure" in result.output
+    child = next(
+        r["recovery_conversation_id"]
+        for r in _records(cid)
+        if r["type"] == "recovery_started"
+    )
+    with pytest.raises(CheckpointError, match="Incomplete inherited checkpoint set"):
+        load_recovery(child)
+    assert len(load_recovery(cid)["checkpoints"]) == 2
+
+
 def test_native_checkpoint_emitted_once_after_full_arguments_and_result():
     state = {
         "tool_done": {},

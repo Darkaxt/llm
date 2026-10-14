@@ -1104,10 +1104,22 @@ Options:
   -h, --help  Show this message and exit.
 
 Commands:
-  check      Run synthetic model, streaming and function-call checks; write...
-  knowledge  Assess and remember an existing local TIDE folder, without...
-  models     Discover and cache actual model IDs for a profile.
-  profile    Manage local APISIX connection profiles.
+  check          Run synthetic model, streaming and function-call checks;...
+  knowledge      Assess and remember an existing local TIDE folder, without...
+  models         Discover and cache actual model IDs for a profile.
+  profile        Manage local APISIX connection profiles.
+  trace-summary  Summarize a local raw HTTP trace without printing prompt...
+```
+
+(help-apisix-trace-summary)=
+#### llm apisix trace-summary --help
+```
+Usage: llm apisix trace-summary [OPTIONS] TRACE
+
+  Summarize a local raw HTTP trace without printing prompt or response text.
+
+Options:
+  -h, --help  Show this message and exit.
 ```
 
 (help-apisix-profile)=
@@ -1259,14 +1271,18 @@ Usage: llm openwebui resume [OPTIONS] CONVERSATION_ID
   default: no MCP tools or other server builtins are available.
 
 Options:
-  --provider-run-id TEXT  Select an earlier failed provider run from this
-                          journal
-  --allow-new-searches    Permit additional MCP calls; duplicate queries cannot
-                          be prevented remotely
-  --assume-stopped        Recover a process-killed run without a provider_error
-                          (only if the task is stopped)
-  --dry-run               Verify checkpoints; do not contact the model
-  -h, --help              Show this message and exit.
+  --provider-run-id TEXT          Select an earlier failed provider run from
+                                  this journal
+  --allow-new-searches            Permit additional MCP calls; duplicate queries
+                                  cannot be prevented remotely
+  --assume-stopped                Recover a process-killed run without a
+                                  provider_error (only if the task is stopped)
+  --dry-run                       Verify checkpoints; do not contact the model
+  --empty-answer                  Recover a completed turn with a recorded empty
+                                  answer and tool checkpoints
+  --keep-awake / --no-keep-awake  Prevent Windows idle sleep during this
+                                  recovery request
+  -h, --help                      Show this message and exit.
 ```
 
 (help-openwebui-models)=
