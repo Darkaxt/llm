@@ -92,7 +92,7 @@ class _OpenWebUIStatusBar:
             normalized = normalized[: max(1, available - 1)] + "…"
         return prefix + normalized
 
-    def update(self, text: str, *, kind: str = "status") -> None:
+    def update(self, text: str, *, kind: str = "status", defer: bool = False) -> None:
         with self._lock:
             self.current = str(text)
             if kind == "tool":
@@ -100,6 +100,10 @@ class _OpenWebUIStatusBar:
                 click.echo(
                     chat_style(f"[Open WebUI tool] {text}", fg=TOOL_COLOR), err=True
                 )
+                return
+            if self.enabled and defer:
+                # The transient line shares the output cursor. Never move that
+                # cursor away from an unfinished word just to show a heartbeat.
                 return
             if not self.enabled:
                 prefix = "[Open WebUI tool]" if kind == "tool" else "[Open WebUI]"
@@ -3127,7 +3131,7 @@ class OpenWebUIModel(llm.Model):
         def on_reasoning(fragment: str) -> None:
             events.put(("reasoning", fragment))
 
-        def on_tool(line: str) -> None:
+        def on_tool(line: str, *, pointer: dict[str, Any] | None = None) -> None:
             tool_activity.append(line)
             journal_provider(
                 {
@@ -3136,7 +3140,7 @@ class OpenWebUIModel(llm.Model):
                     "display": False,
                 }
             )
-            events.put(("tool", line))
+            events.put(("tool_result", (line, pointer)) if pointer else ("tool", line))
 
         def on_source(record: dict[str, Any]) -> None:
             # Legacy tool evidence is sourced before answer generation.
@@ -3150,7 +3154,7 @@ class OpenWebUIModel(llm.Model):
                 pointer = save_tool_checkpoint(
                     conversation.id, provider_run_id, checkpoint
                 )
-                on_tool(checkpoint_notice(checkpoint, pointer))
+                on_tool(checkpoint_notice(checkpoint, pointer), pointer=pointer)
 
         def on_status(line: str) -> None:
             status_activity.append(line)
@@ -3289,23 +3293,32 @@ class OpenWebUIModel(llm.Model):
                             ("\n", "\r")
                         )
                         yield StreamEvent(type="reasoning", chunk=chunk)
-                elif kind in ("tool", "status"):
-                    if output_line_open:
+                elif kind in ("tool", "tool_result", "status"):
+                    is_tool = kind != "status"
+                    if output_line_open and (is_tool or not status_bar.enabled):
                         click.echo("", err=True)
                         output_line_open = False
                     # Source callbacks run in the worker. Mirror only the
                     # consumed display event to preserve terminal order in HTML.
-                    journal_provider(
-                        {
-                            "type": (
-                                "tool_display" if kind == "tool" else "status_display"
-                            ),
-                            "tool" if kind == "tool" else "status": str(payload),
-                        }
-                    )
+                    if kind == "tool_result":
+                        line, pointer = payload
+                        journal_provider({**pointer, "type": "tool_result_display"})
+                    else:
+                        line = str(payload)
+                        journal_provider(
+                            {
+                                "type": (
+                                    "tool_display"
+                                    if kind == "tool"
+                                    else "status_display"
+                                ),
+                                "tool" if is_tool else "status": line,
+                            }
+                        )
                     status_bar.update(
-                        str(payload),
-                        kind="tool" if kind == "tool" else "status",
+                        line,
+                        kind="tool" if is_tool else "status",
+                        defer=output_line_open,
                     )
                 elif kind == "error":
                     status_bar.clear()
@@ -3720,25 +3733,29 @@ def register_commands(cli):
             )
             output_line_open = bool(chunk) and not chunk.endswith(("\n", "\r"))
 
-        def on_tool(line: str) -> None:
+        def on_tool(line: str, *, pointer: dict[str, Any] | None = None) -> None:
             nonlocal output_line_open
             if output_line_open:
                 click.echo("", err=True)
                 output_line_open = False
-            journal({"type": "provider_tool", "tool": line})
+            journal(
+                {**pointer, "type": "tool_result_display"}
+                if pointer
+                else {"type": "provider_tool", "tool": line}
+            )
             status_bar.update(line, kind="tool")
 
         def on_status(line: str) -> None:
             nonlocal output_line_open
-            if output_line_open:
+            if output_line_open and not status_bar.enabled:
                 click.echo("", err=True)
                 output_line_open = False
             journal({"type": "provider_status", "status": line})
-            status_bar.update(line)
+            status_bar.update(line, defer=output_line_open)
 
         def on_checkpoint(item: dict[str, Any]) -> None:
             pointer = save_tool_checkpoint(new_id, run_id, item)
-            on_tool(checkpoint_notice(item, pointer))
+            on_tool(checkpoint_notice(item, pointer), pointer=pointer)
 
         def on_source(source: dict[str, Any]) -> None:
             journal({"type": "provider_tool_source", **source})

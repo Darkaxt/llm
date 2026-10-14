@@ -352,8 +352,9 @@ def test_recovery_cli_dry_run_does_not_connect(monkeypatch, recovery_journal):
 
 
 @pytest.mark.parametrize("allow_new", [False, True])
+@pytest.mark.parametrize("tty", [False, True])
 def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
-    monkeypatch, recovery_journal, allow_new
+    monkeypatch, recovery_journal, allow_new, tty
 ):
     cid, rid, _root = recovery_journal
     _save_two_checkpoints(cid, rid)
@@ -388,10 +389,31 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
         openwebui, "_guard_server_mcp_version", lambda *args: ("0.11.3", True)
     )
     calls = []
+    original_init = openwebui._OpenWebUIStatusBar.__init__
+
+    def status_init(self):
+        original_init(self)
+        self.enabled = tty
+
+    monkeypatch.setattr(openwebui._OpenWebUIStatusBar, "__init__", status_init)
 
     async def fake_runner(**kwargs):
         calls.append(kwargs)
-        kwargs["on_text"]("Recovered answer")
+        kwargs["on_reasoning"]("Recovered rea")
+        kwargs["on_status"]("waiting for model (15s phase)")
+        kwargs["on_reasoning"]("soning")
+        if allow_new:
+            kwargs["on_checkpoint"](
+                {
+                    "call_id": "new-call",
+                    "name": "new-search",
+                    "arguments": {},
+                    "output": "recovered result " * 200 + "FULL_RECOVERY_RESULT",
+                }
+            )
+        kwargs["on_text"]("Recovered ans")
+        kwargs["on_status"]("waiting for model (30s phase)")
+        kwargs["on_text"]("wer")
         return {
             "answer": "Recovered answer",
             "native_checkpoint_count": 0,
@@ -421,7 +443,10 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
     else:
         assert wire["tool_ids"] == []
         assert wire["params"]["function_calling"] == "legacy"
-    assert "Recovered answer" in output.output
+    assert "Recovered answer" in output.stdout
+    if tty:
+        assert "Recovered reasoning" in click.unstyle(output.output)
+        assert "Recovered answer" in click.unstyle(output.output)
     # A new journal is created, preserving the source journal untouched.
     source_records = [
         json.loads(line) for line in journal_path(cid).read_text().splitlines()
@@ -436,6 +461,14 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
     ]
     assert any(row.get("type") == "recovery_completed" for row in new_records)
     assert any(row.get("type") == "provider_request" for row in new_records)
+    if allow_new:
+        assert "Result preview:" in output.output
+        assert "[truncated" in output.output
+        assert "FULL_RECOVERY_RESULT" not in output.output
+        report = journal_path(recovered_id).with_suffix(".html").read_text("utf-8")
+        assert '<details class="tool-result">' in report
+        assert "FULL_RECOVERY_RESULT" in report
+        assert report.index("FULL_RECOVERY_RESULT") < report.index("Recovered answer")
 
 
 def test_recovery_ignores_only_truncated_final_journal_line(recovery_journal):

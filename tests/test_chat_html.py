@@ -1,8 +1,11 @@
+import html
 import json
+from html.parser import HTMLParser
 from pathlib import Path
 from types import SimpleNamespace
 
 import click
+import pytest
 from click.testing import CliRunner
 
 import llm.cli
@@ -206,7 +209,24 @@ def test_html_stream_updates_do_not_read_or_rewrite_history(tmp_path, monkeypatc
     assert sum(writes) < 2000
 
 
-def test_provider_tools_are_inline_auditable_and_in_html(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "tool_output",
+    [
+        "timestamp: 2026-10-14T12:00:00Z",
+        "begin " + "large result " * 300 + "END_OF_RESULT",
+        "\n".join(f"result line {i}" for i in range(40)),
+        {
+            "content": [{"type": "text", "text": "<script>unsafe</script>"}],
+            "extra": [1, None],
+        },
+        "",
+        None,
+    ],
+    ids=["timestamp", "long", "many-lines", "structured", "empty", "null"],
+)
+def test_provider_tools_are_inline_auditable_and_in_html(
+    tmp_path, monkeypatch, tool_output
+):
     from llm.default_plugins import openwebui
 
     monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
@@ -252,7 +272,7 @@ def test_provider_tools_are_inline_auditable_and_in_html(tmp_path, monkeypatch):
                     "query": "index=synthetic | stats count",
                     "earliest": "-1h",
                 },
-                "output": "private raw result",
+                "output": tool_output,
             }
         )
         kwargs["on_status"]("waiting for model continuation")
@@ -276,6 +296,24 @@ def test_provider_tools_are_inline_auditable_and_in_html(tmp_path, monkeypatch):
     result = CliRunner().invoke(app, catch_exceptions=False)
     assert "index=synthetic | stats count" in result.stderr
     assert "Result checkpoint:" in result.stderr
+    assert "Result preview:" in result.stderr
+    result_text = (
+        tool_output
+        if isinstance(tool_output, str)
+        else json.dumps(tool_output, ensure_ascii=False, indent=2)
+    )
+    if len(result_text) > 2000 or len(result_text.splitlines()) > 20:
+        preview = result.stderr.split("Result preview:\n", 1)[1].split(
+            "\n[truncated", 1
+        )[0]
+        assert len(preview) <= 2000
+        assert len(preview.splitlines()) <= 20
+        assert "[truncated; full result in HTML and checkpoint above]" in result.stderr
+        assert "END_OF_RESULT" not in result.stderr
+        assert "result line 39" not in result.stderr
+    else:
+        assert result_text in result.stderr
+        assert "[truncated" not in result.stderr
     assert (
         result.output.index("Check the source")
         < result.output.index("Arguments:")
@@ -285,10 +323,169 @@ def test_provider_tools_are_inline_auditable_and_in_html(tmp_path, monkeypatch):
     assert 'class="tool"' in report
     assert "index=synthetic | stats count" in report
     assert "Result checkpoint:" in report
-    assert "private raw result" not in report
+    assert html.escape(result_text, quote=True) in report
+    assert "[truncated" not in report
+    assert "<script>" not in report
+    assert '<details class="tool-result">' in report
+    assert "<summary>Full result · splunk_search</summary>" in report
+
+    class DetailsParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.panels = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "details":
+                self.panels.append(dict(attrs))
+
+    parser = DetailsParser()
+    parser.feed(report)
+    assert parser.panels == [{"class": "tool-metadata"}, {"class": "tool-result"}]
+    assert "<summary>Call metadata</summary>" in report
     assert "#c4779e" in report
     assert (
         report.index("Check the source")
         < report.index("Arguments:")
         < report.index("Final answer")
     )
+    from llm import chat_html
+
+    chat_html._reports.clear()
+    ensure_session(conversation.id, model=conversation.model.model_id)
+    rebuilt = (tmp_path / f"{conversation.id}.html").read_text("utf-8")
+    assert rebuilt.count('<details class="tool-result">') == 1
+    assert html.escape(result_text, quote=True) in rebuilt
+    # A repeated display record for the same returned call cannot add a second
+    # result panel when the report is regenerated.
+    records = [
+        json.loads(line)
+        for line in (tmp_path / f"{conversation.id}.jsonl")
+        .read_text("utf-8")
+        .splitlines()
+    ]
+    pointer = next(row for row in records if row.get("type") == "tool_result_display")
+    append_record(conversation.id, pointer)
+    assert (tmp_path / f"{conversation.id}.html").read_text("utf-8").count(
+        '<details class="tool-result">'
+    ) == 1
+
+
+def test_corrupt_result_does_not_break_journal_or_replace_readable_report(
+    tmp_path, monkeypatch, capsys
+):
+    from llm.openwebui_recovery import save_tool_checkpoint
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    ensure_session("corrupt-result", model="test")
+    pointer = save_tool_checkpoint(
+        "corrupt-result",
+        "run",
+        {"call_id": "call", "name": "tool", "arguments": {}, "output": "real result"},
+    )
+    report = tmp_path / "corrupt-result.html"
+    previous = report.read_bytes()
+    (tmp_path / pointer["checkpoint_file"]).write_text("tampered", encoding="utf-8")
+    append_record("corrupt-result", {**pointer, "type": "tool_result_display"})
+    append_record(
+        "corrupt-result",
+        {"type": "assistant_stream", "event_type": "text", "chunk": "continues"},
+        durable=True,
+    )
+    assert report.read_bytes() == previous
+    assert "tampered" not in report.read_text("utf-8")
+    assert "continues" in (tmp_path / "corrupt-result.jsonl").read_text("utf-8")
+    assert "HTML report unavailable:" in capsys.readouterr().err
+
+
+def test_existing_completed_call_notice_rebuilds_with_full_result(
+    tmp_path, monkeypatch
+):
+    from llm import chat_html
+    from llm.chat_ui import checkpoint_notice
+    from llm.openwebui_recovery import save_tool_checkpoint
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    ensure_session("old-notice", model="test")
+    call = {
+        "call_id": "call",
+        "name": "get_current_timestamp",
+        "arguments": {},
+        "output": {"timestamp": "2026-10-14T12:39:07Z"},
+    }
+    # The worker can save a checkpoint before the UI has consumed reasoning.
+    pointer = save_tool_checkpoint("old-notice", "run", call)
+    notice = checkpoint_notice(call, pointer, preview=False)
+    append_record(
+        "old-notice", {"type": "provider_tool", "tool": notice, "display": False}
+    )
+    append_record(
+        "old-notice",
+        {"type": "assistant_stream", "event_type": "reasoning", "chunk": "Before call"},
+    )
+    append_record("old-notice", {"type": "tool_display", "tool": notice})
+    append_record(
+        "old-notice",
+        {"type": "assistant_stream", "event_type": "text", "chunk": "After call"},
+    )
+    chat_html._reports.clear()
+    ensure_session("old-notice", model="test")
+    report = (tmp_path / "old-notice.html").read_text("utf-8")
+    assert report.count('<details class="tool-result">') == 1
+    assert (
+        report.index("Before call")
+        < report.index("2026-10-14T12:39:07Z")
+        < report.index("After call")
+    )
+    assert "<summary>Call metadata</summary>" in report
+
+
+def test_tty_status_events_do_not_split_streamed_words(tmp_path, monkeypatch):
+    from llm.default_plugins import openwebui
+
+    monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        openwebui,
+        "_load_config",
+        lambda: {"enabled_tool_ids": ["server:mcp:splunk-mcp"]},
+    )
+    monkeypatch.setattr(
+        openwebui,
+        "_client",
+        lambda _: SimpleNamespace(
+            base_url="https://example.test", token="jwt", timeout=1200
+        ),
+    )
+    monkeypatch.setattr(openwebui, "_get_model_item", lambda *args: {"id": "glm-5.3"})
+    monkeypatch.setattr(openwebui, "_server_config", lambda _: {"version": "0.12.0"})
+    monkeypatch.setattr(openwebui, "_enabled_knowledge_items", lambda *args: [])
+    monkeypatch.setattr(openwebui, "_escape_pressed", lambda: False)
+    original_init = openwebui._OpenWebUIStatusBar.__init__
+
+    def tty_init(self):
+        original_init(self)
+        self.enabled = True
+
+    monkeypatch.setattr(openwebui._OpenWebUIStatusBar, "__init__", tty_init)
+
+    async def runner(**kwargs):
+        for kind, chunks in (
+            ("reasoning", ["Current ", "tim", "e 2026", "-10-14."]),
+            ("text", ["Final ", "ans", "wer."]),
+        ):
+            for chunk in chunks:
+                kwargs["on_" + kind](chunk)
+                kwargs["on_status"]("waiting for model (15s phase)")
+        return {"answer": "Final answer.", "reasoning": "Current time 2026-10-14."}
+
+    monkeypatch.setattr(openwebui, "run_chat_with_tools_with_files", runner)
+    conversation = openwebui.OpenWebUIModel("glm-5.3").conversation()
+
+    @click.command()
+    def app():
+        llm.cli.display_stream_events(
+            conversation.prompt("synthetic").stream_events(), chat=True
+        )
+
+    result = CliRunner().invoke(app, catch_exceptions=False)
+    assert "Current time 2026-10-14." in click.unstyle(result.output)
+    assert "Final answer." in click.unstyle(result.output)

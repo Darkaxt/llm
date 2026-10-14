@@ -17,7 +17,9 @@ from .chat_ui import (
     REASONING_COLOR,
     TOOL_COLOR,
     USER_COLOR,
+    checkpoint_notice,
     echo_program,
+    tool_output_text,
 )
 
 _reports: dict[Path, _HTMLReport] = {}
@@ -37,6 +39,9 @@ def report_path(journal: Path) -> Path:
 class _HTMLReport:
     def __init__(self, journal: Path, *, path: Path):
         self.path = path
+        self.conversation_id = journal.stem
+        self.tool_results: set[tuple[str, str]] = set()
+        self.checkpoints: dict[str, dict[str, Any]] = {}
         self.open_kind: str | None = None
         self.turn_id: str | None = None
         self.show_reasoning = True
@@ -68,6 +73,11 @@ main{{padding-bottom:10rem}}section{{margin:0 0 24px;border-left:2px solid curre
 h2{{font-size:14px;line-height:1.4;margin:0 0 8px}}pre{{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}}
 .program{{color:var(--program);margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}}
 .user{{color:var(--user)}}.answer{{color:var(--answer)}}.reasoning{{color:var(--reasoning)}}.tool{{color:var(--tool)}}
+.tool details{{margin-top:12px;border:1px solid #615044;border-radius:4px}}
+.tool summary{{cursor:pointer;padding:10px 12px;overflow-wrap:anywhere}}
+.tool summary:focus-visible{{outline:2px solid var(--tool);outline-offset:2px}}
+.tool details[open] summary{{border-bottom:1px solid #615044}}
+.tool details pre{{padding:12px}}
 footer{{position:fixed;bottom:0;left:0;right:0;background:#262321;color:var(--program);border-top:1px solid #615044;padding:12px 24px;font-size:13px;max-height:30vh;overflow:auto}}
 footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anywhere}}footer small{{display:block;color:var(--reasoning)}}
 @media(max-width:600px){{header,main{{padding:16px}}main{{padding-bottom:10rem}}section{{padding-left:12px}}footer{{padding:10px 16px}}}}
@@ -100,6 +110,29 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
 
     def append(self, record: dict[str, Any]) -> None:
         kind = record.get("type")
+        if kind == "provider_tool_checkpoint":
+            self.checkpoints[record["checkpoint_file"]] = record
+            return
+        if (
+            kind in ("provider_tool", "tool_display")
+            and record.get("display") is not False
+        ):
+            # The previous client displayed this exact durable path in its
+            # completed-call notice. Upgrade that existing display position;
+            # source checkpoint timing alone cannot establish terminal order.
+            for line in str(record.get("tool", "")).splitlines():
+                if line.startswith("Result checkpoint: "):
+                    pointer = self.checkpoints.get(
+                        line.removeprefix("Result checkpoint: ")
+                    )
+                    if pointer is not None:
+                        record = {
+                            **pointer,
+                            "type": "tool_result_display",
+                            "timestamp": record.get("timestamp"),
+                        }
+                        kind = "tool_result_display"
+                    break
         fragment = ""
         if kind == "conversation":
             self.model = str(record.get("model") or "")
@@ -135,6 +168,30 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
                 + _text(record.get("text", ""))
                 + "</p>\n"
             )
+        elif kind == "tool_result_display":
+            # Import at use time: the checkpoint reader also uses the journal.
+            # Read the verified sidecar only once per returned call, never for
+            # each streamed token. Keep the full output out of the JSONL mirror.
+            from .openwebui_recovery import _load_checkpoint
+
+            checkpoint = _load_checkpoint(self.conversation_id, record)
+            identity = (checkpoint["provider_run_id"], checkpoint["call_id"])
+            if identity in self.tool_results:
+                return
+            fragment = (
+                self._close_block()
+                + '<section class="tool"><h2>'
+                + _text(checkpoint["name"])
+                + ' · returned result</h2><details class="tool-metadata">'
+                + "<summary>Call metadata</summary><pre>"
+                + _text(checkpoint_notice(checkpoint, record, preview=False))
+                + '</pre></details><details class="tool-result"><summary>Full result · '
+                + _text(checkpoint["name"])
+                + "</summary><pre>"
+                + _text(tool_output_text(checkpoint["output"]))
+                + "</pre></details></section>\n"
+            )
+            self.tool_results.add(identity)
         elif kind in ("provider_tool", "tool_display"):
             if record.get("display") is False:
                 return

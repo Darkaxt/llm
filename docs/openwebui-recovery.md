@@ -24,9 +24,14 @@ Tool activity remains inline in muted dark pink (`#c4779e`), so later status
 updates do not erase it. After a native result is durably checkpointed, its
 notice includes the actual tool name, call ID, full arguments and the saved
 result's relative path, byte count and SHA-256. A returned result is not a
-claim that its contents indicate success; inspect the checkpoint for the full
-output. Final arguments are shown with that returned result, not as an approval
-step before execution. Start/done notices remain visible as received.
+claim that its contents indicate success. A result preview follows, limited to
+2000 characters and 20 lines; a truncation marker points to the full HTML result
+and checkpoint. These are display limits only. Final arguments are shown with
+that returned result, not as an approval step before execution. Start/done
+notices remain visible as received.
+Transient status redraws wait while an interactive stream has an unfinished
+line, so heartbeats cannot split a streamed word or sentence. Status remains
+recorded in the journal and HTML footer; tools still start on their own line.
 
 ## Live HTML conversation report
 
@@ -42,10 +47,21 @@ streamed chunks join without per-token line breaks. `--hide-reasoning` also
 hides reasoning in the report for that session. The dark report palette remains
 available when terminal colors are disabled using `NO_COLOR`.
 
-The full visible conversation, reasoning and tool arguments may contain incident
-data. Review them before sharing the HTML with your team. Hidden provider request
-metadata and raw result sidecars are not embedded. Keep matching checkpoints
-separately when your team needs to inspect complete returned results.
+Each completed native tool call includes its **full returned output** in a
+collapsed-by-default **Full result** panel. Click the summary (or focus it and
+press Enter/Space) to expand it. A separate collapsed **Call metadata** panel
+contains the call ID, full arguments, checkpoint path, size and digest.
+Structured results retain every field; strings remain intact. No scripts or
+sidecar access are needed to read a generated HTML
+file. The complete conversation, reasoning, arguments and returned outputs may
+contain incident data; review them before sharing. Hidden provider request
+metadata is not embedded. Raw sidecars remain the authoritative evidence, and
+must stay beside the journal for rebuilding full result panels. Missing/corrupt
+sidecars produce the same report error as other failed rebuilds; inference and
+journaling continue. Reopening also upgrades the previous client's completed-call
+notices at their original display positions when matching checkpoint files are
+present and verified. Older activity without a completed-call notice/result
+checkpoint remains a notice; it cannot supply a full returned output.
 
 Reports update incrementally without rewriting all earlier text for each chunk.
 Reopening a journal in a fresh process rebuilds its report and continues the

@@ -74,6 +74,9 @@ def test_status_bar_color_truncation_and_clear(monkeypatch, no_color):
     monkeypatch.setattr("sys.stdout", terminal)
     bar = _OpenWebUIStatusBar()
     monkeypatch.setattr(bar, "_width", lambda: 40)
+    bar.update("heartbeat during unfinished word", defer=True)
+    assert terminal.getvalue() == ""
+    assert bar.current == "heartbeat during unfinished word"
     bar.update("search " * 30)
     bar.clear()
     rendered = terminal.getvalue()

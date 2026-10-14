@@ -31,7 +31,16 @@ def echo_program(text: str, **kwargs) -> None:
     click.echo(chat_style(text), **kwargs)
 
 
-def checkpoint_notice(checkpoint: dict, pointer: dict) -> str:
+def tool_output_text(output) -> str:
+    """Keep string results intact and all structured result fields visible."""
+    return (
+        output
+        if isinstance(output, str)
+        else json.dumps(output, ensure_ascii=False, indent=2)
+    )
+
+
+def checkpoint_notice(checkpoint: dict, pointer: dict, *, preview: bool = True) -> str:
     """Render actual call arguments and its durably saved result reference."""
     arguments = checkpoint["arguments"]
     if isinstance(arguments, str):
@@ -41,9 +50,17 @@ def checkpoint_notice(checkpoint: dict, pointer: dict) -> str:
             pass
     if not isinstance(arguments, str):
         arguments = json.dumps(arguments, ensure_ascii=False, indent=2)
-    return (
+    notice = (
         f"↳ {checkpoint['name']} · returned result\n"
         f"Call ID: {checkpoint['call_id']}\nArguments:\n{arguments}\n"
         f"Result checkpoint: {pointer['checkpoint_file']}\n"
         f"Checkpoint: {pointer['size_bytes']} bytes · SHA-256 {pointer['sha256']}"
     )
+    if preview:
+        output = tool_output_text(checkpoint["output"])
+        # Display bounds only: the model and saved output remain untouched.
+        excerpt = "".join(output[:2000].splitlines(keepends=True)[:20])
+        notice += "\nResult preview:\n" + (excerpt or "(empty string)")
+        if len(excerpt) < len(output):
+            notice += "\n[truncated; full result in HTML and checkpoint above]"
+    return notice
