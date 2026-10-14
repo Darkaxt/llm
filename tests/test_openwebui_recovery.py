@@ -355,7 +355,7 @@ def test_recovery_cli_dry_run_does_not_connect(monkeypatch, recovery_journal):
 @pytest.mark.parametrize("tty", [False, True])
 @pytest.mark.parametrize("termination", ["complete", "signal", "server"])
 def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
-    monkeypatch, recovery_journal, allow_new, tty, termination
+    monkeypatch, recovery_journal, allow_new, tty, termination, html_transcript
 ):
     cid, rid, _root = recovery_journal
     _save_two_checkpoints(cid, rid)
@@ -496,7 +496,8 @@ def test_recovery_cli_uses_saved_evidence_without_replaying_queries(
         assert '<details class="tool-result">' in report
         assert "FULL_RECOVERY_RESULT" in report
         if termination == "complete":
-            assert report.index("FULL_RECOVERY_RESULT") < report.index(
+            transcript = html_transcript(report)
+            assert transcript.index("FULL_RECOVERY_RESULT") < transcript.index(
                 "Recovered answer"
             )
 

@@ -1,4 +1,3 @@
-import html
 import json
 from html.parser import HTMLParser
 from pathlib import Path
@@ -14,7 +13,7 @@ from llm.parts import StreamEvent
 
 
 def test_chat_html_updates_during_stream_and_preserves_visible_text(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, html_transcript
 ):
     monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
     prompts = iter(["hello <team>\n  second line", "quit"])
@@ -24,12 +23,14 @@ def test_chat_html_updates_during_stream_and_preserves_visible_text(
     class Response:
         def stream_events(self):
             assert report.exists()
-            assert "hello &lt;team&gt;\n  second line" in report.read_text("utf-8")
+            assert "hello <team>\n  second line" in html_transcript(
+                report.read_text("utf-8")
+            )
             append_record("live", {"type": "provider_status", "status": "working"})
             yield StreamEvent(type="reasoning", chunk="Think ")
-            assert "Think " in report.read_text("utf-8")
+            assert "Think " in html_transcript(report.read_text("utf-8"))
             yield StreamEvent(type="reasoning", chunk="carefully\nnext")
-            assert "Think carefully\nnext" in report.read_text("utf-8")
+            assert "Think carefully\nnext" in html_transcript(report.read_text("utf-8"))
             yield StreamEvent(type="text", chunk="Answer <script>alert(1)</script>")
             assert "Answer &lt;script&gt;alert(1)&lt;/script&gt;" in report.read_text(
                 "utf-8"
@@ -58,7 +59,9 @@ def test_chat_html_updates_during_stream_and_preserves_visible_text(
     assert "#aeb7c4" in html
 
 
-def test_journal_html_reopen_controls_and_current_status(tmp_path, monkeypatch):
+def test_journal_html_reopen_controls_and_current_status(
+    tmp_path, monkeypatch, html_transcript
+):
     from llm import chat_html
 
     monkeypatch.setenv("LLM_CHAT_EXPORT_DIR", str(tmp_path))
@@ -79,7 +82,8 @@ def test_journal_html_reopen_controls_and_current_status(tmp_path, monkeypatch):
     append_record("reopen", {"type": "provider_status", "status": "current-status"})
     path = tmp_path / "reopen.html"
     html = path.read_text("utf-8")
-    assert "old-status" not in html
+    assert "old-status" in html  # Preserved in the opt-in event view.
+    assert "old-status" not in html.split('<footer aria-label="Current status">')[1]
     assert "current-status" in html
     assert "hidden-secret" not in html
     assert "\x1b" not in html
@@ -91,9 +95,9 @@ def test_journal_html_reopen_controls_and_current_status(tmp_path, monkeypatch):
         "reopen", {"type": "assistant_stream", "event_type": "text", "chunk": " second"}
     )
     html = path.read_text("utf-8")
-    assert "first second" in html
+    assert "first second" in html_transcript(html)
     assert html.count("original") == 1
-    assert html.count("first second") == 1
+    assert html_transcript(html).count("first second") == 1
 
 
 def test_html_io_failure_does_not_break_durable_journal(tmp_path, monkeypatch, capsys):
@@ -225,7 +229,7 @@ def test_html_stream_updates_do_not_read_or_rewrite_history(tmp_path, monkeypatc
     ids=["timestamp", "long", "many-lines", "structured", "empty", "null"],
 )
 def test_provider_tools_are_inline_auditable_and_in_html(
-    tmp_path, monkeypatch, tool_output
+    tmp_path, monkeypatch, tool_output, html_transcript
 ):
     from llm.default_plugins import openwebui
 
@@ -322,7 +326,7 @@ def test_provider_tools_are_inline_auditable_and_in_html(
     assert 'class="tool"' in report
     assert "index=synthetic | stats count" in report
     assert "Result checkpoint:" in report
-    assert html.escape(result_text, quote=True) in report
+    assert result_text in html_transcript(report)
     assert "[truncated" not in report
     assert "<script>" not in report
     assert '<details class="tool-result">' in report
@@ -353,7 +357,7 @@ def test_provider_tools_are_inline_auditable_and_in_html(
     ensure_session(conversation.id, model=conversation.model.model_id)
     rebuilt = (tmp_path / f"{conversation.id}.html").read_text("utf-8")
     assert rebuilt.count('<details class="tool-result">') == 1
-    assert html.escape(result_text, quote=True) in rebuilt
+    assert result_text in html_transcript(rebuilt)
     # A repeated display record for the same returned call cannot add a second
     # result panel when the report is regenerated.
     records = [

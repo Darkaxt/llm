@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import re
 import tempfile
@@ -49,6 +50,9 @@ class _HTMLReport:
         self.status = "Conversation started"
         self.model = ""
         self.updated = ""
+        self.line_open = False
+        self.previous_timestamp: float | None = None
+        self.status_timing = ""
         colors = {
             key: "#{:02x}{:02x}{:02x}".format(*value)
             for key, value in (
@@ -72,7 +76,21 @@ header,main{{max-width:1100px;margin:auto;padding:24px}}header{{border-bottom:1p
 h1{{font-size:20px;margin:0 0 8px;color:var(--program)}}header p{{margin:0;overflow-wrap:anywhere}}
 main{{padding-bottom:10rem}}section{{margin:0 0 24px;border-left:2px solid currentColor;padding-left:16px}}
 h2{{font-size:14px;line-height:1.4;margin:0 0 8px}}pre{{font:inherit;white-space:pre-wrap;overflow-wrap:anywhere;margin:0}}
-.program{{color:var(--program);margin:0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}}
+.timed-lines{{white-space:normal}}
+.transcript-line{{display:grid;grid-template-columns:16rem minmax(0,1fr);gap:12px}}
+.line-content,.event-content{{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0}}
+.line-time,.event-time{{font-size:11px;line-height:1.5;color:var(--reasoning);user-select:none;white-space:normal;overflow-wrap:anywhere}}
+.event-gap{{display:block}}.event-time,.status-event{{display:none}}
+.timing-help{{max-width:1100px;margin:0 auto 16px;padding:0 24px;font-size:12px;color:var(--reasoning)}}
+#event-times{{margin-left:max(24px,calc((100% - 1052px)/2));accent-color:var(--program)}}
+label[for=event-times]{{cursor:pointer;color:var(--program);font-size:13px}}
+#event-times:focus-visible{{outline:2px solid var(--program);outline-offset:3px}}
+#event-times:checked ~ main .stream-lines .line-time{{display:none}}
+#event-times:checked ~ main .stream-event,#event-times:checked ~ main .status-event{{display:grid;grid-template-columns:16rem minmax(0,1fr);gap:12px}}
+#event-times:checked ~ main .event-time{{display:block}}
+#event-times:checked ~ main .stream-lines .transcript-line{{display:block}}
+#event-times:checked ~ main .status-event{{color:var(--program);font-size:13px}}
+.program{{color:var(--program);margin:0 0 12px;white-space:normal;overflow-wrap:anywhere}}
 .user{{color:var(--user)}}.answer{{color:var(--answer)}}.reasoning{{color:var(--reasoning)}}.tool{{color:var(--tool)}}
 .tool details{{margin-top:12px;border:1px solid #615044;border-radius:4px}}
 .tool summary{{cursor:pointer;padding:10px 12px;overflow-wrap:anywhere}}
@@ -81,10 +99,16 @@ h2{{font-size:14px;line-height:1.4;margin:0 0 8px}}pre{{font:inherit;white-space
 .tool details pre{{padding:12px}}
 footer{{position:fixed;bottom:0;left:0;right:0;background:#262321;color:var(--program);border-top:1px solid #615044;padding:12px 24px;font-size:13px;max-height:30vh;overflow:auto}}
 footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anywhere}}footer small{{display:block;color:var(--reasoning)}}
-@media(max-width:600px){{header,main{{padding:16px}}main{{padding-bottom:10rem}}section{{padding-left:12px}}footer{{padding:10px 16px}}}}
+@media(max-width:600px){{header,main{{padding:16px}}main{{padding-bottom:10rem}}section{{padding-left:12px}}footer{{padding:10px 16px}}
+.timing-help{{padding:0 16px}}#event-times{{margin-left:16px}}
+.transcript-line,#event-times:checked ~ main .stream-event,#event-times:checked ~ main .status-event{{grid-template-columns:minmax(0,1fr);gap:2px}}
+.line-time{{margin-top:6px}}.event-gap{{display:inline;margin-left:8px}}}}
 @media print{{:root{{color-scheme:light;background:white;color:#222}}footer{{position:static}}main{{padding-bottom:16px}}}}
 </style></head><body><header><h1>Conversation</h1>
-<p>{_text(journal.stem)}</p></header><main aria-label="Terminal conversation">
+<p>{_text(journal.stem)}</p></header>
+<p class="timing-help">UTC timestamps mark the first event contributing to each logical line. Δ is the gap from the previous visible event (including status), not computation time. Lines from one event share its timing; wrapped rows are not new events. Individual events shows chunk/status timing. Journal wall clocks can change.</p>
+<input type="checkbox" id="event-times"><label for="event-times"> Individual events</label>
+<main aria-label="Terminal conversation">
 """
         encoded = header.encode("utf-8")
         self.offset = len(encoded)
@@ -95,14 +119,99 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
         if self.open_kind is None:
             return ""
         self.open_kind = None
-        return "</pre></section>\n"
+        return self._close_line() + "</pre></section>\n"
+
+    def _close_line(self) -> str:
+        if not self.line_open:
+            return ""
+        self.line_open = False
+        return "</span></span>\n"
+
+    def _timing(self, record: dict[str, Any]) -> str:
+        value = record.get("timestamp")
+        stamp = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                if math.isfinite(value):
+                    stamp = datetime.fromtimestamp(value, timezone.utc)
+            except (ValueError, OverflowError, OSError):
+                pass
+        if stamp is None:
+            self.previous_timestamp = None
+            self.updated = "Time unavailable"
+            return 'Time unavailable<span class="event-gap">Δ unavailable</span>'
+        timestamp = stamp.timestamp()
+        self.updated = stamp.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3] + " UTC"
+        gap = "Δ unavailable (first event or previous time unavailable)"
+        if self.previous_timestamp is not None:
+            delta = timestamp - self.previous_timestamp
+            gap = (
+                f"Δ {delta:.3f}s"
+                if delta >= 0
+                else "Δ unavailable (clock moved backwards)"
+            )
+        self.previous_timestamp = timestamp
+        return (
+            f'<time datetime="{stamp.isoformat(timespec="milliseconds")}">{self.updated}</time>'
+            f'<span class="event-gap">{gap}</span>'
+        )
+
+    @staticmethod
+    def _lines(text: Any, timing: str) -> str:
+        return "\n".join(
+            '<span class="transcript-line"><span class="line-time">'
+            + timing
+            + '</span><span class="line-content">'
+            + _text(line)
+            + "</span></span>"
+            for line in str(text).split("\n")
+        )
+
+    def _stream(self, text: str, timing: str) -> str:
+        if not text:
+            return (
+                '<span class="status-event"><span class="event-time">'
+                + timing
+                + '</span><span class="event-content">Empty stream event</span></span>'
+            )
+        output = []
+        pieces = text.split("\n")
+        for index, piece in enumerate(pieces):
+            if index:
+                output.append(self._close_line())
+            if not piece and index == len(pieces) - 1:
+                continue
+            if not self.line_open:
+                output.append(
+                    '<span class="transcript-line"><span class="line-time">'
+                    + timing
+                    + '</span><span class="line-content">'
+                )
+                self.line_open = True
+            output.append(
+                '<span class="stream-event"><span class="event-time">'
+                + timing
+                + '</span><span class="event-content">'
+                + _text(piece)
+                + "</span></span>"
+            )
+        return "".join(output)
 
     def _footer(self) -> bytes:
-        closing = "</pre></section>\n" if self.open_kind is not None else ""
+        closing = (
+            ("</span></span>\n" if self.line_open else "") + "</pre></section>\n"
+            if self.open_kind is not None
+            else ""
+        )
         return (
             closing
             + '</main><footer aria-label="Current status"><div>'
             + _text(self.status)
+            + (
+                '<div class="line-time">' + self.status_timing + "</div>"
+                if self.status_timing
+                else ""
+            )
             + "<small>"
             + _text(self.model)
             + (" · Updated " + _text(self.updated) if self.updated else "")
@@ -141,8 +250,15 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
             self.show_reasoning = bool(record.get("show_reasoning", True))
             return
         elif kind == "user_message":
-            fragment = self._close_block() + '<section class="user"><h2>You</h2><pre>'
-            fragment += _text(record.get("prompt", "")) + "</pre></section>\n"
+            timing = self._timing(record)
+            fragment = (
+                self._close_block()
+                + '<section class="user"><h2>You</h2><pre class="timed-lines">'
+            )
+            fragment += (
+                self._lines(record.get("prompt", ""), timing) + "</pre></section>\n"
+            )
+            self.status_timing = timing
             self.status = "Waiting for response"
         elif kind == "assistant_stream":
             event = record.get("event_type")
@@ -155,19 +271,22 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
             if self.open_kind != role or self.turn_id != turn_id:
                 fragment = self._close_block()
                 label = "LLM" if role == "answer" else "LLM · Reasoning"
-                fragment += f'<section class="{role}"><h2>{label}</h2><pre>'
+                fragment += f'<section class="{role}"><h2>{label}</h2><pre class="timed-lines stream-lines">'
                 self.open_kind = role
                 self.turn_id = turn_id
-            fragment += _text(record.get("chunk", ""))
+            timing = self._timing(record)
+            fragment += self._stream(str(record.get("chunk", "")), timing)
+            self.status_timing = timing
             self.status = (
                 "Receiving reply" if role == "answer" else "Receiving reasoning"
             )
         elif kind == "program_message":
+            timing = self._timing(record)
             fragment = (
                 self._close_block()
-                + '<p class="program">'
-                + _text(record.get("text", ""))
-                + "</p>\n"
+                + '<div class="program">'
+                + self._lines(record.get("text", ""), timing)
+                + "</div>\n"
             )
         elif kind == "tool_result_display":
             # Import at use time: the checkpoint reader also uses the journal.
@@ -179,56 +298,86 @@ footer div{{max-width:1052px;margin:auto;white-space:pre-wrap;overflow-wrap:anyw
             identity = (checkpoint["provider_run_id"], checkpoint["call_id"])
             if identity in self.tool_results:
                 return
+            timing = self._timing(record)
             fragment = (
                 self._close_block()
                 + '<section class="tool"><h2>'
                 + _text(checkpoint["name"])
-                + ' · returned result</h2><details class="tool-metadata">'
-                + "<summary>Call metadata</summary><pre>"
-                + _text(checkpoint_notice(checkpoint, record, preview=False))
+                + ' · returned result</h2><div class="line-time">'
+                + timing
+                + '</div><details class="tool-metadata">'
+                + '<summary>Call metadata</summary><pre class="timed-lines">'
+                + self._lines(
+                    checkpoint_notice(checkpoint, record, preview=False), timing
+                )
                 + '</pre></details><details class="tool-result"><summary>Full result · '
                 + _text(checkpoint["name"])
-                + "</summary><pre>"
-                + _text(tool_output_text(checkpoint["output"]))
+                + '</summary><pre class="timed-lines">'
+                + self._lines(tool_output_text(checkpoint["output"]), timing)
                 + "</pre></details></section>\n"
             )
             self.tool_results.add(identity)
         elif kind in ("provider_tool", "tool_display"):
             if record.get("display") is False:
                 return
+            timing = self._timing(record)
             fragment = (
                 self._close_block()
-                + '<section class="tool"><h2>Tool</h2><pre>'
-                + _text(record.get("tool", ""))
+                + '<section class="tool"><h2>Tool</h2><pre class="timed-lines">'
+                + self._lines(record.get("tool", ""), timing)
                 + "</pre></section>\n"
             )
         elif kind in ("provider_status", "status_display"):
             if record.get("display") is False:
                 return
+            timing = self._timing(record)
             self.status = "Open WebUI │ " + str(record.get("status") or "")
+            self.status_timing = timing
+            fragment = (
+                '<span class="status-event"><span class="event-time">'
+                + timing
+                + '</span><span class="event-content">'
+                + _text(self.status)
+                + "</span></span>"
+            )
         elif kind in ("turn_cancelled", "turn_error"):
             message = (
                 cancellation_notice(record)
                 if kind == "turn_cancelled"
                 else "Model error: " + str(record.get("error") or "")
             )
+            timing = self._timing(record)
             fragment = (
-                self._close_block() + '<p class="program">' + _text(message) + "</p>\n"
+                self._close_block()
+                + '<div class="program">'
+                + self._lines(message, timing)
+                + "</div>\n"
             )
             self.status = message
+            self.status_timing = timing
         elif kind in ("turn_completed", "recovery_completed"):
-            fragment = self._close_block()
+            timing = self._timing(record)
+            fragment = (
+                self._close_block()
+                + '<div class="program">'
+                + self._lines("Response completed", timing)
+                + "</div>\n"
+            )
             self.status = "Response completed"
+            self.status_timing = timing
         elif kind == "provider_error":
+            timing = self._timing(record)
             self.status = str(record.get("error") or "Provider error")
+            self.status_timing = timing
+            fragment = (
+                self._close_block()
+                + '<div class="program">'
+                + self._lines(self.status, timing)
+                + "</div>\n"
+            )
         else:
             # Request metadata and checkpoint payloads are not terminal output.
             return
-        timestamp = record.get("timestamp")
-        if isinstance(timestamp, (float, int)):
-            self.updated = datetime.fromtimestamp(timestamp, timezone.utc).strftime(
-                "%Y-%m-%d %H:%M:%S UTC"
-            )
         encoded = fragment.encode("utf-8")
         with self.path.open("r+b") as handle:
             # Replace only the small closing/footer tail. An open stream block

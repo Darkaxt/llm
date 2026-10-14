@@ -20,6 +20,32 @@ background is retained. Redirected output and saved journals remain plain;
 set `NO_COLOR` to disable this chat palette. Recovery uses the same reply,
 reasoning and status colors in an interactive terminal.
 
+## HTML line and event timing
+
+Each logical conversation line has its originating journal timestamp in **UTC
+with milliseconds** and a **Δ gap in seconds** from the preceding rendered event,
+including status updates. The timestamp is when this client recorded the event,
+not when the model started computing. Several lines from one event share the
+same timestamp and gap; soft wrapping does not create another event.
+
+Streamed words remain joined in the default conversation view. Check
+**Individual events** near the top of the HTML to inspect each streamed chunk
+and intermediate status with its own time/gap. This script-free checkbox works
+with mouse or keyboard Space and does not change the saved conversation.
+The tool metadata and full-result panels remain independently collapsible.
+
+Gaps use the journal's wall-clock timestamps. They are observations, not internal
+reasoning durations or proof of model inactivity. Missing/invalid times and
+backwards clock changes are labelled explicitly rather than guessed. Hidden
+reasoning and private request metadata stay excluded. The footer includes the
+current status's timing.
+
+New reports receive timing automatically. Rebuilding an existing report uses its
+original JSONL timestamps and verified result sidecars, without inference or tool
+execution. Keep those files together; reopening the conversation rebuilds its
+HTML, or call `llm.chat_html.ensure_html_report(journal_path)` for an offline-only
+rebuild. No timestamp is reconstructed from model narration.
+
 ## Cancellation and Windows idle sleep
 
 During generation, **Ctrl+C** (or Windows Ctrl+Break) interrupts this console's

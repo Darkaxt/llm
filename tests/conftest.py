@@ -1,6 +1,7 @@
 import importlib.metadata
 import json
 import sqlite3
+from html.parser import HTMLParser
 
 import llm_echo
 import pytest
@@ -9,6 +10,49 @@ from pydantic import Field
 
 import llm
 from llm.plugins import pm
+
+
+@pytest.fixture
+def html_transcript():
+    """Read logical transcript lines without time labels/hidden status copies."""
+
+    class Parser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+            self.lines = []
+            self.current = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag in {"meta", "input"}:
+                return
+            classes = dict(attrs).get("class", "").split()
+            self.stack.append((tag, classes))
+            if "line-content" in classes:
+                self.current = []
+
+        def handle_endtag(self, tag):
+            if not self.stack:
+                return
+            _, classes = self.stack.pop()
+            if "line-content" in classes:
+                self.lines.append("".join(self.current))
+                self.current = None
+
+        def handle_data(self, data):
+            if self.current is not None and not any(
+                set(classes) & {"event-time", "status-event"}
+                for _, classes in self.stack
+            ):
+                self.current.append(data)
+
+    def extract(report):
+        parser = Parser()
+        parser.feed(report)
+        return "\n".join(parser.lines)
+
+    return extract
+
 
 # Both "httpx2-pytest" and "pytest-httpx2" install the same pytest_httpx2
 # package. This suite uses the former (pytest-httpx-compatible API), whereas
