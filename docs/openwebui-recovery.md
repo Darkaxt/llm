@@ -202,7 +202,7 @@ excluded. Earlier failed-turn recovery already reconstructs verified tool calls.
 
 | Stage | Status | Reconciliation |
 |---|---|---|
-| Previous-attempt tool evidence recovery (P1-P5) | ACTIVE | P1-P4 and P5 local verification/documentation pass; commit/push and issue delivery remain; no deferrals |
+| Previous-attempt tool evidence recovery (P1-P5) | COMPLETE | P1-P5 satisfied: verified local flows, committed/pushed implementation and issue delivery; no blockers or deferrals |
 
 Eligibility/run selection and inherited evidence blockers are resolved. Complete
 offline CLI flows verify empty-answer eligibility, active/nonempty/tool-free
@@ -215,10 +215,12 @@ typing, generated CLI documentation and whitespace checks pass. An optional
 untyped-body check reproduces the same three Click Path typing errors in unchanged
 knowledge commands at the pre-change HEAD; these are outside this extension.
 
-The only remaining acceptance work is P5 commit/push and issue delivery. Closure
-review found no requirement-blocking design debt or required deferrals. Corporate
-endurance remains the separate external issue #28 validation boundary, not an
-implementation prerequisite.
+Implementation committed/pushed and remote-verified as `b78ad024224dc7947fe600ae9febaf62f5630298`.
+[Issue #28 delivery](https://github.com/Darkaxt/XSoar-MDR/issues/28#issuecomment-6178193130)
+contains update, dry-run and recovery commands. P1-P5 have no remaining internal
+advancement blockers or required deferrals. Closure review found no
+requirement-blocking design debt. Corporate endurance remains the separate
+external issue #28 validation boundary and is not certified by these local flows.
 
 ## Resume a failed investigation
 
